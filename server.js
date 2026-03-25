@@ -57,7 +57,7 @@ app.get('/generate-stream', authenticateUser, async (req, res) => {
 
         // Generar Token BunnyCDN
         const expires = Math.floor(Date.now() / 1000) + TOKEN_DURATION;
-        const hashString = BUNNY_SECURITY_KEY + STREAM_PATH + expires + userIp;
+        const hashString = BUNNY_SECURITY_KEY + STREAM_PATH + expires;
         const token = crypto.createHash('md5').update(hashString).digest('base64')
             .replace(/\n/g, '')
             .replace(/\+/g, '-')
