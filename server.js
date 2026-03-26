@@ -16,11 +16,11 @@ const app = express();
 // ✅ CORRECCIÓN CRÍTICA: Confiar en el proxy de Render para el Rate Limit
 app.set('trust proxy', 1);
 
-// --- 🚀 SISTEMA DE CACHÉ PRO CON AUTO-LIMPIEZA ---
+// --- 🚀 SISTEMA DE CACHÉ PRO PERMISIVO (v1.4.1) ---
 const userCache = new Map(); 
-const CACHE_TTL = 30 * 1000; // 30 segundos
+const CACHE_TTL = 5 * 60 * 1000; // ⏱️ Subido a 5 minutos para evitar bloqueos por reconexión
 
-// 🧹 GARBAGE COLLECTOR: Limpia la memoria cada 5 minutos
+// 🧹 GARBAGE COLLECTOR: Limpia la memoria cada 10 minutos
 setInterval(() => {
     const now = Date.now();
     let count = 0;
@@ -31,7 +31,7 @@ setInterval(() => {
         }
     }
     if(count > 0) console.log(`[Cache] 🧹 Limpieza realizada: ${count} registros eliminados.`);
-}, 5 * 60 * 1000);
+}, 10 * 60 * 1000);
 
 const getUserData = async (uid) => {
     const now = Date.now();
@@ -52,7 +52,7 @@ app.use(express.json());
 
 // 3. RATE LIMITERS (Arquitectura de Escudo)
 const streamLimiter = rateLimit({
-    windowMs: 1 * 60 * 1000, max: 5, 
+    windowMs: 1 * 60 * 1000, max: 10, // 🔓 Un poco más flexible para pruebas
     message: { error: 'Muchos pedidos. Espera 1 min.' }
 });
 const heartbeatLimiter = rateLimit({
@@ -81,7 +81,6 @@ const authenticateUser = async (req, res, next) => {
 // 🎯 ENDPOINT 1: GENERAR STREAM
 app.get('/generate-stream', streamLimiter, authenticateUser, async (req, res) => {
     const uid = req.user.uid;
-    // IP Normalizada para los logs
     const userIp = (req.headers['x-forwarded-for'] || req.socket.remoteAddress || '').split(',')[0].trim();
     
     try {
@@ -92,14 +91,15 @@ app.get('/generate-stream', streamLimiter, authenticateUser, async (req, res) =>
 
         const newSessionId = crypto.randomUUID();
         await db.collection('usuarios').doc(uid).update({ session_id: newSessionId });
-        userCache.delete(uid); // Invalidación inmediata post-escritura
+        
+        // Actualizamos caché inmediatamente con la nueva sesión
+        userCache.set(uid, { data: { ...userData, session_id: newSessionId }, timestamp: Date.now() });
 
         const expires = Math.floor(Date.now() / 1000) + TOKEN_DURATION;
         const pathAllowed = '/stream/'; 
         const hashableBase = BUNNY_SECURITY_KEY + pathAllowed + expires + 'token_path=' + pathAllowed;
         const token = crypto.createHash('sha256').update(hashableBase).digest('base64').replace(/\n/g, '').replace(/\+/g, '-').replace(/\//g, '_').replace(/=/g, '');
 
-        // Construcción de URL con el token como directorio para soporte de .ts
         const finalUrl = `${BUNNY_URL}/bcdn_token=${token}&expires=${expires}&token_path=%2Fstream%2F${STREAM_PATH}`;
         
         console.log(`[${new Date().toISOString()}] ✅ Stream OK: ${uid} | ${userIp}`);
@@ -117,9 +117,11 @@ app.post('/check-session', heartbeatLimiter, authenticateUser, async (req, res) 
     if (!session_id) return res.status(400).json({ valid: false });
     try {
         const userData = await getUserData(uid);
+        // Si la sesión coincide, mantenemos el acceso vivo
         if (userData && userData.session_id === session_id) {
             res.json({ valid: true });
         } else {
+            // Si no coincide, borramos caché para forzar re-validación con DB en el siguiente intento
             userCache.delete(uid);
             res.json({ valid: false });
         }
@@ -127,4 +129,4 @@ app.post('/check-session', heartbeatLimiter, authenticateUser, async (req, res) 
 });
 
 const PORT = process.env.PORT || 3000;
-app.listen(PORT, () => console.log(`🚀 GOLAZO SP PLATFORM v1.4 [ENTERPRISE] READY`));
+app.listen(PORT, () => console.log(`🚀 GOLAZO SP PLATFORM v1.4.1 [PERMISSIVE] READY`));
