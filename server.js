@@ -13,6 +13,9 @@ admin.initializeApp({
 const db = admin.firestore();
 const app = express();
 
+// ✅ CORRECCIÓN CRÍTICA: Confiar en el proxy de Render para el Rate Limit
+app.set('trust proxy', 1);
+
 // --- 🚀 SISTEMA DE CACHÉ PRO CON AUTO-LIMPIEZA ---
 const userCache = new Map(); 
 const CACHE_TTL = 30 * 1000; // 30 segundos
@@ -61,7 +64,7 @@ const heartbeatLimiter = rateLimit({
 const BUNNY_URL = 'https://stream.golazosp.net'; 
 const BUNNY_SECURITY_KEY = process.env.BUNNY_KEY; 
 const STREAM_PATH = '/stream/canal.m3u8';
-const TOKEN_DURATION = 7200; 
+const TOKEN_DURATION = 7200; // 2 horas
 
 // MIDDLEWARE: Autenticación
 const authenticateUser = async (req, res, next) => {
@@ -78,7 +81,9 @@ const authenticateUser = async (req, res, next) => {
 // 🎯 ENDPOINT 1: GENERAR STREAM
 app.get('/generate-stream', streamLimiter, authenticateUser, async (req, res) => {
     const uid = req.user.uid;
+    // IP Normalizada para los logs
     const userIp = (req.headers['x-forwarded-for'] || req.socket.remoteAddress || '').split(',')[0].trim();
+    
     try {
         const userData = await getUserData(uid);
         const expiresAt = userData?.expires_at?.toMillis ? userData.expires_at.toMillis() : userData?.expires_at;
@@ -94,10 +99,15 @@ app.get('/generate-stream', streamLimiter, authenticateUser, async (req, res) =>
         const hashableBase = BUNNY_SECURITY_KEY + pathAllowed + expires + 'token_path=' + pathAllowed;
         const token = crypto.createHash('sha256').update(hashableBase).digest('base64').replace(/\n/g, '').replace(/\+/g, '-').replace(/\//g, '_').replace(/=/g, '');
 
+        // Construcción de URL con el token como directorio para soporte de .ts
         const finalUrl = `${BUNNY_URL}/bcdn_token=${token}&expires=${expires}&token_path=%2Fstream%2F${STREAM_PATH}`;
+        
         console.log(`[${new Date().toISOString()}] ✅ Stream OK: ${uid} | ${userIp}`);
         res.json({ stream_url: finalUrl, session_id: newSessionId });
-    } catch (e) { res.status(500).json({ error: 'Error' }); }
+    } catch (e) { 
+        console.error("Error en generate-stream:", e);
+        res.status(500).json({ error: 'Error interno' }); 
+    }
 });
 
 // 🎯 ENDPOINT 2: HEARTBEAT
