@@ -79,34 +79,23 @@ const authenticateUser = async (req, res, next) => {
 app.get('/generate-stream', streamLimiter, authenticateUser, async (req, res) => {
     const uid = req.user.uid;
     const userIp = (req.headers['x-forwarded-for'] || req.socket.remoteAddress || '').split(',')[0].trim();
-    
     try {
         const userData = await getUserData(uid);
         const expiresAt = userData?.expires_at?.toMillis ? userData.expires_at.toMillis() : userData?.expires_at;
-
         if (!userData || !expiresAt || expiresAt < Date.now()) return res.status(403).json({ error: 'Inactivo' });
-
         const newSessionId = crypto.randomUUID();
         await db.collection('usuarios').doc(uid).update({ session_id: newSessionId });
-        
         userCache.set(uid, { data: { ...userData, session_id: newSessionId }, timestamp: Date.now() });
-
         const expires = Math.floor(Date.now() / 1000) + TOKEN_DURATION;
         const pathAllowed = '/stream/'; 
         const hashableBase = BUNNY_SECURITY_KEY + pathAllowed + expires + 'token_path=' + pathAllowed;
         const token = crypto.createHash('sha256').update(hashableBase).digest('base64').replace(/\n/g, '').replace(/\+/g, '-').replace(/\//g, '_').replace(/=/g, '');
-
         const finalUrl = `${BUNNY_URL}/bcdn_token=${token}&expires=${expires}&token_path=%2Fstream%2F${STREAM_PATH}`;
-        
-        console.log(`[${new Date().toISOString()}] ✅ Stream OK: ${uid} | ${userIp}`);
         res.json({ stream_url: finalUrl, session_id: newSessionId });
-    } catch (e) { 
-        console.error("Error en generate-stream:", e);
-        res.status(500).json({ error: 'Error interno' }); 
-    }
+    } catch (e) { res.status(500).json({ error: 'Error interno' }); }
 });
 
-// 🎯 ENDPOINT 2: HEARTBEAT (Control de Piratería y Expiración con Motivos)
+// 🎯 ENDPOINT 2: HEARTBEAT
 app.post('/check-session', heartbeatLimiter, authenticateUser, async (req, res) => {
     const uid = req.user.uid;
     const { session_id } = req.body;
@@ -114,24 +103,10 @@ app.post('/check-session', heartbeatLimiter, authenticateUser, async (req, res) 
     try {
         const userData = await getUserData(uid);
         const expiresAt = userData?.expires_at?.toMillis ? userData.expires_at.toMillis() : userData?.expires_at;
-        
-        if (!userData) {
-            userCache.delete(uid);
-            return res.json({ valid: false, motivo: 'eliminado' });
-        }
-
-        if (userData.session_id !== session_id) {
-            userCache.delete(uid);
-            return res.json({ valid: false, motivo: 'pirateria' });
-        }
-
-        if (expiresAt && expiresAt <= Date.now()) {
-            userCache.delete(uid);
-            return res.json({ valid: false, motivo: 'tiempo_agotado' });
-        }
-
+        if (!userData) return res.json({ valid: false, motivo: 'eliminado' });
+        if (userData.session_id !== session_id) return res.json({ valid: false, motivo: 'pirateria' });
+        if (expiresAt && expiresAt <= Date.now()) return res.json({ valid: false, motivo: 'tiempo_agotado' });
         res.json({ valid: true });
-        
     } catch (e) { res.status(500).json({ valid: false, motivo: 'error_servidor' }); }
 });
 
@@ -139,24 +114,13 @@ app.post('/check-session', heartbeatLimiter, authenticateUser, async (req, res) 
 app.post('/admin/generar-pase-rapido', async (req, res) => {
     try {
         const { admin_secret, fecha_corte, partido, email_manual, pass_manual } = req.body; 
-
-        if (admin_secret !== process.env.PANEL_SECRET) {
-            return res.status(403).json({ success: false, error: "Acceso denegado." });
-        }
-
-        // Si mandas email_manual, es un Socio. Si no, es un Pase de 5 dígitos.
+        if (admin_secret !== process.env.PANEL_SECRET) return res.status(403).json({ success: false, error: "Acceso denegado." });
         const esSocio = !!email_manual;
         const emailFinal = email_manual || `${Math.floor(10000 + Math.random() * 90000)}@golazosp.net`;
         const passFinal = pass_manual || Math.floor(100000 + Math.random() * 900000).toString();
         const usuarioCorto = esSocio ? email_manual : emailFinal.split('@')[0];
-
-        const userRecord = await admin.auth().createUser({
-            email: emailFinal,
-            password: passFinal,
-        });
-
+        const userRecord = await admin.auth().createUser({ email: emailFinal, password: passFinal });
         const fechaExpiracion = admin.firestore.Timestamp.fromDate(new Date(fecha_corte));
-
         await db.collection('usuarios').doc(userRecord.uid).set({
             email: emailFinal,
             usuario_corto: usuarioCorto, 
@@ -165,79 +129,43 @@ app.post('/admin/generar-pase-rapido', async (req, res) => {
             etiqueta: partido || 'Sin especificar', 
             creado_el: admin.firestore.FieldValue.serverTimestamp()
         });
-
         const fechaFormateada = new Date(fecha_corte).toLocaleString('es-PE', { 
-            timeZone: 'America/Lima',
-            day: '2-digit', month: '2-digit', year: 'numeric',
+            timeZone: 'America/Lima', day: '2-digit', month: '2-digit', year: 'numeric',
             hour: '2-digit', minute: '2-digit', hour12: true 
         });
-
-        res.json({
-            success: true,
-            usuario: usuarioCorto,
-            clave: passFinal,
-            expira_en: fechaFormateada,
-            partido: partido || 'General'
-        });
-
-    } catch (error) {
-        res.status(500).json({ success: false, error: error.message });
-    }
+        res.json({ success: true, usuario: usuarioCorto, clave: passFinal, expira_en: fechaFormateada, partido: partido || 'General' });
+    } catch (error) { res.status(500).json({ success: false, error: error.message }); }
 });
 
-// 🎯 ENDPOINT 4: EXTENDER ACCESO / RENOVACIÓN
+// 🎯 ENDPOINT 4: EXTENDER ACCESO
 app.post('/admin/extender-acceso', async (req, res) => {
     try {
         const { admin_secret, usuario_corto, horas_extra } = req.body; 
-        
-        if (admin_secret !== process.env.PANEL_SECRET) {
-            return res.status(403).json({ success: false, error: "Clave maestra incorrecta." });
-        }
-
-        // Buscamos por el ID corto o por el Email completo
+        if (admin_secret !== process.env.PANEL_SECRET) return res.status(403).json({ success: false, error: "Clave maestra incorrecta." });
         let snapshot = await db.collection('usuarios').where('usuario_corto', '==', usuario_corto).get();
-        if (snapshot.empty) {
-            snapshot = await db.collection('usuarios').where('email', '==', usuario_corto).get();
-        }
-
+        if (snapshot.empty) snapshot = await db.collection('usuarios').where('email', '==', usuario_corto).get();
         if (snapshot.empty) return res.status(404).json({ error: "Usuario no encontrado" });
-        
         const doc = snapshot.docs[0];
         const data = doc.data();
-        
         const tiempoActual = data.expires_at.toMillis();
         const nuevoTiempo = admin.firestore.Timestamp.fromMillis(tiempoActual + (parseFloat(horas_extra) * 60 * 60 * 1000));
-
-        await db.collection('usuarios').doc(doc.id).update({
-            expires_at: nuevoTiempo
-        });
-
+        await db.collection('usuarios').doc(doc.id).update({ expires_at: nuevoTiempo });
         userCache.delete(doc.id);
-
-        res.json({ 
-            success: true, 
-            mensaje: `Tiempo actualizado con éxito para ${usuario_corto}` 
-        });
-
-    } catch (error) {
-        res.status(500).json({ success: false, error: error.message });
-    }
+        res.json({ success: true, mensaje: `Tiempo actualizado con éxito para ${usuario_corto}` });
+    } catch (error) { res.status(500).json({ success: false, error: error.message }); }
 });
 
-// 🎯 ENDPOINT 6: LISTAR USUARIOS (Auditoría en Vivo)
+// 🎯 ENDPOINT 6: LISTAR USUARIOS
 app.post('/admin/listar-usuarios', async (req, res) => {
     try {
         const { admin_secret } = req.body;
         if (admin_secret !== process.env.PANEL_SECRET) return res.status(403).json({ success: false, error: "No autorizado" });
-
         const snapshot = await db.collection('usuarios').orderBy('creado_el', 'desc').limit(100).get();
         const ahora = Date.now();
-        
         const usuarios = snapshot.docs.map(doc => {
             const data = doc.data();
             const expiresAt = data.expires_at?.toMillis ? data.expires_at.toMillis() : data.expires_at;
             const tiempoRestanteMs = expiresAt - ahora;
-            
             let tiempoTexto = "Expirado";
             if (tiempoRestanteMs > 0) {
                 const dias = Math.floor(tiempoRestanteMs / 86400000);
@@ -245,20 +173,32 @@ app.post('/admin/listar-usuarios', async (req, res) => {
                 const mins = Math.floor((tiempoRestanteMs % 3600000) / 60000);
                 tiempoTexto = dias > 0 ? `${dias}d ${horas}h` : `${horas}h ${mins}m`;
             }
-
-            return {
-                email: data.email,
-                usuario_corto: data.usuario_corto,
-                etiqueta: data.etiqueta,
-                estado: tiempoRestanteMs > 0 ? "ACTIVO ✅" : "CADUCADO ❌",
-                tiempo: tiempoTexto,
-                esActivo: tiempoRestanteMs > 0
-            };
+            return { email: data.email, usuario_corto: data.usuario_corto, etiqueta: data.etiqueta, estado: tiempoRestanteMs > 0 ? "ACTIVO ✅" : "CADUCADO ❌", tiempo: tiempoTexto, esActivo: tiempoRestanteMs > 0 };
         });
-
         res.json({ success: true, usuarios });
     } catch (error) { res.status(500).json({ success: false, error: error.message }); }
 });
 
+// 🎯 ENDPOINT 7: LIMPIEZA DE CADUCADOS
+app.post('/admin/limpiar-caducados', async (req, res) => {
+    try {
+        const { admin_secret } = req.body;
+        if (admin_secret !== process.env.PANEL_SECRET) return res.status(403).json({ error: "No autorizado" });
+        const ahora = admin.firestore.Timestamp.now();
+        const snapshot = await db.collection('usuarios').where('tipo', '==', 'pase_ocasional').where('expires_at', '<', ahora).get();
+        if (snapshot.empty) return res.json({ success: true, mensaje: "No hay usuarios ocasionales caducados." });
+        let borrados = 0;
+        for (const doc of snapshot.docs) {
+            try {
+                const userAuth = await admin.auth().getUserByEmail(doc.data().email);
+                await admin.auth().deleteUser(userAuth.uid);
+                await db.collection('usuarios').doc(doc.id).delete();
+                borrados++;
+            } catch (err) { console.error("Error al borrar:", err); }
+        }
+        res.json({ success: true, mensaje: `Limpieza terminada: ${borrados} registros eliminados.` });
+    } catch (error) { res.status(500).json({ error: error.message }); }
+});
+
 const PORT = process.env.PORT || 3000;
-app.listen(PORT, () => console.log(`🚀 GOLAZO SP PLATFORM v1.6.0 [MASTER CONSOLE] READY`));
+app.listen(PORT, () => console.log(`🚀 GOLAZO SP PLATFORM v1.7.0 [FULL CLEANUP] READY`));
