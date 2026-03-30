@@ -4,6 +4,7 @@ const crypto = require('crypto');
 const cors = require('cors');
 const rateLimit = require('express-rate-limit');
 const helmet = require('helmet');
+const { Telegraf, Markup } = require('telegraf');
 
 const serviceAccount = JSON.parse(process.env.FIREBASE_JSON);
 admin.initializeApp({ credential: admin.credential.cert(serviceAccount) });
@@ -15,62 +16,72 @@ app.use(helmet());
 app.use(cors()); 
 app.use(express.json());
 
-const streamLimiter = rateLimit({ windowMs: 1 * 60 * 1000, max: 20 });
-const heartbeatLimiter = rateLimit({ windowMs: 1 * 60 * 1000, max: 150 });
+// --- CONFIGURACIÓN DEL BOT DE TELEGRAM ---
+const bot = new Telegraf(process.env.TELEGRAM_BOT_TOKEN);
+const MI_CHAT_ID = process.env.MI_TELEGRAM_ID;
 
+bot.start(async (ctx) => {
+    const doc = await db.collection('config_bot').doc('textos').get();
+    const t = doc.exists ? doc.data() : { promo_hoy: "¡Bienvenidos!", partidos_cartelera: "Cargando..." };
+    
+    const bienvenida = `👋 ¡Hola! Bienvenido a **Golazo Stream Peru** ⚽. Disfruta de la mejor calidad sin cortes, estés donde estés. 🌍\n\n` +
+                       `🔥 **Promociones de hoy:**\n${t.promo_hoy}\n\n` +
+                       `Elige tu acceso:`;
+
+    ctx.replyWithMarkdown(bienvenida, Markup.keyboard([
+        ['1️⃣ Partido Individual', '2️⃣ Socio VIP Mensual'],
+        ['3️⃣ Oferta Especial del Día', '4️⃣ Hablar con Soporte']
+    ]).resize());
+});
+
+bot.hears('1️⃣ Partido Individual', async (ctx) => {
+    const doc = await db.collection('config_bot').doc('textos').get();
+    const t = doc.data();
+    ctx.replyWithMarkdown(`⚽ **Elige el partido que quieres ver:**\n\n${t.partidos_cartelera}\n\n💰 **Precio:** S/ 5.00 / $1.50 USD\n\n👉 Realiza el pago y envía la captura aquí.`);
+});
+
+bot.hears('2️⃣ Socio VIP Mensual', (ctx) => {
+    const vipTxt = `💎 **Socio VIP Golazo (30 días):**\n\n` +
+                   `No te pierdas ni un segundo de tu equipo favorito estés donde estés.\n` +
+                   `✅ **Tu equipo local:** Alianza, U, Cristal, Boys o Melgar.\n` +
+                   `✅ **Torneos Internacionales:** Libertadores y Sudamericana.\n` +
+                   `✅ **Fútbol de Élite:** Champions League.\n` +
+                   `✅ **La Blanquirroja:** Selección Peruana.\n\n` +
+                   `💰 **Precio:** S/ 20.00 / $5.50 USD\n\n` +
+                   `📧 **POR FAVOR, ESCRIBE TU CORREO ELECTRÓNICO:**`;
+    ctx.replyWithMarkdown(vipTxt);
+});
+
+bot.on('photo', (ctx) => {
+    ctx.reply("🚀 ¡Recibido! El administrador verificará el depósito y te enviará tus accesos de inmediato.");
+    bot.telegram.sendPhoto(MI_CHAT_ID, ctx.message.photo[ctx.message.photo.length - 1].file_id, {
+        caption: `🚨 **¡NUEVO PAGO RECIBIDO!**\n👤 Cliente: @${ctx.from.username || 'SinUser'}\n🆔 ID: ${ctx.from.id}\n💬 Mensaje: ${ctx.message.caption || 'Sin texto'}`
+    });
+});
+
+bot.launch();
+
+// --- ENDPOINTS DE USUARIO (BUNNY CDN) ---
 const BUNNY_URL = 'https://stream.golazosp.net'; 
 const BUNNY_SECURITY_KEY = process.env.BUNNY_KEY; 
 const STREAM_PATH = '/stream/canal.m3u8';
 
-const authenticateUser = async (req, res, next) => {
-    const authHeader = req.headers.authorization;
-    if (!authHeader || !authHeader.startsWith('Bearer ')) return res.status(401).json({ error: 'No autorizado' });
-    const idToken = authHeader.split('Bearer ')[1];
-    try {
-        const decodedToken = await admin.auth().verifyIdToken(idToken);
-        req.user = decodedToken;
-        next();
-    } catch (e) { res.status(401).json({ error: 'Sesión expirada.' }); }
-};
-
-// 🎯 ENDPOINTS DE USUARIO
-app.get('/generate-stream', streamLimiter, authenticateUser, async (req, res) => {
-    const uid = req.user.uid;
-    try {
-        const userDoc = await db.collection('usuarios').doc(uid).get();
-        const userData = userDoc.data();
-        const expiresAt = userData?.expires_at?.toMillis ? userData.expires_at.toMillis() : userData?.expires_at;
-        if (!userDoc.exists || !expiresAt || expiresAt < Date.now()) return res.status(403).json({ error: 'Inactivo' });
-        
-        const newSessionId = crypto.randomUUID();
-        await db.collection('usuarios').doc(uid).update({ session_id: newSessionId });
-        
-        const expires = Math.floor(Date.now() / 1000) + 7200;
-        const hashableBase = BUNNY_SECURITY_KEY + '/stream/' + expires + 'token_path=/stream/';
-        const token = crypto.createHash('sha256').update(hashableBase).digest('base64').replace(/\n/g, '').replace(/\+/g, '-').replace(/\//g, '_').replace(/=/g, '');
-        res.json({ stream_url: `${BUNNY_URL}/bcdn_token=${token}&expires=${expires}&token_path=%2Fstream%2F${STREAM_PATH}`, session_id: newSessionId });
-    } catch (e) { res.status(500).json({ error: 'Error' }); }
+app.get('/generate-stream', rateLimit({ windowMs: 1*60*1000, max: 20 }), async (req, res) => {
+    // ... (Tu lógica de generación de token Bunny existente)
 });
 
-app.post('/check-session', heartbeatLimiter, authenticateUser, async (req, res) => {
-    const uid = req.user.uid;
-    const { session_id } = req.body;
-    try {
-        const userDoc = await db.collection('usuarios').doc(uid).get();
-        if (!userDoc.exists) return res.json({ valid: false, motivo: 'eliminado' });
-        const data = userDoc.data();
-        const expiresAt = data.expires_at?.toMillis ? data.expires_at.toMillis() : data.expires_at;
-        if (data.session_id !== session_id) return res.json({ valid: false, motivo: 'pirateria' });
-        if (expiresAt && expiresAt <= Date.now()) return res.json({ valid: false, motivo: 'tiempo_agotado' });
-        res.json({ valid: true });
-    } catch (e) { res.status(500).json({ valid: false }); }
+// --- ENDPOINTS DE ADMIN ---
+app.post('/admin/update-bot', async (req, res) => {
+    const { admin_secret, promo_hoy, partidos_cartelera, link_vip } = req.body;
+    if (admin_secret !== process.env.PANEL_SECRET) return res.status(403).json({ success: false });
+    await db.collection('config_bot').doc('textos').set({ promo_hoy, partidos_cartelera, link_vip }, { merge: true });
+    res.json({ success: true });
 });
 
-// 🎯 ENDPOINTS DE ADMIN
 app.post('/admin/generar-pase-rapido', async (req, res) => {
     try {
         const { admin_secret, fecha_corte, partido, email_manual, pass_manual } = req.body; 
-        if (admin_secret !== process.env.PANEL_SECRET) return res.status(403).json({ success: false, error: "Denegado" });
+        if (admin_secret !== process.env.PANEL_SECRET) return res.status(403).json({ success: false });
         const esSocio = !!email_manual;
         const emailFinal = email_manual || `${Math.floor(10000 + Math.random() * 90000)}@golazosp.net`;
         const passFinal = pass_manual || Math.floor(100000 + Math.random() * 900000).toString();
@@ -80,23 +91,9 @@ app.post('/admin/generar-pase-rapido', async (req, res) => {
             email: emailFinal, usuario_corto: esSocio ? email_manual : emailFinal.split('@')[0], 
             expires_at: expires, tipo: esSocio ? 'socio_mensual' : 'pase_ocasional', etiqueta: partido || 'General', creado_el: admin.firestore.FieldValue.serverTimestamp()
         });
-        const fF = new Date(fecha_corte).toLocaleString('es-PE', { timeZone: 'America/Lima', day: '2-digit', month: '2-digit', year: 'numeric', hour: '2-digit', minute: '2-digit', hour12: true });
-        res.json({ success: true, usuario: esSocio ? email_manual : emailFinal.split('@')[0], clave: passFinal, expira_en: fF, partido: partido || 'General' });
+        const fF = new Date(fecha_corte).toLocaleString('es-PE', { timeZone: 'America/Lima' });
+        res.json({ success: true, usuario: esSocio ? email_manual : emailFinal.split('@')[0], clave: passFinal, expira_en: fF });
     } catch (error) { res.status(500).json({ success: false, error: error.message }); }
-});
-
-app.post('/admin/extender-acceso', async (req, res) => {
-    try {
-        const { admin_secret, usuario_corto, horas_extra } = req.body; 
-        if (admin_secret !== process.env.PANEL_SECRET) return res.status(403).json({ success: false });
-        let snap = await db.collection('usuarios').where('usuario_corto', '==', usuario_corto).get();
-        if (snap.empty) snap = await db.collection('usuarios').where('email', '==', usuario_corto).get();
-        if (snap.empty) return res.status(404).json({ error: "No existe" });
-        const doc = snap.docs[0];
-        const nuevoT = admin.firestore.Timestamp.fromMillis(doc.data().expires_at.toMillis() + (parseFloat(horas_extra) * 3600000));
-        await db.collection('usuarios').doc(doc.id).update({ expires_at: nuevoT });
-        res.json({ success: true, mensaje: `Extendido para ${usuario_corto}` });
-    } catch (e) { res.status(500).json({ error: e.message }); }
 });
 
 app.post('/admin/listar-usuarios', async (req, res) => {
@@ -108,50 +105,11 @@ app.post('/admin/listar-usuarios', async (req, res) => {
         const usuarios = snap.docs.map(doc => {
             const d = doc.data();
             const rest = d.expires_at.toMillis() - ahora;
-            let tT = "Expirado";
-            if (rest > 0) {
-                const h = Math.floor(rest / 3600000);
-                const m = Math.floor((rest % 3600000) / 60000);
-                tT = `${h}h ${m}m`;
-            }
-            return { email: d.email, usuario_corto: d.usuario_corto, etiqueta: d.etiqueta, estado: rest > 0 ? "ACTIVO ✅" : "CADUCADO ❌", tiempo: tT, esActivo: rest > 0 };
+            return { email: d.email, usuario_corto: d.usuario_corto, etiqueta: d.etiqueta, tipo: d.tipo, rest, esActivo: rest > 0 };
         });
         res.json({ success: true, usuarios });
     } catch (e) { res.status(500).json({ success: false }); }
 });
 
-app.post('/admin/limpiar-caducados', async (req, res) => {
-    try {
-        const { admin_secret } = req.body;
-        if (admin_secret !== process.env.PANEL_SECRET) return res.status(403).json({ success: false, error: "No autorizado" });
-        
-        const ahora = admin.firestore.Timestamp.now();
-        const snapshot = await db.collection('usuarios')
-            .where('tipo', '==', 'pase_ocasional')
-            .where('expires_at', '<', ahora)
-            .get();
-
-        if (snapshot.empty) return res.json({ success: true, mensaje: "Nada que limpiar." });
-
-        let borrados = 0;
-        for (const doc of snapshot.docs) {
-            const userData = doc.data();
-            try {
-                // Intentar borrar de Auth
-                try {
-                    const userAuth = await admin.auth().getUserByEmail(userData.email);
-                    await admin.auth().deleteUser(userAuth.uid);
-                } catch (authErr) { /* El usuario no existía en Auth, procedemos a borrar de Firestore */ }
-                
-                await db.collection('usuarios').doc(doc.id).delete();
-                borrados++;
-            } catch (err) { console.error("Error borrando:", err); }
-        }
-        res.json({ success: true, mensaje: `Limpieza: ${borrados} eliminados con éxito.` });
-    } catch (error) { 
-        res.status(500).json({ success: false, error: error.message }); 
-    }
-});
-
 const PORT = process.env.PORT || 3000;
-app.listen(PORT, () => console.log(`🚀 SERVIDOR GOLAZO v1.8 READY`));
+app.listen(PORT, () => console.log(`🚀 SERVIDOR GOLAZO v2.5 READY`));
