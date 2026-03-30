@@ -1,7 +1,13 @@
-// 🎯 ENDPOINT 3: GENERAR PASE RÁPIDO (Ahora con tiempo dinámico)
+// 🎯 ENDPOINT 3: GENERAR PASE RÁPIDO (Ahora con tiempo dinámico y seguridad)
 app.post('/admin/generar-pase-rapido', async (req, res) => {
     try {
-        const { horas } = req.body; // Recibimos las horas desde tu Panel (ej. 3, 4 o 5)
+        const { admin_secret, horas } = req.body; // Recibimos la clave maestra y las horas
+
+        // 🔒 Candado de Seguridad
+        if (admin_secret !== process.env.PANEL_SECRET) {
+            return res.status(403).json({ success: false, error: "Acceso denegado: Clave maestra incorrecta." });
+        }
+
         const duracionHoras = horas || 4; // Si no mandas nada, por defecto son 4
 
         const randomUser = Math.floor(10000 + Math.random() * 90000).toString();
@@ -36,11 +42,16 @@ app.post('/admin/generar-pase-rapido', async (req, res) => {
     }
 });
 
-// 🎯 ENDPOINT 4: EXTENDER ACCESO (El botón de "Tiempo Suplementario")
+// 🎯 ENDPOINT 4: EXTENDER ACCESO (El botón de "Tiempo Suplementario" con seguridad)
 app.post('/admin/extender-acceso', async (req, res) => {
     try {
-        const { usuario_corto, horas_extra } = req.body; // Ej: "73914" y 1
+        const { admin_secret, usuario_corto, horas_extra } = req.body; // Recibimos clave y datos
         
+        // 🔒 Candado de Seguridad
+        if (admin_secret !== process.env.PANEL_SECRET) {
+            return res.status(403).json({ success: false, error: "Acceso denegado: Clave maestra incorrecta." });
+        }
+
         // 1. Buscamos al usuario por su código de 5 dígitos
         const snapshot = await db.collection('usuarios').where('usuario_corto', '==', usuario_corto).get();
         
