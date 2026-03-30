@@ -78,7 +78,6 @@ const authenticateUser = async (req, res, next) => {
 // 🎯 ENDPOINT 1: GENERAR STREAM
 app.get('/generate-stream', streamLimiter, authenticateUser, async (req, res) => {
     const uid = req.user.uid;
-    const userIp = (req.headers['x-forwarded-for'] || req.socket.remoteAddress || '').split(',')[0].trim();
     try {
         const userData = await getUserData(uid);
         const expiresAt = userData?.expires_at?.toMillis ? userData.expires_at.toMillis() : userData?.expires_at;
@@ -99,7 +98,6 @@ app.get('/generate-stream', streamLimiter, authenticateUser, async (req, res) =>
 app.post('/check-session', heartbeatLimiter, authenticateUser, async (req, res) => {
     const uid = req.user.uid;
     const { session_id } = req.body;
-    if (!session_id) return res.status(400).json({ valid: false, motivo: 'error' });
     try {
         const userData = await getUserData(uid);
         const expiresAt = userData?.expires_at?.toMillis ? userData.expires_at.toMillis() : userData?.expires_at;
@@ -107,10 +105,10 @@ app.post('/check-session', heartbeatLimiter, authenticateUser, async (req, res) 
         if (userData.session_id !== session_id) return res.json({ valid: false, motivo: 'pirateria' });
         if (expiresAt && expiresAt <= Date.now()) return res.json({ valid: false, motivo: 'tiempo_agotado' });
         res.json({ valid: true });
-    } catch (e) { res.status(500).json({ valid: false, motivo: 'error_servidor' }); }
+    } catch (e) { res.status(500).json({ valid: false }); }
 });
 
-// 🎯 ENDPOINT 3: GENERAR PASE RÁPIDO O SOCIO MANUAL
+// 🎯 ENDPOINT 3: GENERAR PASE O SOCIO
 app.post('/admin/generar-pase-rapido', async (req, res) => {
     try {
         const { admin_secret, fecha_corte, partido, email_manual, pass_manual } = req.body; 
@@ -179,26 +177,30 @@ app.post('/admin/listar-usuarios', async (req, res) => {
     } catch (error) { res.status(500).json({ success: false, error: error.message }); }
 });
 
-// 🎯 ENDPOINT 7: LIMPIEZA DE CADUCADOS
+// 🎯 ENDPOINT 7: LIMPIEZA DE CADUCADOS (Versión Corregida)
 app.post('/admin/limpiar-caducados', async (req, res) => {
     try {
         const { admin_secret } = req.body;
-        if (admin_secret !== process.env.PANEL_SECRET) return res.status(403).json({ error: "No autorizado" });
+        if (admin_secret !== process.env.PANEL_SECRET) return res.status(403).json({ success: false, error: "No autorizado" });
         const ahora = admin.firestore.Timestamp.now();
         const snapshot = await db.collection('usuarios').where('tipo', '==', 'pase_ocasional').where('expires_at', '<', ahora).get();
-        if (snapshot.empty) return res.json({ success: true, mensaje: "No hay usuarios ocasionales caducados." });
+        if (snapshot.empty) return res.json({ success: true, mensaje: "No hay usuarios caducados para limpiar." });
         let borrados = 0;
-        for (const doc of snapshot.docs) {
+        const promesas = snapshot.docs.map(async (doc) => {
+            const data = doc.data();
             try {
-                const userAuth = await admin.auth().getUserByEmail(doc.data().email);
-                await admin.auth().deleteUser(userAuth.uid);
+                try {
+                    const userAuth = await admin.auth().getUserByEmail(data.email);
+                    await admin.auth().deleteUser(userAuth.uid);
+                } catch (e) {}
                 await db.collection('usuarios').doc(doc.id).delete();
                 borrados++;
-            } catch (err) { console.error("Error al borrar:", err); }
-        }
+            } catch (err) {}
+        });
+        await Promise.all(promesas);
         res.json({ success: true, mensaje: `Limpieza terminada: ${borrados} registros eliminados.` });
-    } catch (error) { res.status(500).json({ error: error.message }); }
+    } catch (error) { res.status(500).json({ success: false, error: "Error interno del servidor." }); }
 });
 
 const PORT = process.env.PORT || 3000;
-app.listen(PORT, () => console.log(`🚀 GOLAZO SP PLATFORM v1.7.0 [FULL CLEANUP] READY`));
+app.listen(PORT, () => console.log(`🚀 GOLAZO SP PLATFORM v1.7.1 READY`));
