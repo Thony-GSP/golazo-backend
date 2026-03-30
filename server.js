@@ -133,7 +133,7 @@ app.post('/admin/generar-pase-rapido', async (req, res) => {
 
         const duracionHoras = horas || 4; 
         const randomUser = Math.floor(10000 + Math.random() * 90000).toString();
-        const randomPass = Math.floor(1000 + Math.random() * 9000).toString();
+        const randomPass = Math.floor(100000 + Math.random() * 900000).toString();
         const correoFirebase = `${randomUser}@golazosp.net`;
 
         const userRecord = await admin.auth().createUser({
