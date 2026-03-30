@@ -45,7 +45,7 @@ const getUserData = async (uid) => {
 
 // 2. SEGURIDAD Y CORS
 app.use(helmet()); 
-app.use(cors()); // Permite conexiones desde tu panel local
+app.use(cors()); 
 app.use(express.json());
 
 // 3. RATE LIMITERS
@@ -106,7 +106,7 @@ app.get('/generate-stream', streamLimiter, authenticateUser, async (req, res) =>
     }
 });
 
-// 🎯 ENDPOINT 2: HEARTBEAT (Ahora envía el motivo exacto de la expulsión)
+// 🎯 ENDPOINT 2: HEARTBEAT (Control de Piratería y Expiración con Motivos)
 app.post('/check-session', heartbeatLimiter, authenticateUser, async (req, res) => {
     const uid = req.user.uid;
     const { session_id } = req.body;
@@ -115,66 +115,57 @@ app.post('/check-session', heartbeatLimiter, authenticateUser, async (req, res) 
         const userData = await getUserData(uid);
         const expiresAt = userData?.expires_at?.toMillis ? userData.expires_at.toMillis() : userData?.expires_at;
         
-        // Si el usuario ya no existe en la base de datos
         if (!userData) {
             userCache.delete(uid);
             return res.json({ valid: false, motivo: 'eliminado' });
         }
 
-        // 1. ¿Compartió su cuenta? (Detección de piratería)
         if (userData.session_id !== session_id) {
             userCache.delete(uid);
             return res.json({ valid: false, motivo: 'pirateria' });
         }
 
-        // 2. ¿Se le acabó el tiempo del pase? (Control de tiempo)
         if (expiresAt && expiresAt <= Date.now()) {
             userCache.delete(uid);
             return res.json({ valid: false, motivo: 'tiempo_agotado' });
         }
 
-        // Si pasó todas las pruebas, lo dejamos seguir viendo el partido
         res.json({ valid: true });
         
     } catch (e) { res.status(500).json({ valid: false, motivo: 'error_servidor' }); }
 });
 
-// 🎯 ENDPOINT 3: GENERAR PASE RÁPIDO (Con Fecha y Hora Exacta)
+// 🎯 ENDPOINT 3: GENERAR PASE RÁPIDO O SOCIO MANUAL
 app.post('/admin/generar-pase-rapido', async (req, res) => {
     try {
-        const { admin_secret, fecha_corte, partido } = req.body; 
+        const { admin_secret, fecha_corte, partido, email_manual, pass_manual } = req.body; 
 
         if (admin_secret !== process.env.PANEL_SECRET) {
-            return res.status(403).json({ success: false, error: "Acceso denegado: Clave maestra incorrecta." });
+            return res.status(403).json({ success: false, error: "Acceso denegado." });
         }
 
-        if (!fecha_corte) {
-            return res.status(400).json({ success: false, error: "Debes especificar la fecha y hora de corte." });
-        }
-
-        const nombrePartido = partido || 'Sin especificar'; 
-        const randomUser = Math.floor(10000 + Math.random() * 90000).toString();
-        const randomPass = Math.floor(100000 + Math.random() * 900000).toString();
-        const correoFirebase = `${randomUser}@golazosp.net`;
+        // Si mandas email_manual, es un Socio. Si no, es un Pase de 5 dígitos.
+        const esSocio = !!email_manual;
+        const emailFinal = email_manual || `${Math.floor(10000 + Math.random() * 90000)}@golazosp.net`;
+        const passFinal = pass_manual || Math.floor(100000 + Math.random() * 900000).toString();
+        const usuarioCorto = esSocio ? email_manual : emailFinal.split('@')[0];
 
         const userRecord = await admin.auth().createUser({
-            email: correoFirebase,
-            password: randomPass,
+            email: emailFinal,
+            password: passFinal,
         });
 
-        // Convertimos la fecha exacta enviada desde tu panel a formato Firebase
         const fechaExpiracion = admin.firestore.Timestamp.fromDate(new Date(fecha_corte));
 
         await db.collection('usuarios').doc(userRecord.uid).set({
-            email: correoFirebase,
-            usuario_corto: randomUser, 
+            email: emailFinal,
+            usuario_corto: usuarioCorto, 
             expires_at: fechaExpiracion,
-            tipo: 'pase_ocasional',
-            etiqueta: nombrePartido, 
+            tipo: esSocio ? 'socio_mensual' : 'pase_ocasional',
+            etiqueta: partido || 'Sin especificar', 
             creado_el: admin.firestore.FieldValue.serverTimestamp()
         });
 
-        // Formateamos la fecha para que el mensaje de WhatsApp muestre la hora de Perú
         const fechaFormateada = new Date(fecha_corte).toLocaleString('es-PE', { 
             timeZone: 'America/Lima',
             day: '2-digit', month: '2-digit', year: 'numeric',
@@ -183,10 +174,10 @@ app.post('/admin/generar-pase-rapido', async (req, res) => {
 
         res.json({
             success: true,
-            usuario: randomUser,
-            clave: randomPass,
+            usuario: usuarioCorto,
+            clave: passFinal,
             expira_en: fechaFormateada,
-            partido: nombrePartido
+            partido: partido || 'General'
         });
 
     } catch (error) {
@@ -194,23 +185,28 @@ app.post('/admin/generar-pase-rapido', async (req, res) => {
     }
 });
 
-// 🎯 ENDPOINT 4: EXTENDER ACCESO
+// 🎯 ENDPOINT 4: EXTENDER ACCESO / RENOVACIÓN
 app.post('/admin/extender-acceso', async (req, res) => {
     try {
         const { admin_secret, usuario_corto, horas_extra } = req.body; 
         
         if (admin_secret !== process.env.PANEL_SECRET) {
-            return res.status(403).json({ success: false, error: "Acceso denegado: Clave maestra incorrecta." });
+            return res.status(403).json({ success: false, error: "Clave maestra incorrecta." });
         }
 
-        const snapshot = await db.collection('usuarios').where('usuario_corto', '==', usuario_corto).get();
+        // Buscamos por el ID corto o por el Email completo
+        let snapshot = await db.collection('usuarios').where('usuario_corto', '==', usuario_corto).get();
+        if (snapshot.empty) {
+            snapshot = await db.collection('usuarios').where('email', '==', usuario_corto).get();
+        }
+
         if (snapshot.empty) return res.status(404).json({ error: "Usuario no encontrado" });
         
         const doc = snapshot.docs[0];
         const data = doc.data();
         
         const tiempoActual = data.expires_at.toMillis();
-        const nuevoTiempo = admin.firestore.Timestamp.fromMillis(tiempoActual + (horas_extra * 60 * 60 * 1000));
+        const nuevoTiempo = admin.firestore.Timestamp.fromMillis(tiempoActual + (parseFloat(horas_extra) * 60 * 60 * 1000));
 
         await db.collection('usuarios').doc(doc.id).update({
             expires_at: nuevoTiempo
@@ -220,7 +216,7 @@ app.post('/admin/extender-acceso', async (req, res) => {
 
         res.json({ 
             success: true, 
-            mensaje: `Acceso extendido ${horas_extra} hora(s) para ${usuario_corto}` 
+            mensaje: `Tiempo actualizado con éxito para ${usuario_corto}` 
         });
 
     } catch (error) {
@@ -228,5 +224,41 @@ app.post('/admin/extender-acceso', async (req, res) => {
     }
 });
 
+// 🎯 ENDPOINT 6: LISTAR USUARIOS (Auditoría en Vivo)
+app.post('/admin/listar-usuarios', async (req, res) => {
+    try {
+        const { admin_secret } = req.body;
+        if (admin_secret !== process.env.PANEL_SECRET) return res.status(403).json({ success: false, error: "No autorizado" });
+
+        const snapshot = await db.collection('usuarios').orderBy('creado_el', 'desc').limit(100).get();
+        const ahora = Date.now();
+        
+        const usuarios = snapshot.docs.map(doc => {
+            const data = doc.data();
+            const expiresAt = data.expires_at?.toMillis ? data.expires_at.toMillis() : data.expires_at;
+            const tiempoRestanteMs = expiresAt - ahora;
+            
+            let tiempoTexto = "Expirado";
+            if (tiempoRestanteMs > 0) {
+                const dias = Math.floor(tiempoRestanteMs / 86400000);
+                const horas = Math.floor((tiempoRestanteMs % 86400000) / 3600000);
+                const mins = Math.floor((tiempoRestanteMs % 3600000) / 60000);
+                tiempoTexto = dias > 0 ? `${dias}d ${horas}h` : `${horas}h ${mins}m`;
+            }
+
+            return {
+                email: data.email,
+                usuario_corto: data.usuario_corto,
+                etiqueta: data.etiqueta,
+                estado: tiempoRestanteMs > 0 ? "ACTIVO ✅" : "CADUCADO ❌",
+                tiempo: tiempoTexto,
+                esActivo: tiempoRestanteMs > 0
+            };
+        });
+
+        res.json({ success: true, usuarios });
+    } catch (error) { res.status(500).json({ success: false, error: error.message }); }
+});
+
 const PORT = process.env.PORT || 3000;
-app.listen(PORT, () => console.log(`🚀 GOLAZO SP PLATFORM v1.4.6 [SMART ALERTS] READY`));
+app.listen(PORT, () => console.log(`🚀 GOLAZO SP PLATFORM v1.6.0 [MASTER CONSOLE] READY`));
