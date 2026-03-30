@@ -1,15 +1,137 @@
-// 🎯 ENDPOINT 3: GENERAR PASE RÁPIDO (Ahora con tiempo dinámico y seguridad)
+const express = require('express');
+const admin = require('firebase-admin');
+const crypto = require('crypto');
+const cors = require('cors');
+const rateLimit = require('express-rate-limit');
+const helmet = require('helmet');
+
+// 1. INICIALIZAR FIREBASE
+const serviceAccount = JSON.parse(process.env.FIREBASE_JSON);
+admin.initializeApp({
+    credential: admin.credential.cert(serviceAccount)
+});
+const db = admin.firestore();
+const app = express();
+
+app.set('trust proxy', 1);
+
+// --- 🚀 SISTEMA DE CACHÉ PRO PERMISIVO ---
+const userCache = new Map(); 
+const CACHE_TTL = 5 * 60 * 1000; 
+
+setInterval(() => {
+    const now = Date.now();
+    let count = 0;
+    for (const [uid, value] of userCache.entries()) {
+        if (now - value.timestamp > CACHE_TTL) {
+            userCache.delete(uid);
+            count++;
+        }
+    }
+    if(count > 0) console.log(`[Cache] Limpieza: ${count} eliminados.`);
+}, 10 * 60 * 1000);
+
+const getUserData = async (uid) => {
+    const now = Date.now();
+    const cached = userCache.get(uid);
+    if (cached && (now - cached.timestamp < CACHE_TTL)) return cached.data;
+
+    const userDoc = await db.collection('usuarios').doc(uid).get();
+    if (!userDoc.exists) return null;
+    const data = userDoc.data();
+    userCache.set(uid, { data, timestamp: now });
+    return data;
+};
+
+// 2. SEGURIDAD Y CORS (Ajustado para permitir tu Panel Local)
+app.use(helmet()); 
+app.use(cors()); // <-- ESTO PERMITE QUE TU ARCHIVO PANEL.HTML SE CONECTE
+app.use(express.json());
+
+// 3. RATE LIMITERS
+const streamLimiter = rateLimit({
+    windowMs: 1 * 60 * 1000, max: 10,
+    message: { error: 'Muchos pedidos. Espera 1 min.' }
+});
+const heartbeatLimiter = rateLimit({
+    windowMs: 1 * 60 * 1000, max: 120, 
+    message: { error: 'Actividad sospechosa.' }
+});
+
+// 4. CONFIGURACIÓN DE STREAMING
+const BUNNY_URL = 'https://stream.golazosp.net'; 
+const BUNNY_SECURITY_KEY = process.env.BUNNY_KEY; 
+const STREAM_PATH = '/stream/canal.m3u8';
+const TOKEN_DURATION = 7200; 
+
+const authenticateUser = async (req, res, next) => {
+    const authHeader = req.headers.authorization;
+    if (!authHeader || !authHeader.startsWith('Bearer ')) return res.status(401).json({ error: 'No autorizado' });
+    const idToken = authHeader.split('Bearer ')[1];
+    try {
+        const decodedToken = await admin.auth().verifyIdToken(idToken);
+        req.user = decodedToken;
+        next();
+    } catch (e) { res.status(401).json({ error: 'Sesión expirada.' }); }
+};
+
+// 🎯 ENDPOINT 1: GENERAR STREAM
+app.get('/generate-stream', streamLimiter, authenticateUser, async (req, res) => {
+    const uid = req.user.uid;
+    const userIp = (req.headers['x-forwarded-for'] || req.socket.remoteAddress || '').split(',')[0].trim();
+    
+    try {
+        const userData = await getUserData(uid);
+        const expiresAt = userData?.expires_at?.toMillis ? userData.expires_at.toMillis() : userData?.expires_at;
+
+        if (!userData || !expiresAt || expiresAt < Date.now()) return res.status(403).json({ error: 'Inactivo' });
+
+        const newSessionId = crypto.randomUUID();
+        await db.collection('usuarios').doc(uid).update({ session_id: newSessionId });
+        
+        userCache.set(uid, { data: { ...userData, session_id: newSessionId }, timestamp: Date.now() });
+
+        const expires = Math.floor(Date.now() / 1000) + TOKEN_DURATION;
+        const pathAllowed = '/stream/'; 
+        const hashableBase = BUNNY_SECURITY_KEY + pathAllowed + expires + 'token_path=' + pathAllowed;
+        const token = crypto.createHash('sha256').update(hashableBase).digest('base64').replace(/\n/g, '').replace(/\+/g, '-').replace(/\//g, '_').replace(/=/g, '');
+
+        const finalUrl = `${BUNNY_URL}/bcdn_token=${token}&expires=${expires}&token_path=%2Fstream%2F${STREAM_PATH}`;
+        
+        console.log(`[${new Date().toISOString()}] ✅ Stream OK: ${uid} | ${userIp}`);
+        res.json({ stream_url: finalUrl, session_id: newSessionId });
+    } catch (e) { 
+        console.error("Error en generate-stream:", e);
+        res.status(500).json({ error: 'Error interno' }); 
+    }
+});
+
+// 🎯 ENDPOINT 2: HEARTBEAT
+app.post('/check-session', heartbeatLimiter, authenticateUser, async (req, res) => {
+    const uid = req.user.uid;
+    const { session_id } = req.body;
+    if (!session_id) return res.status(400).json({ valid: false });
+    try {
+        const userData = await getUserData(uid);
+        if (userData && userData.session_id === session_id) {
+            res.json({ valid: true });
+        } else {
+            userCache.delete(uid);
+            res.json({ valid: false });
+        }
+    } catch (e) { res.status(500).json({ valid: false }); }
+});
+
+// 🎯 ENDPOINT 3: GENERAR PASE RÁPIDO
 app.post('/admin/generar-pase-rapido', async (req, res) => {
     try {
-        const { admin_secret, horas } = req.body; // Recibimos la clave maestra y las horas
+        const { admin_secret, horas } = req.body; 
 
-        // 🔒 Candado de Seguridad
         if (admin_secret !== process.env.PANEL_SECRET) {
             return res.status(403).json({ success: false, error: "Acceso denegado: Clave maestra incorrecta." });
         }
 
-        const duracionHoras = horas || 4; // Si no mandas nada, por defecto son 4
-
+        const duracionHoras = horas || 4; 
         const randomUser = Math.floor(10000 + Math.random() * 90000).toString();
         const randomPass = Math.floor(1000 + Math.random() * 9000).toString();
         const correoFirebase = `${randomUser}@golazosp.net`;
@@ -19,12 +141,11 @@ app.post('/admin/generar-pase-rapido', async (req, res) => {
             password: randomPass,
         });
 
-        // Calculamos la expiración basada en lo que tú elijas en el Panel
         const fechaExpiracion = admin.firestore.Timestamp.fromMillis(Date.now() + (duracionHoras * 60 * 60 * 1000));
 
         await db.collection('usuarios').doc(userRecord.uid).set({
             email: correoFirebase,
-            usuario_corto: randomUser, // Guardamos esto para buscarlo rápido luego
+            usuario_corto: randomUser, 
             expires_at: fechaExpiracion,
             tipo: 'pase_ocasional',
             creado_el: admin.firestore.FieldValue.serverTimestamp()
@@ -42,17 +163,15 @@ app.post('/admin/generar-pase-rapido', async (req, res) => {
     }
 });
 
-// 🎯 ENDPOINT 4: EXTENDER ACCESO (El botón de "Tiempo Suplementario" con seguridad)
+// 🎯 ENDPOINT 4: EXTENDER ACCESO
 app.post('/admin/extender-acceso', async (req, res) => {
     try {
-        const { admin_secret, usuario_corto, horas_extra } = req.body; // Recibimos clave y datos
+        const { admin_secret, usuario_corto, horas_extra } = req.body; 
         
-        // 🔒 Candado de Seguridad
         if (admin_secret !== process.env.PANEL_SECRET) {
             return res.status(403).json({ success: false, error: "Acceso denegado: Clave maestra incorrecta." });
         }
 
-        // 1. Buscamos al usuario por su código de 5 dígitos
         const snapshot = await db.collection('usuarios').where('usuario_corto', '==', usuario_corto).get();
         
         if (snapshot.empty) return res.status(404).json({ error: "Usuario no encontrado" });
@@ -60,16 +179,13 @@ app.post('/admin/extender-acceso', async (req, res) => {
         const doc = snapshot.docs[0];
         const data = doc.data();
         
-        // 2. Calculamos el nuevo tiempo (Tiempo actual que tenía + las horas extra)
         const tiempoActual = data.expires_at.toMillis();
         const nuevoTiempo = admin.firestore.Timestamp.fromMillis(tiempoActual + (horas_extra * 60 * 60 * 1000));
 
-        // 3. Actualizamos en la DB
         await db.collection('usuarios').doc(doc.id).update({
             expires_at: nuevoTiempo
         });
 
-        // 4. LIMPIAMOS CACHÉ (Vital para que el reproductor detecte el cambio al instante)
         userCache.delete(doc.id);
 
         res.json({ 
@@ -82,3 +198,5 @@ app.post('/admin/extender-acceso', async (req, res) => {
     }
 });
 
+const PORT = process.env.PORT || 3000;
+app.listen(PORT, () => console.log(`🚀 GOLAZO SP PLATFORM v1.4.2 [PANEL ADMIN] READY`));
