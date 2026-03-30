@@ -106,23 +106,37 @@ app.get('/generate-stream', streamLimiter, authenticateUser, async (req, res) =>
     }
 });
 
-// 🎯 ENDPOINT 2: HEARTBEAT (Expulsión exacta basada en el tiempo real)
+// 🎯 ENDPOINT 2: HEARTBEAT (Ahora envía el motivo exacto de la expulsión)
 app.post('/check-session', heartbeatLimiter, authenticateUser, async (req, res) => {
     const uid = req.user.uid;
     const { session_id } = req.body;
-    if (!session_id) return res.status(400).json({ valid: false });
+    if (!session_id) return res.status(400).json({ valid: false, motivo: 'error' });
     try {
         const userData = await getUserData(uid);
         const expiresAt = userData?.expires_at?.toMillis ? userData.expires_at.toMillis() : userData?.expires_at;
         
-        // Solo es válido si la sesión coincide y el tiempo actual es MENOR a la fecha de expiración
-        if (userData && userData.session_id === session_id && expiresAt && expiresAt > Date.now()) {
-            res.json({ valid: true });
-        } else {
-            userCache.delete(uid); // Expulsión de caché
-            res.json({ valid: false });
+        // Si el usuario ya no existe en la base de datos
+        if (!userData) {
+            userCache.delete(uid);
+            return res.json({ valid: false, motivo: 'eliminado' });
         }
-    } catch (e) { res.status(500).json({ valid: false }); }
+
+        // 1. ¿Compartió su cuenta? (Detección de piratería)
+        if (userData.session_id !== session_id) {
+            userCache.delete(uid);
+            return res.json({ valid: false, motivo: 'pirateria' });
+        }
+
+        // 2. ¿Se le acabó el tiempo del pase? (Control de tiempo)
+        if (expiresAt && expiresAt <= Date.now()) {
+            userCache.delete(uid);
+            return res.json({ valid: false, motivo: 'tiempo_agotado' });
+        }
+
+        // Si pasó todas las pruebas, lo dejamos seguir viendo el partido
+        res.json({ valid: true });
+        
+    } catch (e) { res.status(500).json({ valid: false, motivo: 'error_servidor' }); }
 });
 
 // 🎯 ENDPOINT 3: GENERAR PASE RÁPIDO (Con Fecha y Hora Exacta)
@@ -215,4 +229,4 @@ app.post('/admin/extender-acceso', async (req, res) => {
 });
 
 const PORT = process.env.PORT || 3000;
-app.listen(PORT, () => console.log(`🚀 GOLAZO SP PLATFORM v1.4.5 [TIME CONTROL] READY`));
+app.listen(PORT, () => console.log(`🚀 GOLAZO SP PLATFORM v1.4.6 [SMART ALERTS] READY`));
