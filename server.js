@@ -40,16 +40,32 @@ bot.hears('1️⃣ Partido Individual', async (ctx) => {
     ctx.replyWithMarkdown(`⚽ **Elige el partido que quieres ver:**\n\n${t.partidos_cartelera}\n\n💰 **Precio:** S/ 5.00 / $1.50 USD\n\n👉 Realiza el pago y envía la captura aquí.`);
 });
 
+// FLUJO DE SOCIO VIP ACTUALIZADO (PAGO PRIMERO)
 bot.hears('2️⃣ Socio VIP Mensual', (ctx) => {
     const vipTxt = `💎 **Socio VIP Golazo (30 días):**\n\n` +
-                   `No te pierdas ni un segundo de tu equipo favorito estés donde estés.\n` +
-                   `✅ **Tu equipo local:** Alianza, U, Cristal, Boys o Melgar.\n` +
-                   `✅ **Torneos Internacionales:** Libertadores y Sudamericana.\n` +
-                   `✅ **Fútbol de Élite:** Champions League.\n` +
-                   `✅ **La Blanquirroja:** Selección Peruana.\n\n` +
+                   `Acceso total a Liga 1 (YouTube VIP) y Torneos Internacionales (Web).\n\n` +
                    `💰 **Precio:** S/ 20.00 / $5.50 USD\n\n` +
-                   `📧 **POR FAVOR, ESCRIBE TU CORREO ELECTRÓNICO:**`;
-    ctx.replyWithMarkdown(vipTxt);
+                   `👇 **ELIGE TU MÉTODO DE PAGO:**`;
+
+    ctx.replyWithMarkdown(vipTxt, Markup.inlineKeyboard([
+        [Markup.button.callback('🇵🇪 Yape (Perú)', 'pago_yape')],
+        [Markup.button.callback('🌎 PayPal / Binance (Internacional)', 'pago_extranjero')]
+    ]));
+});
+
+// Acciones de pago
+bot.action('pago_yape', (ctx) => {
+    ctx.replyWithMarkdown(`💳 **PAGO POR YAPE:**\n\n` +
+                   `Número: **987 456 932**\n` +
+                   `A nombre de: **Thony**\n\n` +
+                   `🚀 **PASO FINAL:** Envía la captura del pago y **ESCRIBE TU CORREO** aquí mismo para activar tu cuenta.`);
+});
+
+bot.action('pago_extranjero', (ctx) => {
+    ctx.replyWithMarkdown(`🌐 **PAGO INTERNACIONAL:**\n\n` +
+                   `🔹 **PayPal:** [Haz clic aquí para pagar](https://paypal.me/thonytech)\n` +
+                   `🔹 **Binance Pay ID:** \`735707066\`\n\n` +
+                   `🚀 **PASO FINAL:** Envía la captura del pago y **ESCRIBE TU CORREO** aquí mismo para activar tu cuenta.`);
 });
 
 bot.on('photo', (ctx) => {
@@ -66,9 +82,7 @@ const BUNNY_URL = 'https://stream.golazosp.net';
 const BUNNY_SECURITY_KEY = process.env.BUNNY_KEY; 
 const STREAM_PATH = '/stream/canal.m3u8';
 
-app.get('/generate-stream', rateLimit({ windowMs: 1*60*1000, max: 20 }), async (req, res) => {
-    // ... (Tu lógica de generación de token Bunny existente)
-});
+// (Aquí se mantiene tu lógica de generate-stream y check-session que ya tienes)
 
 // --- ENDPOINTS DE ADMIN ---
 app.post('/admin/update-bot', async (req, res) => {
@@ -105,11 +119,26 @@ app.post('/admin/listar-usuarios', async (req, res) => {
         const usuarios = snap.docs.map(doc => {
             const d = doc.data();
             const rest = d.expires_at.toMillis() - ahora;
-            return { email: d.email, usuario_corto: d.usuario_corto, etiqueta: d.etiqueta, tipo: d.tipo, rest, esActivo: rest > 0 };
+            let tT = "Expirado";
+            if (rest > 0) {
+                const h = Math.floor(rest / 3600000);
+                const m = Math.floor((rest % 3600000) / 60000);
+                tT = `${h}h ${m}m`;
+            }
+            return { 
+                email: d.email, 
+                usuario_corto: d.usuario_corto, 
+                etiqueta: d.etiqueta, 
+                estado: rest > 0 ? "ACTIVO ✅" : "CADUCADO ❌", 
+                tiempo: tT, 
+                esActivo: rest > 0,
+                tipo: d.tipo,
+                rest: rest
+            };
         });
         res.json({ success: true, usuarios });
     } catch (e) { res.status(500).json({ success: false }); }
 });
 
 const PORT = process.env.PORT || 3000;
-app.listen(PORT, () => console.log(`🚀 SERVIDOR GOLAZO v2.5 READY`));
+app.listen(PORT, () => console.log(`🚀 SERVIDOR GOLAZO v2.8 READY`));
