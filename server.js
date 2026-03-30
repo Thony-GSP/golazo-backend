@@ -43,9 +43,9 @@ const getUserData = async (uid) => {
     return data;
 };
 
-// 2. SEGURIDAD Y CORS (Ajustado para permitir tu Panel Local)
+// 2. SEGURIDAD Y CORS
 app.use(helmet()); 
-app.use(cors()); // <-- ESTO PERMITE QUE TU ARCHIVO PANEL.HTML SE CONECTE
+app.use(cors()); // Permite conexiones desde tu panel local
 app.use(express.json());
 
 // 3. RATE LIMITERS
@@ -106,32 +106,39 @@ app.get('/generate-stream', streamLimiter, authenticateUser, async (req, res) =>
     }
 });
 
-// 🎯 ENDPOINT 2: HEARTBEAT
+// 🎯 ENDPOINT 2: HEARTBEAT (Expulsión exacta basada en el tiempo real)
 app.post('/check-session', heartbeatLimiter, authenticateUser, async (req, res) => {
     const uid = req.user.uid;
     const { session_id } = req.body;
     if (!session_id) return res.status(400).json({ valid: false });
     try {
         const userData = await getUserData(uid);
-        if (userData && userData.session_id === session_id) {
+        const expiresAt = userData?.expires_at?.toMillis ? userData.expires_at.toMillis() : userData?.expires_at;
+        
+        // Solo es válido si la sesión coincide y el tiempo actual es MENOR a la fecha de expiración
+        if (userData && userData.session_id === session_id && expiresAt && expiresAt > Date.now()) {
             res.json({ valid: true });
         } else {
-            userCache.delete(uid);
+            userCache.delete(uid); // Expulsión de caché
             res.json({ valid: false });
         }
     } catch (e) { res.status(500).json({ valid: false }); }
 });
 
-// 🎯 ENDPOINT 3: GENERAR PASE RÁPIDO
+// 🎯 ENDPOINT 3: GENERAR PASE RÁPIDO (Con Fecha y Hora Exacta)
 app.post('/admin/generar-pase-rapido', async (req, res) => {
     try {
-        const { admin_secret, horas } = req.body; 
+        const { admin_secret, fecha_corte, partido } = req.body; 
 
         if (admin_secret !== process.env.PANEL_SECRET) {
             return res.status(403).json({ success: false, error: "Acceso denegado: Clave maestra incorrecta." });
         }
 
-        const duracionHoras = horas || 4; 
+        if (!fecha_corte) {
+            return res.status(400).json({ success: false, error: "Debes especificar la fecha y hora de corte." });
+        }
+
+        const nombrePartido = partido || 'Sin especificar'; 
         const randomUser = Math.floor(10000 + Math.random() * 90000).toString();
         const randomPass = Math.floor(100000 + Math.random() * 900000).toString();
         const correoFirebase = `${randomUser}@golazosp.net`;
@@ -141,21 +148,31 @@ app.post('/admin/generar-pase-rapido', async (req, res) => {
             password: randomPass,
         });
 
-        const fechaExpiracion = admin.firestore.Timestamp.fromMillis(Date.now() + (duracionHoras * 60 * 60 * 1000));
+        // Convertimos la fecha exacta enviada desde tu panel a formato Firebase
+        const fechaExpiracion = admin.firestore.Timestamp.fromDate(new Date(fecha_corte));
 
         await db.collection('usuarios').doc(userRecord.uid).set({
             email: correoFirebase,
             usuario_corto: randomUser, 
             expires_at: fechaExpiracion,
             tipo: 'pase_ocasional',
+            etiqueta: nombrePartido, 
             creado_el: admin.firestore.FieldValue.serverTimestamp()
+        });
+
+        // Formateamos la fecha para que el mensaje de WhatsApp muestre la hora de Perú
+        const fechaFormateada = new Date(fecha_corte).toLocaleString('es-PE', { 
+            timeZone: 'America/Lima',
+            day: '2-digit', month: '2-digit', year: 'numeric',
+            hour: '2-digit', minute: '2-digit', hour12: true 
         });
 
         res.json({
             success: true,
             usuario: randomUser,
             clave: randomPass,
-            expira_en: duracionHoras + " horas"
+            expira_en: fechaFormateada,
+            partido: nombrePartido
         });
 
     } catch (error) {
@@ -173,7 +190,6 @@ app.post('/admin/extender-acceso', async (req, res) => {
         }
 
         const snapshot = await db.collection('usuarios').where('usuario_corto', '==', usuario_corto).get();
-        
         if (snapshot.empty) return res.status(404).json({ error: "Usuario no encontrado" });
         
         const doc = snapshot.docs[0];
@@ -199,4 +215,4 @@ app.post('/admin/extender-acceso', async (req, res) => {
 });
 
 const PORT = process.env.PORT || 3000;
-app.listen(PORT, () => console.log(`🚀 GOLAZO SP PLATFORM v1.4.2 [PANEL ADMIN] READY`));
+app.listen(PORT, () => console.log(`🚀 GOLAZO SP PLATFORM v1.4.5 [TIME CONTROL] READY`));
