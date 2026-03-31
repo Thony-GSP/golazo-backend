@@ -2,120 +2,65 @@
 <html lang="es">
 <head>
     <meta charset="UTF-8">
-    <meta name="viewport" content="width=device-width, initial-scale=1.0, maximum-scale=1.0, user-scalable=no">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
     <title>GOLAZO SP - CENTRAL MAESTRA</title>
     <style>
         :root { --primary: #ef4444; --bg: #0f172a; --card: #1e293b; --text: #f8fafc; }
-        body { font-family: 'Segoe UI', system-ui, sans-serif; background: var(--bg); color: var(--text); margin: 0; padding: 10px; }
-        .dashboard { max-width: 1100px; margin: auto; background: var(--card); padding: 20px; border-radius: 16px; border-top: 5px solid var(--primary); box-shadow: 0 10px 30px rgba(0,0,0,0.5); }
-        h1 { text-align: center; color: var(--primary); font-size: 22px; margin-bottom: 20px; text-transform: uppercase; letter-spacing: 1px; }
-        
-        /* Grid de Secciones */
-        .grid-bot { margin-bottom: 20px; }
-        .grid-main { display: grid; grid-template-columns: repeat(auto-fit, minmax(300px, 1fr)); gap: 15px; }
-        
-        .section { background: var(--bg); padding: 18px; border-radius: 12px; border: 1px solid #334155; position: relative; }
-        h2 { font-size: 14px; color: #94a3b8; border-bottom: 1px solid #334155; padding-bottom: 10px; margin-top: 0; text-transform: uppercase; }
-        
-        input, select, textarea { width: 100%; padding: 12px; margin: 8px 0; border-radius: 8px; border: 1px solid #475569; background: var(--card); color: white; font-size: 16px; box-sizing: border-box; }
-        
-        button { width: 100%; padding: 15px; border: none; border-radius: 8px; cursor: pointer; font-weight: bold; text-transform: uppercase; transition: 0.2s; font-size: 13px; }
-        button:active { transform: scale(0.97); }
-
-        /* Colores de Botones */
-        .btn-bot { background: #a855f7; color: white; }
+        body { font-family: 'Segoe UI', sans-serif; background: var(--bg); color: var(--text); padding: 10px; margin: 0; }
+        .dashboard { max-width: 1100px; margin: auto; background: var(--card); padding: 20px; border-radius: 16px; border-top: 5px solid var(--primary); }
+        h1 { text-align: center; color: var(--primary); font-size: 20px; }
+        .section { background: var(--bg); padding: 15px; border-radius: 12px; margin-bottom: 15px; border: 1px solid #334155; }
+        input, textarea, select { width: 100%; padding: 10px; margin: 5px 0; border-radius: 8px; background: var(--card); color: white; border: 1px solid #475569; box-sizing: border-box; }
+        button { width: 100%; padding: 12px; border: none; border-radius: 8px; cursor: pointer; font-weight: bold; text-transform: uppercase; margin-top: 5px; }
         .btn-crear { background: #10b981; color: white; }
-        .btn-socio { background: #f59e0b; color: white; }
-        .btn-extender { background: #3b82f6; color: white; }
-        .btn-refresh { background: var(--primary); width: 45px; height: 45px; padding: 0; border-radius: 8px; }
-        .btn-limpiar { background: #475569; width: auto; padding: 10px 20px; }
-
-        .res-box { background: #000; color: #22c55e; padding: 15px; border-radius: 8px; font-family: 'Courier New', monospace; font-size: 13px; margin-top: 15px; display: none; white-space: pre-wrap; border: 1px solid #22c55e; }
-        
-        /* Tabla */
-        .table-wrapper { overflow-x: auto; background: var(--bg); border-radius: 12px; margin-top: 15px; border: 1px solid #334155; }
-        table { width: 100%; border-collapse: collapse; min-width: 600px; }
-        th { background: #1e293b; padding: 15px; text-align: left; font-size: 12px; color: #94a3b8; }
-        td { padding: 15px; border-bottom: 1px solid #1e293b; font-size: 14px; }
-        .badge { padding: 4px 8px; border-radius: 6px; font-size: 11px; font-weight: bold; }
+        .btn-bot { background: #a855f7; color: white; }
+        .res-box { background: #000; color: #22c55e; padding: 10px; border-radius: 8px; margin-top: 10px; display: none; font-family: monospace; white-space: pre-wrap; }
+        table { width: 100%; border-collapse: collapse; margin-top: 10px; }
+        th, td { padding: 10px; border-bottom: 1px solid #334155; text-align: left; font-size: 13px; }
+        .badge { padding: 3px 6px; border-radius: 4px; font-size: 10px; }
     </style>
 </head>
 <body>
-
 <div class="dashboard">
-    <h1>⚙️ GOLAZO SP - CENTRAL DE MANDO</h1>
-    
-    <input type="password" id="adminSecret" placeholder="🔐 Ingresa Clave Maestra para activar">
+    <h1>⚙️ GOLAZO SP - MANDO CENTRAL</h1>
+    <input type="password" id="adminSecret" placeholder="🔐 Clave Maestra">
 
-    <div class="grid-bot">
-        <div class="section" style="border-left: 4px solid #a855f7;">
-            <h2>🤖 CONFIGURACIÓN DEL BOT DE TELEGRAM</h2>
-            <div style="display: flex; gap: 10px; flex-wrap: wrap;">
-                <div style="flex: 1; min-width: 250px;">
-                    <input type="text" id="botPromo" placeholder="Promo hoy (Fase 1: ej. ¡Tripleta S/10!)">
-                    <input type="text" id="botLinkVip" placeholder="Link Grupo VIP (YouTube)">
-                </div>
-                <div style="flex: 1; min-width: 250px;">
-                    <textarea id="botPartidos" placeholder="Cartelera (Fase 2: Un partido por línea)" style="height: 100px;"></textarea>
-                </div>
-            </div>
-            <button class="btn-bot" onclick="actualizarBot()">Guardar Cambios en el Bot</button>
-        </div>
+    <div class="section">
+        <h2>🤖 BOT TELEGRAM</h2>
+        <input type="text" id="botPromo" placeholder="Promo hoy">
+        <textarea id="botPartidos" placeholder="Cartelera (Un partido por línea)"></textarea>
+        <input type="text" id="botLinkVip" placeholder="Link Grupo VIP">
+        <button class="btn-bot" onclick="actualizarBot()">Guardar en Bot</button>
     </div>
 
-    <div class="grid-main">
-        <div class="section" style="border-left: 4px solid #10b981;">
+    <div style="display: grid; grid-template-columns: 1fr 1fr; gap: 15px;">
+        <div class="section">
             <h2>⚡ PASE RÁPIDO</h2>
             <input type="text" id="nombrePartido" placeholder="Ej: Perú vs Brasil">
             <input type="datetime-local" id="fechaCorte">
-            <button class="btn-crear" onclick="generarPase(false)">Generar y Copiar</button>
+            <button class="btn-crear" onclick="generarPase(false)">Crear Pase</button>
             <div id="resPase" class="res-box"></div>
         </div>
-
-        <div class="section" style="border-left: 4px solid #f59e0b;">
-            <h2>💎 SOCIO MENSUAL</h2>
-            <input type="text" id="socioEmail" placeholder="Email del cliente">
-            <input type="text" id="socioPass" placeholder="Clave temporal">
+        <div class="section">
+            <h2>💎 SOCIO VIP</h2>
+            <input type="text" id="socioEmail" placeholder="Email o Nombre">
             <select id="socioMeses">
                 <option value="720">Plan 1 Mes</option>
                 <option value="1440">Plan 2 Meses</option>
             </select>
-            <button class="btn-socio" onclick="generarPase(true)">Activar Socio VIP</button>
-            <div id="resSocio" class="res-box" style="color: #f59e0b; border-color: #f59e0b;"></div>
-        </div>
-
-        <div class="section" style="border-left: 4px solid #3b82f6;">
-            <h2>⏱️ TIEMPO EXTRA</h2>
-            <input type="text" id="usuarioExtender" placeholder="Usuario o Email">
-            <select id="horasExtra">
-                <option value="0.25">15 Minutos</option>
-                <option value="1" selected>1 Hora</option>
-                <option value="2">2 Horas</option>
-                <option value="720">Añadir 1 Mes</option>
-            </select>
-            <button class="btn-extender" onclick="extenderPase()">Aplicar Tiempo</button>
+            <button class="btn-crear" style="background:#f59e0b" onclick="generarPase(true)">Activar VIP</button>
+            <div id="resSocio" class="res-box" style="color:#f59e0b"></div>
         </div>
     </div>
 
-    <div style="display: flex; justify-content: space-between; align-items: center; margin-top: 30px;">
-        <h2 style="border: none; margin: 0;">📊 AUDITORÍA DE ACCESOS</h2>
-        <div style="display: flex; gap: 10px;">
-            <button class="btn-refresh" onclick="cargarUsuarios()">🔄</button>
-            <button class="btn-limpiar" onclick="limpiarCaducados()">🧹 Limpiar</button>
+    <div class="section">
+        <div style="display: flex; justify-content: space-between;">
+            <h2>📊 AUDITORÍA</h2>
+            <button onclick="cargarUsuarios()" style="width:auto; padding:5px 15px;">🔄 Refrescar</button>
+            <button onclick="limpiarCaducados()" style="width:auto; background:#475569; padding:5px 15px;">🧹 Limpiar</button>
         </div>
-    </div>
-
-    <div class="table-wrapper">
         <table>
-            <thead>
-                <tr>
-                    <th>USUARIO</th>
-                    <th>ETIQUETA</th>
-                    <th>ESTADO</th>
-                    <th>TIEMPO</th>
-                    <th>ACCIÓN</th>
-                </tr>
-            </thead>
+            <thead><tr><th>USUARIO</th><th>PARTIDO</th><th>ESTADO</th><th>TIEMPO</th></tr></thead>
             <tbody id="tablaUsuarios"></tbody>
         </table>
     </div>
@@ -124,124 +69,64 @@
 <script>
     const BACKEND_URL = "https://golazo-backend-ellz.onrender.com";
 
-    // Carga fecha por defecto (+4 horas)
-    window.onload = () => {
-        let n = new Date(); 
-        n.setHours(n.getHours() + 4); 
-        n.setMinutes(n.getMinutes() - n.getTimezoneOffset());
-        document.getElementById('fechaCorte').value = n.toISOString().slice(0,16);
-    };
-
     async function actualizarBot() {
-        const s = document.getElementById('adminSecret').value;
-        if(!s) return alert("Ingresa clave maestra");
         const res = await fetch(`${BACKEND_URL}/admin/update-bot`, {
             method: 'POST', headers: {'Content-Type': 'application/json'},
             body: JSON.stringify({
-                admin_secret: s,
+                admin_secret: document.getElementById('adminSecret').value,
                 promo_hoy: document.getElementById('botPromo').value,
                 partidos_cartelera: document.getElementById('botPartidos').value,
                 link_vip: document.getElementById('botLinkVip').value
             })
         });
-        if(res.ok) alert("✅ ¡Bot de Telegram actualizado!");
+        if(res.ok) alert("✅ Bot actualizado");
     }
 
     async function generarPase(esSocio) {
         const s = document.getElementById('adminSecret').value;
         const nombre = esSocio ? document.getElementById('socioEmail').value : document.getElementById('nombrePartido').value;
-        const passManual = esSocio ? document.getElementById('socioPass').value : null;
-        let fecha;
-
-        if(esSocio) {
-            fecha = new Date();
-            fecha.setHours(fecha.getHours() + parseInt(document.getElementById('socioMeses').value));
-        } else {
-            fecha = new Date(document.getElementById('fechaCorte').value);
-        }
+        let fecha = esSocio ? new Date() : new Date(document.getElementById('fechaCorte').value);
+        if(esSocio) fecha.setHours(fecha.getHours() + parseInt(document.getElementById('socioMeses').value));
 
         const res = await fetch(`${BACKEND_URL}/admin/generar-pase-rapido`, {
             method: 'POST', headers: {'Content-Type': 'application/json'},
             body: JSON.stringify({ 
-                admin_secret: s, 
-                fecha_corte: fecha.toISOString(), 
-                partido: esSocio ? "SOCIO VIP ⭐" : nombre,
-                email_manual: esSocio ? nombre : null,
-                pass_manual: passManual
+                admin_secret: s, fecha_corte: fecha.toISOString(), 
+                partido: esSocio ? "SOCIO VIP ⭐" : nombre, email_manual: esSocio ? nombre : null 
             })
         });
         const d = await res.json();
         if(d.success) {
-            let msg = "";
             const box = esSocio ? document.getElementById('resSocio') : document.getElementById('resPase');
-            
-            if(esSocio) {
-                const link = document.getElementById('botLinkVip').value;
-                msg = `🔥 ¡BIENVENIDO SOCIO VIP! 🔥\n━━━━━━━━━━━━━━\n1️⃣ Grupo VIP (Liga 1): ${link}\n2️⃣ Web (Inter): www.golazosp.net\n👤 User: ${d.usuario}\n🔑 Pass: ${d.clave}\n━━━━━━━━━━━━━━\n¡Disfruta el mes!`;
-            } else {
-                msg = `✅ ¡ACCESO LISTO! ⚽\n━━━━━━━━━━━━━━\n🌐 www.golazosp.net\n👤 User: ${d.usuario}\n🔑 Pass: ${d.clave}\n━━━━━━━━━━━━━━\n⏳ Expira: ${d.expira_en}`;
-            }
-            
-            box.innerText = msg;
+            box.innerText = `👤 User: ${d.usuario}\n🔑 Pass: ${d.clave}\n⏳ Exp: ${d.expira_en}`;
             box.style.display = "block";
-            navigator.clipboard.writeText(msg);
-            alert("¡Copiado al portapapeles!");
+            navigator.clipboard.writeText(box.innerText);
+            alert("¡Copiado!");
             cargarUsuarios();
         }
     }
 
-    async function extenderPase() {
-        const s = document.getElementById('adminSecret').value;
-        const user = document.getElementById('usuarioExtender').value;
-        const res = await fetch(`${BACKEND_URL}/admin/extender-acceso`, {
-            method: 'POST', headers: {'Content-Type': 'application/json'},
-            body: JSON.stringify({ admin_secret: s, usuario_corto: user, horas_extra: document.getElementById('horasExtra').value })
-        });
-        const d = await res.json();
-        alert(d.mensaje || "Tiempo actualizado");
-        cargarUsuarios();
-    }
-
     async function cargarUsuarios() {
-        const s = document.getElementById('adminSecret').value;
-        if(!s) return;
         const res = await fetch(`${BACKEND_URL}/admin/listar-usuarios`, {
             method: 'POST', headers: {'Content-Type': 'application/json'},
-            body: JSON.stringify({ admin_secret: s })
+            body: JSON.stringify({ admin_secret: document.getElementById('adminSecret').value })
         });
         const d = await res.json();
         if(d.success) {
             const tbody = document.getElementById('tablaUsuarios');
-            tbody.innerHTML = '';
-            d.usuarios.forEach(u => {
-                const restH = u.rest / 3600000;
-                const bCol = u.esActivo ? '#065f46' : '#7f1d1d';
-                const btnAvisar = (u.tipo === 'socio_mensual' && restH < 48 && restH > 0) ? 
-                    `<button class="btn-avisar" onclick="avisarSocio('${u.usuario_corto}')" style="background:#3b82f6; padding:5px; font-size:10px; width:auto;">💬 Avisar</button>` : '';
-                
-                tbody.innerHTML += `<tr>
-                    <td><b>${u.usuario_corto}</b><br><small>${u.email}</small></td>
-                    <td>${u.etiqueta}</td>
-                    <td><span class="badge" style="background:${bCol}">${u.estado}</span></td>
-                    <td>${u.tiempo}</td>
-                    <td>${btnAvisar}</td>
-                </tr>`;
-            });
+            tbody.innerHTML = d.usuarios.map(u => `<tr>
+                <td><b>${u.usuario_corto}</b></td>
+                <td>${u.etiqueta}</td>
+                <td><span class="badge" style="background:${u.esActivo ? '#065f46' : '#7f1d1d'}">${u.estado}</span></td>
+                <td>${u.tiempo}</td>
+            </tr>`).join('');
         }
     }
 
-    function avisarSocio(nombre) {
-        const msg = `¡Hola ${nombre}! 👋 Soy Thony de Golazo SP. Tu acceso VIP vence pronto. ¿Renovamos para no perderte los partidos? ⚽`;
-        navigator.clipboard.writeText(msg);
-        alert("Mensaje de renovación copiado.");
-    }
-
     async function limpiarCaducados() {
-        const s = document.getElementById('adminSecret').value;
-        if(!confirm("¿Borrar pases caducados?")) return;
         const res = await fetch(`${BACKEND_URL}/admin/limpiar-caducados`, {
             method: 'POST', headers: {'Content-Type': 'application/json'},
-            body: JSON.stringify({ admin_secret: s })
+            body: JSON.stringify({ admin_secret: document.getElementById('adminSecret').value })
         });
         const d = await res.json();
         alert(d.mensaje);
