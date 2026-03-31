@@ -20,6 +20,7 @@ app.use(express.json());
 const bot = new Telegraf(process.env.TELEGRAM_BOT_TOKEN);
 const MI_CHAT_ID = process.env.MI_TELEGRAM_ID;
 
+// MENÚ PRINCIPAL CON BOTONES INLINE (Estilo Moderno)
 bot.start(async (ctx) => {
     const doc = await db.collection('config_bot').doc('textos').get();
     const t = doc.exists ? doc.data() : { promo_hoy: "¡Bienvenidos!", partidos_cartelera: "Cargando..." };
@@ -28,20 +29,23 @@ bot.start(async (ctx) => {
                        `🔥 **Promociones de hoy:**\n${t.promo_hoy}\n\n` +
                        `Elige tu acceso:`;
 
-    ctx.replyWithMarkdown(bienvenida, Markup.keyboard([
-        ['1️⃣ Partido Individual', '2️⃣ Socio VIP Mensual'],
-        ['3️⃣ Oferta Especial del Día', '4️⃣ Hablar con Soporte']
-    ]).resize());
+    ctx.replyWithMarkdown(bienvenida, Markup.inlineKeyboard([
+        [Markup.button.callback('1️⃣ Partido Individual', 'ver_partidos')],
+        [Markup.button.callback('2️⃣ Socio VIP Mensual 💎', 'ver_vip')],
+        [Markup.button.callback('3️⃣ Oferta Especial', 'ver_oferta'), Markup.button.callback('4️⃣ Soporte 💬', 'ver_soporte')]
+    ]));
 });
 
-bot.hears('1️⃣ Partido Individual', async (ctx) => {
+// ACCIONES DE LOS BOTONES DEL MENÚ
+bot.action('ver_partidos', async (ctx) => {
     const doc = await db.collection('config_bot').doc('textos').get();
     const t = doc.data();
+    await ctx.answerCbQuery(); // Quita el relojito del botón
     ctx.replyWithMarkdown(`⚽ **Elige el partido que quieres ver:**\n\n${t.partidos_cartelera}\n\n💰 **Precio:** S/ 5.00 / $1.50 USD\n\n👉 Realiza el pago y envía la captura aquí.`);
 });
 
-// FLUJO DE SOCIO VIP ACTUALIZADO (PAGO PRIMERO)
-bot.hears('2️⃣ Socio VIP Mensual', (ctx) => {
+bot.action('ver_vip', async (ctx) => {
+    await ctx.answerCbQuery();
     const vipTxt = `💎 **Socio VIP Golazo (30 días):**\n\n` +
                    `Acceso total a Liga 1 (YouTube VIP) y Torneos Internacionales (Web).\n\n` +
                    `💰 **Precio:** S/ 20.00 / $5.50 USD\n\n` +
@@ -53,21 +57,36 @@ bot.hears('2️⃣ Socio VIP Mensual', (ctx) => {
     ]));
 });
 
-// Acciones de pago
-bot.action('pago_yape', (ctx) => {
+bot.action('ver_oferta', async (ctx) => {
+    await ctx.answerCbQuery();
+    const doc = await db.collection('config_bot').doc('textos').get();
+    const t = doc.data();
+    ctx.replyWithMarkdown(`🔥 **OFERTA ESPECIAL:**\n\n${t.promo_hoy}\n\nEscribe al soporte si tienes dudas.`);
+});
+
+bot.action('ver_soporte', async (ctx) => {
+    await ctx.answerCbQuery();
+    ctx.replyWithMarkdown(`💬 **SOPORTE GOLAZO SP:**\n\nSi tienes problemas con tu acceso o quieres hacer una consulta directa, escribe a: @ThonyGeek`);
+});
+
+// ACCIONES DE PAGO
+bot.action('pago_yape', async (ctx) => {
+    await ctx.answerCbQuery();
     ctx.replyWithMarkdown(`💳 **PAGO POR YAPE:**\n\n` +
                    `Número: **987 456 932**\n` +
                    `A nombre de: **Thony**\n\n` +
                    `🚀 **PASO FINAL:** Envía la captura del pago y **ESCRIBE TU CORREO** aquí mismo para activar tu cuenta.`);
 });
 
-bot.action('pago_extranjero', (ctx) => {
+bot.action('pago_extranjero', async (ctx) => {
+    await ctx.answerCbQuery();
     ctx.replyWithMarkdown(`🌐 **PAGO INTERNACIONAL:**\n\n` +
                    `🔹 **PayPal:** [Haz clic aquí para pagar](https://paypal.me/thonytech)\n` +
                    `🔹 **Binance Pay ID:** \`735707066\`\n\n` +
                    `🚀 **PASO FINAL:** Envía la captura del pago y **ESCRIBE TU CORREO** aquí mismo para activar tu cuenta.`);
 });
 
+// RECEPTOR DE FOTOS (COMPROBANTES)
 bot.on('photo', (ctx) => {
     ctx.reply("🚀 ¡Recibido! El administrador verificará el depósito y te enviará tus accesos de inmediato.");
     bot.telegram.sendPhoto(MI_CHAT_ID, ctx.message.photo[ctx.message.photo.length - 1].file_id, {
@@ -82,7 +101,7 @@ const BUNNY_URL = 'https://stream.golazosp.net';
 const BUNNY_SECURITY_KEY = process.env.BUNNY_KEY; 
 const STREAM_PATH = '/stream/canal.m3u8';
 
-// (Aquí se mantiene tu lógica de generate-stream y check-session que ya tienes)
+// (Aquí continúa tu lógica de generate-stream y check-session...)
 
 // --- ENDPOINTS DE ADMIN ---
 app.post('/admin/update-bot', async (req, res) => {
@@ -141,4 +160,4 @@ app.post('/admin/listar-usuarios', async (req, res) => {
 });
 
 const PORT = process.env.PORT || 3000;
-app.listen(PORT, () => console.log(`🚀 SERVIDOR GOLAZO v2.8 READY`));
+app.listen(PORT, () => console.log(`🚀 SERVIDOR GOLAZO v3.0 READY`));
