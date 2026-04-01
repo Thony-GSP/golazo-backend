@@ -13,7 +13,7 @@ const auth = admin.auth();
 const app = express();
 app.set('trust proxy', 1);
 
-// --- 2. CONFIGURACIÓN DE CORS (PARA GITHUB Y LITESPEED) ---
+// --- 2. CONFIGURACIÓN DE CORS ---
 app.use(cors({
     origin: '*',
     methods: ['GET', 'POST', 'OPTIONS'],
@@ -29,7 +29,6 @@ const MI_CHAT_ID = process.env.MI_TELEGRAM_ID;
 const ADMIN_SECRET = process.env.ADMIN_SECRET;
 
 // --- 4. RUTA PARA EL REPRODUCTOR (BUNNYCDN) ---
-// Esta ruta elimina el error 404 en la consola de tu web
 app.get('/generate-stream', (req, res) => {
     const URL_FINAL = "https://golazosp-stream.b-cdn.net/live/playlist.m3u8";
     res.json({
@@ -77,25 +76,22 @@ bot.on('photo', (ctx) => {
     });
 });
 
-// --- 6. LANZAMIENTO DEL BOT CON MANEJO DE CONFLICTO 409 ---
+// --- 6. LANZAMIENTO DEL BOT CON REINTENTOS ---
 const iniciarBot = async () => {
     try {
-        // Pausa de seguridad para que Render cierre la instancia anterior
         await new Promise(resolve => setTimeout(resolve, 5000));
         await bot.launch({ dropPendingUpdates: true });
-        console.log("✅ Bot conectado correctamente.");
+        console.log("✅ Bot conectado.");
     } catch (err) {
         if (err.response && err.response.error_code === 409) {
-            console.log("⚠️ Conflicto 409 detectado. Reintentando en 10 segundos...");
+            console.log("⚠️ Conflicto 409. Reintentando...");
             setTimeout(iniciarBot, 10000);
-        } else {
-            console.error("❌ Error al lanzar el bot:", err);
         }
     }
 };
 iniciarBot();
 
-// --- 7. ENDPOINTS ADMINISTRATIVOS (PANEL) ---
+// --- 7. ENDPOINTS ADMINISTRATIVOS ---
 app.post('/admin/generar-pase-rapido', async (req, res) => {
     const { admin_secret, fecha_corte, partido, email_manual, pass_manual } = req.body;
     if (admin_secret !== ADMIN_SECRET) return res.status(403).json({ success: false });
@@ -105,21 +101,25 @@ app.post('/admin/generar-pase-rapido', async (req, res) => {
         const emailFinal = email_manual || `${userRandom}@golazosp.net`;
         const claveFinal = pass_manual || crypto.randomBytes(4).toString('hex');
 
-        // CREAR EN FIREBASE AUTH (Para permitir Login)
+        // CREAR EN AUTH
         const userRecord = await auth.createUser({
             email: emailFinal,
             password: claveFinal,
             displayName: partido
         });
 
-        // GUARDAR EN FIRESTORE (Usando UID real)
+        // 🛠️ FIX: Forzamos duración de 24 horas para evitar errores de zona horaria
+        const expiracionForzada = new Date();
+        expiracionForzada.setHours(expiracionForzada.getHours() + 24);
+
+        // GUARDAR EN FIRESTORE
         await db.collection('usuarios').doc(userRecord.uid).set({
             uid: userRecord.uid,
             usuario_corto: emailFinal,
             clave: claveFinal,
             email: emailFinal,
             etiqueta: partido,
-            fecha_expiracion: admin.firestore.Timestamp.fromDate(new Date(fecha_corte)),
+            fecha_expiracion: admin.firestore.Timestamp.fromDate(expiracionForzada),
             tipo: email_manual ? 'socio_mensual' : 'pase_individual',
             creado_el: admin.firestore.Timestamp.now()
         });
@@ -128,7 +128,7 @@ app.post('/admin/generar-pase-rapido', async (req, res) => {
             success: true, 
             usuario: emailFinal, 
             clave: claveFinal, 
-            expira_en: new Date(fecha_corte).toLocaleString('es-PE') 
+            expira: expiracionForzada.toLocaleString('es-PE')
         });
     } catch (error) {
         res.status(500).json({ success: false, message: error.message });
@@ -138,29 +138,9 @@ app.post('/admin/generar-pase-rapido', async (req, res) => {
 app.post('/admin/listar-usuarios', async (req, res) => {
     const { admin_secret } = req.body;
     if (admin_secret !== ADMIN_SECRET) return res.status(403).json({ success: false });
-    try {
-        const snapshot = await db.collection('usuarios').orderBy('creado_el', 'desc').get();
-        const lista = snapshot.docs.map(doc => doc.data());
-        res.json({ success: true, usuarios: lista });
-    } catch (e) { res.status(500).json({ success: false }); }
-});
-
-app.post('/admin/limpiar-caducados', async (req, res) => {
-    const { admin_secret } = req.body;
-    if (admin_secret !== ADMIN_SECRET) return res.status(403).json({ success: false });
-    try {
-        const snapshot = await db.collection('usuarios').get();
-        const ahora = new Date();
-        let borrados = 0;
-        for (const doc of snapshot.docs) {
-            if (doc.data().fecha_expiracion.toDate() < ahora) {
-                try { await auth.deleteUser(doc.id); } catch (e) {}
-                await doc.ref.delete();
-                borrados++;
-            }
-        }
-        res.json({ success: true, mensaje: `Se borraron ${borrados} pases.` });
-    } catch (e) { res.status(500).json({ success: false }); }
+    const snapshot = await db.collection('usuarios').orderBy('creado_el', 'desc').get();
+    const lista = snapshot.docs.map(doc => doc.data());
+    res.json({ success: true, usuarios: lista });
 });
 
 app.post('/admin/update-bot', async (req, res) => {
@@ -170,12 +150,8 @@ app.post('/admin/update-bot', async (req, res) => {
     res.json({ success: true });
 });
 
-// Manejo de cierres
 process.once('SIGINT', () => bot.stop('SIGINT'));
 process.once('SIGTERM', () => bot.stop('SIGTERM'));
 
 const PORT = process.env.PORT || 3000;
-app.listen(PORT, () => {
-    console.log(`🚀 SERVIDOR GOLAZO v5.1 READY`);
-    console.log(`📺 Señal vinculada: https://golazosp-stream.b-cdn.net/live/playlist.m3u8`);
-});
+app.listen(PORT, () => console.log(`🚀 SERVIDOR GOLAZO v5.2 READY`));
