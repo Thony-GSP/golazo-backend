@@ -1,137 +1,103 @@
-<!DOCTYPE html>
-<html lang="es">
-<head>
-    <meta charset="UTF-8">
-    <meta name="viewport" content="width=device-width, initial-scale=1.0">
-    <title>GOLAZO SP - CENTRAL MAESTRA</title>
-    <style>
-        :root { --primary: #ef4444; --bg: #0f172a; --card: #1e293b; --text: #f8fafc; }
-        body { font-family: 'Segoe UI', sans-serif; background: var(--bg); color: var(--text); padding: 10px; margin: 0; }
-        .dashboard { max-width: 1100px; margin: auto; background: var(--card); padding: 20px; border-radius: 16px; border-top: 5px solid var(--primary); }
-        h1 { text-align: center; color: var(--primary); font-size: 20px; }
-        .section { background: var(--bg); padding: 15px; border-radius: 12px; margin-bottom: 15px; border: 1px solid #334155; }
-        input, textarea, select { width: 100%; padding: 10px; margin: 5px 0; border-radius: 8px; background: var(--card); color: white; border: 1px solid #475569; box-sizing: border-box; }
-        button { width: 100%; padding: 12px; border: none; border-radius: 8px; cursor: pointer; font-weight: bold; text-transform: uppercase; margin-top: 5px; }
-        .btn-crear { background: #10b981; color: white; }
-        .btn-bot { background: #a855f7; color: white; }
-        .res-box { background: #000; color: #22c55e; padding: 10px; border-radius: 8px; margin-top: 10px; display: none; font-family: monospace; white-space: pre-wrap; }
-        table { width: 100%; border-collapse: collapse; margin-top: 10px; }
-        th, td { padding: 10px; border-bottom: 1px solid #334155; text-align: left; font-size: 13px; }
-        .badge { padding: 3px 6px; border-radius: 4px; font-size: 10px; }
-    </style>
-</head>
-<body>
-<div class="dashboard">
-    <h1>⚙️ GOLAZO SP - MANDO CENTRAL</h1>
-    <input type="password" id="adminSecret" placeholder="🔐 Clave Maestra">
-
-    <div class="section">
-        <h2>🤖 BOT TELEGRAM</h2>
-        <input type="text" id="botPromo" placeholder="Promo hoy">
-        <textarea id="botPartidos" placeholder="Cartelera (Un partido por línea)"></textarea>
-        <input type="text" id="botLinkVip" placeholder="Link Grupo VIP">
-        <button class="btn-bot" onclick="actualizarBot()">Guardar en Bot</button>
-    </div>
-
-    <div style="display: grid; grid-template-columns: 1fr 1fr; gap: 15px;">
-        <div class="section">
-            <h2>⚡ PASE RÁPIDO</h2>
-            <input type="text" id="nombrePartido" placeholder="Ej: Perú vs Brasil">
-            <input type="datetime-local" id="fechaCorte">
-            <button class="btn-crear" onclick="generarPase(false)">Crear Pase</button>
-            <div id="resPase" class="res-box"></div>
-        </div>
-        <div class="section">
-            <h2>💎 SOCIO VIP</h2>
-            <input type="text" id="socioEmail" placeholder="Email o Nombre">
-            <select id="socioMeses">
-                <option value="720">Plan 1 Mes</option>
-                <option value="1440">Plan 2 Meses</option>
-            </select>
-            <button class="btn-crear" style="background:#f59e0b" onclick="generarPase(true)">Activar VIP</button>
-            <div id="resSocio" class="res-box" style="color:#f59e0b"></div>
-        </div>
-    </div>
-
-    <div class="section">
-        <div style="display: flex; justify-content: space-between;">
-            <h2>📊 AUDITORÍA</h2>
-            <button onclick="cargarUsuarios()" style="width:auto; padding:5px 15px;">🔄 Refrescar</button>
-            <button onclick="limpiarCaducados()" style="width:auto; background:#475569; padding:5px 15px;">🧹 Limpiar</button>
-        </div>
-        <table>
-            <thead><tr><th>USUARIO</th><th>PARTIDO</th><th>ESTADO</th><th>TIEMPO</th></tr></thead>
-            <tbody id="tablaUsuarios"></tbody>
-        </table>
-    </div>
-</div>
-
 <script>
     const BACKEND_URL = "https://golazo-backend-ellz.onrender.com";
 
+    // Carga fecha por defecto (+4 horas) al abrir el panel
+    window.onload = () => {
+        let n = new Date();
+        n.setHours(n.getHours() + 4);
+        n.setMinutes(n.getMinutes() - n.getTimezoneOffset());
+        document.getElementById('fechaCorte').value = n.toISOString().slice(0,16);
+    };
+
     async function actualizarBot() {
-        const res = await fetch(`${BACKEND_URL}/admin/update-bot`, {
-            method: 'POST', headers: {'Content-Type': 'application/json'},
-            body: JSON.stringify({
-                admin_secret: document.getElementById('adminSecret').value,
-                promo_hoy: document.getElementById('botPromo').value,
-                partidos_cartelera: document.getElementById('botPartidos').value,
-                link_vip: document.getElementById('botLinkVip').value
-            })
-        });
-        if(res.ok) alert("✅ Bot actualizado");
+        const s = document.getElementById('adminSecret').value;
+        if(!s) return alert("Ingresa clave maestra");
+        try {
+            const res = await fetch(`${BACKEND_URL}/admin/update-bot`, {
+                method: 'POST', headers: {'Content-Type': 'application/json'},
+                body: JSON.stringify({
+                    admin_secret: s,
+                    promo_hoy: document.getElementById('botPromo').value,
+                    partidos_cartelera: document.getElementById('botPartidos').value,
+                    link_vip: document.getElementById('botLinkVip').value
+                })
+            });
+            if(res.ok) alert("✅ Bot actualizado con éxito");
+            else alert("❌ Error: Clave incorrecta o servidor caído");
+        } catch(e) { alert("❌ Error de red: No se pudo conectar al backend"); }
     }
 
     async function generarPase(esSocio) {
         const s = document.getElementById('adminSecret').value;
         const nombre = esSocio ? document.getElementById('socioEmail').value : document.getElementById('nombrePartido').value;
+        if(!s || !nombre) return alert("Faltan datos (Clave o Nombre)");
+
         let fecha = esSocio ? new Date() : new Date(document.getElementById('fechaCorte').value);
         if(esSocio) fecha.setHours(fecha.getHours() + parseInt(document.getElementById('socioMeses').value));
 
-        const res = await fetch(`${BACKEND_URL}/admin/generar-pase-rapido`, {
-            method: 'POST', headers: {'Content-Type': 'application/json'},
-            body: JSON.stringify({ 
-                admin_secret: s, fecha_corte: fecha.toISOString(), 
-                partido: esSocio ? "SOCIO VIP ⭐" : nombre, email_manual: esSocio ? nombre : null 
-            })
-        });
-        const d = await res.json();
-        if(d.success) {
-            const box = esSocio ? document.getElementById('resSocio') : document.getElementById('resPase');
-            box.innerText = `👤 User: ${d.usuario}\n🔑 Pass: ${d.clave}\n⏳ Exp: ${d.expira_en}`;
-            box.style.display = "block";
-            navigator.clipboard.writeText(box.innerText);
-            alert("¡Copiado!");
-            cargarUsuarios();
-        }
+        try {
+            const res = await fetch(`${BACKEND_URL}/admin/generar-pase-rapido`, {
+                method: 'POST', headers: {'Content-Type': 'application/json'},
+                body: JSON.stringify({ 
+                    admin_secret: s, 
+                    fecha_corte: fecha.toISOString(), 
+                    partido: esSocio ? "SOCIO VIP ⭐" : nombre, 
+                    email_manual: esSocio ? nombre : null 
+                })
+            });
+            const d = await res.json();
+            if(d.success) {
+                const box = esSocio ? document.getElementById('resSocio') : document.getElementById('resPase');
+                const linkVip = document.getElementById('botLinkVip').value || "Solicitar al soporte";
+                
+                let msg = "";
+                if(esSocio) {
+                    msg = `🔥 ¡BIENVENIDO SOCIO VIP! 🔥\n━━━━━━━━━━━━━━\n1️⃣ Grupo VIP: ${linkVip}\n2️⃣ Web: www.golazosp.net\n👤 User: ${d.usuario}\n🔑 Pass: ${d.clave}\n━━━━━━━━━━━━━━\n¡Disfruta tu acceso mensual!`;
+                } else {
+                    msg = `✅ ¡ACCESO LISTO! ⚽\n━━━━━━━━━━━━━━\n🌐 www.golazosp.net\n👤 User: ${d.usuario}\n🔑 Pass: ${d.clave}\n━━━━━━━━━━━━━━\n⏳ Expira: ${d.expira_en}`;
+                }
+
+                box.innerText = msg;
+                box.style.display = "block";
+                await navigator.clipboard.writeText(msg);
+                alert("¡Acceso creado y copiado!");
+                cargarUsuarios();
+            } else { alert("❌ Error: " + (d.message || "No autorizado")); }
+        } catch(e) { alert("❌ Error al conectar con el servidor."); }
     }
 
     async function cargarUsuarios() {
-        const res = await fetch(`${BACKEND_URL}/admin/listar-usuarios`, {
-            method: 'POST', headers: {'Content-Type': 'application/json'},
-            body: JSON.stringify({ admin_secret: document.getElementById('adminSecret').value })
-        });
-        const d = await res.json();
-        if(d.success) {
-            const tbody = document.getElementById('tablaUsuarios');
-            tbody.innerHTML = d.usuarios.map(u => `<tr>
-                <td><b>${u.usuario_corto}</b></td>
-                <td>${u.etiqueta}</td>
-                <td><span class="badge" style="background:${u.esActivo ? '#065f46' : '#7f1d1d'}">${u.estado}</span></td>
-                <td>${u.tiempo}</td>
-            </tr>`).join('');
-        }
+        const s = document.getElementById('adminSecret').value;
+        if(!s) return;
+        try {
+            const res = await fetch(`${BACKEND_URL}/admin/listar-usuarios`, {
+                method: 'POST', headers: {'Content-Type': 'application/json'},
+                body: JSON.stringify({ admin_secret: s })
+            });
+            const d = await res.json();
+            if(d.success) {
+                const tbody = document.getElementById('tablaUsuarios');
+                tbody.innerHTML = d.usuarios.map(u => `<tr>
+                    <td><b>${u.usuario_corto}</b></td>
+                    <td>${u.etiqueta}</td>
+                    <td><span class="badge" style="background:${u.esActivo ? '#065f46' : '#7f1d1d'}">${u.estado}</span></td>
+                    <td>${u.tiempo}</td>
+                </tr>`).join('');
+            }
+        } catch(e) { console.error("Error cargando usuarios"); }
     }
 
     async function limpiarCaducados() {
-        const res = await fetch(`${BACKEND_URL}/admin/limpiar-caducados`, {
-            method: 'POST', headers: {'Content-Type': 'application/json'},
-            body: JSON.stringify({ admin_secret: document.getElementById('adminSecret').value })
-        });
-        const d = await res.json();
-        alert(d.mensaje);
-        cargarUsuarios();
+        const s = document.getElementById('adminSecret').value;
+        if(!confirm("¿Seguro que quieres borrar los pases vencidos?")) return;
+        try {
+            const res = await fetch(`${BACKEND_URL}/admin/limpiar-caducados`, {
+                method: 'POST', headers: {'Content-Type': 'application/json'},
+                body: JSON.stringify({ admin_secret: s })
+            });
+            const d = await res.json();
+            alert(d.mensaje);
+            cargarUsuarios();
+        } catch(e) { alert("❌ Error al limpiar"); }
     }
 </script>
-</body>
-</html>
