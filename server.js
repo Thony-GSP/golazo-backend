@@ -16,17 +16,18 @@ app.set('trust proxy', 1);
 app.use(cors({ origin: '*', methods: ['GET', 'POST', 'OPTIONS'], allowedHeaders: ['Content-Type', 'Authorization'] }));
 app.use(express.json());
 
-// --- 2. CONFIGURACIÓN (REVISADA) ---
+// --- 2. CONFIGURACIÓN ---
 const BUNNY_URL = 'https://stream.golazosp.net'; 
-const BUNNY_SECURITY_KEY = process.env.BUNNY_KEY; 
+const BUNNY_SECURITY_KEY = process.env.BUNNY_KEY.trim(); 
 const STREAM_PATH = '/stream/canal.m3u8';
 const ADMIN_SECRET = process.env.ADMIN_SECRET;
 
-// --- 3. GENERADOR DE TOKEN (ESTÁNDAR BUNNY) ---
-function generateBunnyToken(path, securityKey, ip, duration = 14400) {
+// --- 3. GENERADOR DE TOKEN (IGUALADO A TU PANEL BUNNY) ---
+function generateBunnyToken(path, securityKey, duration = 14400) {
     const expires = Math.floor(Date.now() / 1000) + duration;
-    // IMPORTANTE: El estándar suele ser Key + Path + Expires + IP
-    const hashString = securityKey + path + expires + ip;
+    
+    // 🔥 EL ARREGLO: Hash SIN IP (Key + Path + Expires)
+    const hashString = securityKey + path + expires;
     const token = crypto.createHash('md5').update(hashString).digest('base64')
         .replace(/\+/g, '-').replace(/\//g, '_').replace(/=/g, '').replace(/\n/g, '');
     
@@ -41,9 +42,6 @@ app.get('/generate-stream', async (req, res) => {
         const idToken = authHeader.split('Bearer ')[1];
         const decodedToken = await auth.verifyIdToken(idToken);
         const uid = decodedToken.uid;
-        
-        // IP Real del cliente (Crucial para el 403)
-        const userIp = req.headers['x-forwarded-for'] || req.socket.remoteAddress;
 
         const userDoc = await db.collection('usuarios').doc(uid).get();
         if (!userDoc.exists) return res.status(403).json({ error: "Pase inactivo" });
@@ -56,11 +54,11 @@ app.get('/generate-stream', async (req, res) => {
         const newSessionId = crypto.randomUUID();
         await db.collection('usuarios').doc(uid).update({ session_id: newSessionId });
 
-        // Generamos el Token
-        const { token, expires } = generateBunnyToken(STREAM_PATH, BUNNY_SECURITY_KEY, userIp);
+        // 🔥 Generamos el Token SIN pedir la IP
+        const { token, expires } = generateBunnyToken(STREAM_PATH, BUNNY_SECURITY_KEY);
         const finalUrl = `${BUNNY_URL}${STREAM_PATH}?token=${token}&expires=${expires}`;
 
-        console.log(`✅ URL Generada para ${uid}: ${finalUrl}`);
+        console.log(`✅ URL Generada: ${finalUrl}`);
 
         res.json({
             success: true,
@@ -132,4 +130,4 @@ app.post('/admin/listar-usuarios', async (req, res) => {
 });
 
 const PORT = process.env.PORT || 3000;
-app.listen(PORT, () => console.log(`🚀 GOLAZO v8.1 READY`));
+app.listen(PORT, () => console.log(`🚀 GOLAZO v8.3 READY (TOKEN FIX)`));
