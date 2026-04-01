@@ -4,16 +4,16 @@ const crypto = require('crypto');
 const cors = require('cors');
 const { Telegraf, Markup } = require('telegraf');
 
-// --- CONFIGURACIÓN DE FIREBASE ---
+// --- 1. CONFIGURACIÓN DE FIREBASE ---
 const serviceAccount = JSON.parse(process.env.FIREBASE_JSON);
 admin.initializeApp({ credential: admin.credential.cert(serviceAccount) });
 const db = admin.firestore();
-const auth = admin.auth(); // Módulo para Authentication
+const auth = admin.auth();
 
 const app = express();
 app.set('trust proxy', 1);
 
-// --- CONFIGURACIÓN DE CORS (PARA GITHUB Y LITESPEED) ---
+// --- 2. CONFIGURACIÓN DE CORS (PARA GITHUB Y LITESPEED) ---
 app.use(cors({
     origin: '*',
     methods: ['GET', 'POST', 'OPTIONS'],
@@ -23,24 +23,22 @@ app.use(cors({
 
 app.use(express.json());
 
-// --- VARIABLES DE ENTORNO ---
+// --- 3. VARIABLES DE ENTORNO ---
 const bot = new Telegraf(process.env.TELEGRAM_BOT_TOKEN);
 const MI_CHAT_ID = process.env.MI_TELEGRAM_ID;
 const ADMIN_SECRET = process.env.ADMIN_SECRET;
 
-// --- 📺 RUTA PARA EL REPRODUCTOR (BUNNYCDN) ---
+// --- 4. RUTA PARA EL REPRODUCTOR (BUNNYCDN) ---
+// Esta ruta elimina el error 404 en la consola de tu web
 app.get('/generate-stream', (req, res) => {
-    // URL obtenida de tu Pull Zone en BunnyCDN
     const URL_FINAL = "https://golazosp-stream.b-cdn.net/live/playlist.m3u8";
-    
     res.json({
         success: true,
         url: URL_FINAL
     });
 });
 
-// --- LÓGICA DEL BOT DE TELEGRAM ---
-
+// --- 5. LÓGICA DEL BOT DE TELEGRAM ---
 bot.start(async (ctx) => {
     try {
         const doc = await db.collection('config_bot').doc('textos').get();
@@ -66,24 +64,10 @@ bot.action('ver_partidos', async (ctx) => {
     const doc = await db.collection('config_bot').doc('textos').get();
     const t = doc.data() || { partidos_cartelera: "" };
     const lineas = t.partidos_cartelera.split('\n').filter(l => l.trim() !== "");
-    
     const botonesPartidos = lineas.length > 0 
         ? lineas.map(partido => [Markup.button.callback(`⚽ ${partido}`, 'pago_individual')])
         : [[Markup.button.callback('Consultar horarios', 'ver_soporte')]];
-
     ctx.replyWithMarkdown(`🏟️ **Cartelera de hoy:**`, Markup.inlineKeyboard(botonesPartidos));
-});
-
-bot.action(['pago_individual', 'ver_vip'], async (ctx) => {
-    await ctx.answerCbQuery();
-    const esVip = ctx.match === 'ver_vip';
-    const texto = esVip ? `💎 **Socio VIP (30 días):** S/ 20.00` : `✅ **Pase Individual:** S/ 5.00`;
-    ctx.replyWithMarkdown(`${texto}\n\n👇 **ELIGE TU MÉTODO DE PAGO:**`,
-        Markup.inlineKeyboard([
-            [Markup.button.callback('🇵🇪 Yape (Perú)', 'pago_yape')],
-            [Markup.button.callback('🌎 PayPal / Binance', 'pago_extranjero')]
-        ])
-    );
 });
 
 bot.on('photo', (ctx) => {
@@ -93,11 +77,25 @@ bot.on('photo', (ctx) => {
     });
 });
 
-// Lanzar bot con limpieza de actualizaciones pendientes
-bot.launch({ dropPendingUpdates: true });
+// --- 6. LANZAMIENTO DEL BOT CON MANEJO DE CONFLICTO 409 ---
+const iniciarBot = async () => {
+    try {
+        // Pausa de seguridad para que Render cierre la instancia anterior
+        await new Promise(resolve => setTimeout(resolve, 5000));
+        await bot.launch({ dropPendingUpdates: true });
+        console.log("✅ Bot conectado correctamente.");
+    } catch (err) {
+        if (err.response && err.response.error_code === 409) {
+            console.log("⚠️ Conflicto 409 detectado. Reintentando en 10 segundos...");
+            setTimeout(iniciarBot, 10000);
+        } else {
+            console.error("❌ Error al lanzar el bot:", err);
+        }
+    }
+};
+iniciarBot();
 
-// --- ENDPOINTS ADMINISTRATIVOS (PANEL) ---
-
+// --- 7. ENDPOINTS ADMINISTRATIVOS (PANEL) ---
 app.post('/admin/generar-pase-rapido', async (req, res) => {
     const { admin_secret, fecha_corte, partido, email_manual, pass_manual } = req.body;
     if (admin_secret !== ADMIN_SECRET) return res.status(403).json({ success: false });
@@ -107,14 +105,14 @@ app.post('/admin/generar-pase-rapido', async (req, res) => {
         const emailFinal = email_manual || `${userRandom}@golazosp.net`;
         const claveFinal = pass_manual || crypto.randomBytes(4).toString('hex');
 
-        // 1. CREAR USUARIO EN FIREBASE AUTH (Para que el login funcione)
+        // CREAR EN FIREBASE AUTH (Para permitir Login)
         const userRecord = await auth.createUser({
             email: emailFinal,
             password: claveFinal,
             displayName: partido
         });
 
-        // 2. GUARDAR EN FIRESTORE (Usando el UID real como ID del documento)
+        // GUARDAR EN FIRESTORE (Usando UID real)
         await db.collection('usuarios').doc(userRecord.uid).set({
             uid: userRecord.uid,
             usuario_corto: emailFinal,
@@ -137,15 +135,6 @@ app.post('/admin/generar-pase-rapido', async (req, res) => {
     }
 });
 
-app.post('/admin/update-bot', async (req, res) => {
-    const { admin_secret, promo_hoy, partidos_cartelera, link_vip } = req.body;
-    if (admin_secret !== ADMIN_SECRET) return res.status(403).send("No autorizado");
-    try {
-        await db.collection('config_bot').doc('textos').set({ promo_hoy, partidos_cartelera, link_vip });
-        res.json({ success: true });
-    } catch (e) { res.status(500).send(e.message); }
-});
-
 app.post('/admin/listar-usuarios', async (req, res) => {
     const { admin_secret } = req.body;
     if (admin_secret !== ADMIN_SECRET) return res.status(403).json({ success: false });
@@ -159,21 +148,34 @@ app.post('/admin/listar-usuarios', async (req, res) => {
 app.post('/admin/limpiar-caducados', async (req, res) => {
     const { admin_secret } = req.body;
     if (admin_secret !== ADMIN_SECRET) return res.status(403).json({ success: false });
-    
     try {
         const snapshot = await db.collection('usuarios').get();
         const ahora = new Date();
         let borrados = 0;
         for (const doc of snapshot.docs) {
             if (doc.data().fecha_expiracion.toDate() < ahora) {
-                try { await auth.deleteUser(doc.id); } catch (e) {} // Borrar de Auth
-                await doc.ref.delete(); // Borrar de Firestore
+                try { await auth.deleteUser(doc.id); } catch (e) {}
+                await doc.ref.delete();
                 borrados++;
             }
         }
-        res.json({ success: true, mensaje: `Se borraron ${borrados} pases caducados.` });
+        res.json({ success: true, mensaje: `Se borraron ${borrados} pases.` });
     } catch (e) { res.status(500).json({ success: false }); }
 });
 
+app.post('/admin/update-bot', async (req, res) => {
+    const { admin_secret, promo_hoy, partidos_cartelera, link_vip } = req.body;
+    if (admin_secret !== ADMIN_SECRET) return res.status(403).send("No autorizado");
+    await db.collection('config_bot').doc('textos').set({ promo_hoy, partidos_cartelera, link_vip });
+    res.json({ success: true });
+});
+
+// Manejo de cierres
+process.once('SIGINT', () => bot.stop('SIGINT'));
+process.once('SIGTERM', () => bot.stop('SIGTERM'));
+
 const PORT = process.env.PORT || 3000;
-app.listen(PORT, () => console.log(`🚀 SERVIDOR GOLAZO v5.0 READY (AUTH & STREAM VINCULADOS)`));
+app.listen(PORT, () => {
+    console.log(`🚀 SERVIDOR GOLAZO v5.1 READY`);
+    console.log(`📺 Señal vinculada: https://golazosp-stream.b-cdn.net/live/playlist.m3u8`);
+});
