@@ -2,7 +2,6 @@ const express = require('express');
 const admin = require('firebase-admin');
 const crypto = require('crypto');
 const cors = require('cors');
-const helmet = require('helmet');
 const { Telegraf, Markup } = require('telegraf');
 
 // --- CONFIGURACIÓN DE FIREBASE ---
@@ -13,15 +12,12 @@ const db = admin.firestore();
 const app = express();
 app.set('trust proxy', 1);
 
-// --- CONFIGURACIÓN DE SEGURIDAD Y CORS (CRÍTICO PARA EL PANEL) ---
-app.use(helmet({
-    contentSecurityPolicy: false, // Permite que el panel conecte sin bloqueos de política
-}));
-
+// --- CONFIGURACIÓN DE CORS (ULTRA PERMISIVA PARA GITHUB) ---
 app.use(cors({
-    origin: '*', // Permite peticiones desde tu panel en GitHub Pages
+    origin: '*',
     methods: ['GET', 'POST', 'OPTIONS'],
-    allowedHeaders: ['Content-Type', 'Authorization']
+    allowedHeaders: ['Content-Type', 'Authorization'],
+    credentials: true
 }));
 
 app.use(express.json());
@@ -95,10 +91,15 @@ bot.on('photo', (ctx) => {
     });
 });
 
-// Lanzar bot con limpieza de actualizaciones pendientes
-bot.launch({ dropPendingUpdates: true });
+// --- LANZAMIENTO DEL BOT (BLINDAJE ERROR 409) ---
+bot.launch({ dropPendingUpdates: true })
+    .then(() => console.log("✅ Bot conectado y limpio de sesiones viejas."))
+    .catch((err) => console.error("❌ Error al lanzar el bot:", err));
 
-// --- ENDPOINTS ADMINISTRATIVOS (CONEXIÓN CON EL PANEL) ---
+process.once('SIGINT', () => bot.stop('SIGINT'));
+process.once('SIGTERM', () => bot.stop('SIGTERM'));
+
+// --- ENDPOINTS ADMINISTRATIVOS (PARA EL PANEL) ---
 
 app.post('/admin/update-bot', async (req, res) => {
     const { admin_secret, promo_hoy, partidos_cartelera, link_vip } = req.body;
@@ -174,5 +175,6 @@ app.post('/admin/limpiar-caducados', async (req, res) => {
     } catch (e) { res.status(500).json({ success: false }); }
 });
 
+// --- INICIO DEL SERVIDOR ---
 const PORT = process.env.PORT || 3000;
 app.listen(PORT, () => console.log(`🚀 SERVIDOR GOLAZO v3.5 READY`));
