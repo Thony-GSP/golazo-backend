@@ -80,9 +80,18 @@ app.post('/check-session', async (req, res) => {
         const { session_id } = req.body;
 
         const userDoc = await db.collection('usuarios').doc(decodedToken.uid).get();
-        if (session_id !== userDoc.data().session_id) {
+        const userData = userDoc.data();
+
+        // 1. Verificamos si alguien más entró con su cuenta (Anti-Piratería)
+        if (session_id !== userData.session_id) {
             return res.json({ valid: false, motivo: 'pirateria' });
         }
+
+        // 2. 🔥 NUEVO: Verificamos si su tiempo ya se acabó en tiempo real
+        if (userData.fecha_expiracion.toMillis() < Date.now()) {
+            return res.json({ valid: false, motivo: 'expirado' }); // Esto forzará al reproductor a cerrarse
+        }
+
         res.json({ valid: true });
     } catch (e) { res.json({ valid: false }); }
 });
@@ -173,9 +182,25 @@ iniciarBot();
 app.post('/admin/listar-usuarios', async (req, res) => {
     const { admin_secret } = req.body;
     if (admin_secret !== ADMIN_SECRET) return res.status(403).json({ success: false });
+    
     const snap = await db.collection('usuarios').orderBy('creado_el', 'desc').get();
-    res.json({ success: true, usuarios: snap.docs.map(d => d.data()) });
+    
+    // Formateamos los datos para que el panel.html los entienda y no diga "undefined"
+    const usuariosFormateados = snap.docs.map(d => {
+        const data = d.data();
+        const expiraMillis = data.fecha_expiracion.toMillis();
+        const esActivo = expiraMillis > Date.now();
+        
+        return {
+            ...data,
+            estado: esActivo ? 'ACTIVO' : 'VENCIDO',
+            esActivo: esActivo,
+            tiempo: new Date(expiraMillis).toLocaleString('es-PE') // Muestra la fecha/hora en formato Perú
+        };
+    });
+
+    res.json({ success: true, usuarios: usuariosFormateados });
 });
 
 const PORT = process.env.PORT || 3000;
-app.listen(PORT, () => console.log(`🚀 GOLAZO v8.4 READY (DATES & CLEANUP FIX)`));
+app.listen(PORT, () => console.log(`🚀 GOLAZO v8.5 READY (HEARTBEAT & TABLE FIX)`));
