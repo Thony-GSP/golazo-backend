@@ -89,26 +89,74 @@ app.post('/check-session', async (req, res) => {
 
 // --- 5. PANEL ADMIN ---
 app.post('/admin/generar-pase-rapido', async (req, res) => {
-    const { admin_secret, partido, email_manual, pass_manual } = req.body;
+    // 🔥 Capturamos la 'fecha_corte' que envía el panel HTML
+    const { admin_secret, partido, email_manual, pass_manual, fecha_corte } = req.body;
     if (admin_secret !== ADMIN_SECRET) return res.status(403).json({ success: false });
 
     try {
-        const userRandom = crypto.randomBytes(3).toString('hex');
-        const emailFinal = email_manual || `${userRandom}@golazosp.net`;
-        const claveFinal = pass_manual || crypto.randomBytes(4).toString('hex');
+        let emailFinal, claveFinal;
+
+        if (email_manual) {
+            // 💎 SOCIO VIP: Lógica intacta (Respeta lo que escribas o genera hex)
+            emailFinal = email_manual;
+            claveFinal = pass_manual || crypto.randomBytes(4).toString('hex');
+        } else {
+            // ⚡ PASE RÁPIDO: Genera 6 números aleatorios para facilitar el acceso desde celular
+            const numUser = Math.floor(100000 + Math.random() * 900000).toString();
+            const numPass = Math.floor(100000 + Math.random() * 900000).toString();
+            emailFinal = `${numUser}@golazosp.net`;
+            claveFinal = numPass;
+        }
+
         const userRecord = await auth.createUser({ email: emailFinal, password: claveFinal, displayName: partido });
 
-        const exp = new Date();
-        exp.setHours(exp.getHours() + 24);
+        // 🔥 Ahora usamos la fecha del calendario. Si no hay, usa 24h por defecto.
+        const exp = fecha_corte ? new Date(fecha_corte) : new Date(Date.now() + 24 * 60 * 60 * 1000);
 
         await db.collection('usuarios').doc(userRecord.uid).set({
-            uid: userRecord.uid, usuario_corto: emailFinal, clave: claveFinal,
-            etiqueta: partido, fecha_expiracion: admin.firestore.Timestamp.fromDate(exp),
-            creado_el: admin.firestore.Timestamp.now(), session_id: ""
+            uid: userRecord.uid, 
+            usuario_corto: emailFinal, 
+            clave: claveFinal,
+            etiqueta: partido, 
+            fecha_expiracion: admin.firestore.Timestamp.fromDate(exp),
+            creado_el: admin.firestore.Timestamp.now(), 
+            session_id: ""
         });
 
         res.json({ success: true, usuario: emailFinal, clave: claveFinal });
     } catch (e) { res.status(500).json({ success: false, message: e.message }); }
+});
+
+// 🔥 NUEVO: Función para limpiar usuarios vencidos
+app.post('/admin/limpiar-caducados', async (req, res) => {
+    const { admin_secret } = req.body;
+    if (admin_secret !== ADMIN_SECRET) return res.status(403).json({ success: false, mensaje: "No autorizado" });
+
+    try {
+        const ahora = admin.firestore.Timestamp.now();
+        const vencidosSnap = await db.collection('usuarios').where('fecha_expiracion', '<', ahora).get();
+
+        if (vencidosSnap.empty) {
+            return res.json({ success: true, mensaje: "✅ No hay usuarios vencidos para limpiar." });
+        }
+
+        let borrados = 0;
+        for (const doc of vencidosSnap.docs) {
+            try {
+                // Borra de Authentication y de Firestore para dejarlo 100% limpio
+                await auth.deleteUser(doc.id); 
+                await doc.ref.delete();        
+                borrados++;
+            } catch (err) {
+                console.error("Error borrando usuario:", doc.id);
+            }
+        }
+
+        res.json({ success: true, mensaje: `🧹 Limpieza completada: ${borrados} pases vencidos eliminados.` });
+    } catch (e) {
+        console.error(e);
+        res.status(500).json({ success: false, mensaje: "Error al intentar limpiar la base de datos." });
+    }
 });
 
 // --- 6. BOT TELEGRAM ---
@@ -130,4 +178,4 @@ app.post('/admin/listar-usuarios', async (req, res) => {
 });
 
 const PORT = process.env.PORT || 3000;
-app.listen(PORT, () => console.log(`🚀 GOLAZO v8.3 READY (TOKEN FIX)`));
+app.listen(PORT, () => console.log(`🚀 GOLAZO v8.4 READY (DATES & CLEANUP FIX)`));
