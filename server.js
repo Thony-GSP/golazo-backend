@@ -22,11 +22,9 @@ const BUNNY_SECURITY_KEY = process.env.BUNNY_KEY.trim();
 const STREAM_PATH = '/stream/canal.m3u8';
 const ADMIN_SECRET = process.env.ADMIN_SECRET;
 
-// --- 3. GENERADOR DE TOKEN (IGUALADO A TU PANEL BUNNY) ---
-function generateBunnyToken(path, securityKey, duration = 14400) {
+// --- 3. GENERADOR DE TOKEN ---
+function generateBunnyToken(path, securityKey, duration = 120) {
     const expires = Math.floor(Date.now() / 1000) + duration;
-    
-    // 🔥 EL ARREGLO: Hash SIN IP (Key + Path + Expires)
     const hashString = securityKey + path + expires;
     const token = crypto.createHash('md5').update(hashString).digest('base64')
         .replace(/\+/g, '-').replace(/\//g, '_').replace(/=/g, '').replace(/\n/g, '');
@@ -34,92 +32,142 @@ function generateBunnyToken(path, securityKey, duration = 14400) {
     return { token, expires };
 }
 
+// --- 4. GENERATE STREAM (FASE 2: RENOVACIÓN Y SEGURIDAD CDN) ---
 app.get('/generate-stream', async (req, res) => {
     try {
-        const authHeader = req.headers.authorization;
-        if (!authHeader) return res.status(401).json({ error: "No autorizado" });
+        const authHeader = req.headers.authorization || "";
+        if (!authHeader.startsWith("Bearer ")) return res.status(401).json({ success: false, code: "NO_AUTH" });
 
-        const idToken = authHeader.split('Bearer ')[1];
-        const decodedToken = await auth.verifyIdToken(idToken);
-        const uid = decodedToken.uid;
-
-        const userDoc = await db.collection('usuarios').doc(uid).get();
-        if (!userDoc.exists) return res.status(403).json({ error: "Pase inactivo" });
-
-        const userData = userDoc.data();
-        if (userData.fecha_expiracion.toMillis() < Date.now()) {
-            return res.status(403).json({ error: "Pase expirado" });
+        const idToken = authHeader.replace("Bearer ", "").trim();
+        let decodedToken;
+        try {
+            decodedToken = await auth.verifyIdToken(idToken);
+        } catch (authError) {
+            return res.status(401).json({ success: false, code: "INVALID_AUTH" });
         }
 
-        const newSessionId = crypto.randomUUID();
-        await db.collection('usuarios').doc(uid).update({ session_id: newSessionId });
+        const uid = decodedToken.uid;
+        const requestedSessionId = req.query.session_id || null;
+        const userRef = db.collection('usuarios').doc(uid);
+        const userDoc = await userRef.get();
 
-        // 🔥 Generamos el Token SIN pedir la IP
-        const { token, expires } = generateBunnyToken(STREAM_PATH, BUNNY_SECURITY_KEY);
+        if (!userDoc.exists) return res.status(403).json({ success: false, code: "PASS_INACTIVE" });
+        
+        const userData = userDoc.data();
+        if (!userData.fecha_expiracion) return res.status(403).json({ success: false, code: "NO_EXPIRATION" });
+
+        const ahora = Date.now();
+        const expiraMillis = userData.fecha_expiracion.toMillis();
+        const segundosRestantesPase = Math.floor((expiraMillis - ahora) / 1000);
+
+        if (segundosRestantesPase <= 0) {
+            return res.status(403).json({ success: false, code: "PASS_EXPIRED", error: "Pase expirado" });
+        }
+
+        let sessionIdFinal = userData.session_id || "";
+        
+        // 🔥 AJUSTE FINO: Forzamos a un booleano estricto (true o false)
+        const mismaSesion = Boolean(requestedSessionId && requestedSessionId === userData.session_id);
+
+        if (!mismaSesion) {
+            sessionIdFinal = crypto.randomUUID();
+            await userRef.update({
+                session_id: sessionIdFinal,
+                session_started_at: admin.firestore.Timestamp.now(),
+                last_heartbeat: admin.firestore.Timestamp.now(),
+                last_status: "stream_started"
+            });
+        } else {
+            await userRef.update({
+                last_heartbeat: admin.firestore.Timestamp.now(),
+                last_status: "stream_renewed"
+            });
+        }
+
+        // Token dura máximo 120s o lo que le quede al pase.
+        const tokenDuration = Math.min(120, segundosRestantesPase);
+        const { token, expires } = generateBunnyToken(STREAM_PATH, BUNNY_SECURITY_KEY, tokenDuration);
         const finalUrl = `${BUNNY_URL}${STREAM_PATH}?token=${token}&expires=${expires}`;
 
-        console.log(`✅ URL Generada: ${finalUrl}`);
+        console.log(`✅ Stream [${mismaSesion ? 'RENOVADO' : 'NUEVO'}] | uid=${uid} | duration=${tokenDuration}s`);
 
-        res.json({
+        return res.json({
             success: true,
             stream_url: finalUrl,
-            session_id: newSessionId
+            session_id: sessionIdFinal,
+            reused_session: mismaSesion,
+            bunny_expires: expires,
+            pase_expira: expiraMillis
         });
 
     } catch (error) {
-        res.status(401).json({ error: "Sesión inválida" });
+        console.error("❌ Error en /generate-stream:", error);
+        return res.status(500).json({ success: false, code: "SERVER_ERROR" });
     }
 });
 
-// --- 4. HEARTBEAT ---
+// --- 5. CHECK SESSION (HEARTBEAT) ---
 app.post('/check-session', async (req, res) => {
     try {
-        const authHeader = req.headers.authorization;
-        const idToken = authHeader.split('Bearer ')[1];
-        const decodedToken = await auth.verifyIdToken(idToken);
-        const { session_id } = req.body;
+        const authHeader = req.headers.authorization || "";
+        if (!authHeader.startsWith("Bearer ")) return res.status(401).json({ valid: false, motivo: "no_auth" });
 
-        const userDoc = await db.collection('usuarios').doc(decodedToken.uid).get();
+        const idToken = authHeader.replace("Bearer ", "").trim();
+        let decodedToken;
+        try { decodedToken = await auth.verifyIdToken(idToken); } 
+        catch (e) { return res.status(401).json({ valid: false, motivo: "no_auth" }); }
+
+        const { session_id } = req.body || {};
+        if (!session_id) return res.status(400).json({ valid: false, motivo: "missing_session" });
+
+        const uid = decodedToken.uid;
+        const userRef = db.collection('usuarios').doc(uid);
+        const userDoc = await userRef.get();
+
+        if (!userDoc.exists) return res.status(403).json({ valid: false, motivo: "pase_inactivo" });
+        
         const userData = userDoc.data();
+        if (!userData.fecha_expiracion) return res.status(403).json({ valid: false, motivo: "pase_sin_expiracion" });
 
-        // 1. Verificamos si alguien más entró con su cuenta (Anti-Piratería)
+        const expiraMillis = userData.fecha_expiracion.toMillis();
+        const ahora = Date.now();
+
+        if (expiraMillis <= ahora) {
+            // 🔥 AJUSTE FINO: Guardamos last_heartbeat para auditar la hora exacta del cierre
+            await userRef.update({ 
+                last_heartbeat: admin.firestore.Timestamp.now(),
+                last_status: "expired" 
+            });
+            return res.json({ valid: false, motivo: "expirado" });
+        }
+
         if (session_id !== userData.session_id) {
-            return res.json({ valid: false, motivo: 'pirateria' });
+            // 🔥 AJUSTE FINO: Guardamos last_heartbeat para auditar la hora exacta del reemplazo
+            await userRef.update({ 
+                last_heartbeat: admin.firestore.Timestamp.now(),
+                last_status: "replaced_session" 
+            });
+            return res.json({ valid: false, motivo: "pirateria" });
         }
 
-        // 2. 🔥 NUEVO: Verificamos si su tiempo ya se acabó en tiempo real
-        if (userData.fecha_expiracion.toMillis() < Date.now()) {
-            return res.json({ valid: false, motivo: 'expirado' }); // Esto forzará al reproductor a cerrarse
-        }
+        await userRef.update({ last_heartbeat: admin.firestore.Timestamp.now(), last_status: "active" });
+        return res.json({ valid: true, motivo: "ok", pase_expira: expiraMillis });
 
-        res.json({ valid: true });
-    } catch (e) { res.json({ valid: false }); }
+    } catch (e) {
+        return res.status(500).json({ valid: false, motivo: "server_error" });
+    }
 });
 
-// --- 5. PANEL ADMIN ---
+// --- 6. PANEL ADMIN Y LIMPIEZA ---
 app.post('/admin/generar-pase-rapido', async (req, res) => {
-    // 🔥 Capturamos la 'fecha_corte' que envía el panel HTML
     const { admin_secret, partido, email_manual, pass_manual, fecha_corte } = req.body;
     if (admin_secret !== ADMIN_SECRET) return res.status(403).json({ success: false });
 
     try {
-        let emailFinal, claveFinal;
-
-        if (email_manual) {
-            // 💎 SOCIO VIP: Lógica intacta (Respeta lo que escribas o genera hex)
-            emailFinal = email_manual;
-            claveFinal = pass_manual || crypto.randomBytes(4).toString('hex');
-        } else {
-            // ⚡ PASE RÁPIDO: Genera 6 números aleatorios para facilitar el acceso desde celular
-            const numUser = Math.floor(100000 + Math.random() * 900000).toString();
-            const numPass = Math.floor(100000 + Math.random() * 900000).toString();
-            emailFinal = `${numUser}@golazosp.net`;
-            claveFinal = numPass;
-        }
-
+        let emailFinal = email_manual || `${Math.floor(100000 + Math.random() * 900000)}@golazosp.net`;
+        let claveFinal = pass_manual || Math.floor(100000 + Math.random() * 900000).toString();
+        
         const userRecord = await auth.createUser({ email: emailFinal, password: claveFinal, displayName: partido });
-
-        // 🔥 Ahora usamos la fecha del calendario. Si no hay, usa 24h por defecto.
         const exp = fecha_corte ? new Date(fecha_corte) : new Date(Date.now() + 24 * 60 * 60 * 1000);
 
         await db.collection('usuarios').doc(userRecord.uid).set({
@@ -136,39 +184,50 @@ app.post('/admin/generar-pase-rapido', async (req, res) => {
     } catch (e) { res.status(500).json({ success: false, message: e.message }); }
 });
 
-// 🔥 NUEVO: Función para limpiar usuarios vencidos
 app.post('/admin/limpiar-caducados', async (req, res) => {
     const { admin_secret } = req.body;
-    if (admin_secret !== ADMIN_SECRET) return res.status(403).json({ success: false, mensaje: "No autorizado" });
+    if (admin_secret !== ADMIN_SECRET) return res.status(403).json({ success: false });
 
     try {
         const ahora = admin.firestore.Timestamp.now();
         const vencidosSnap = await db.collection('usuarios').where('fecha_expiracion', '<', ahora).get();
-
-        if (vencidosSnap.empty) {
-            return res.json({ success: true, mensaje: "✅ No hay usuarios vencidos para limpiar." });
-        }
+        if (vencidosSnap.empty) return res.json({ success: true, mensaje: "✅ No hay usuarios vencidos." });
 
         let borrados = 0;
         for (const doc of vencidosSnap.docs) {
             try {
-                // Borra de Authentication y de Firestore para dejarlo 100% limpio
                 await auth.deleteUser(doc.id); 
                 await doc.ref.delete();        
                 borrados++;
-            } catch (err) {
-                console.error("Error borrando usuario:", doc.id);
-            }
+            } catch (err) {}
         }
-
-        res.json({ success: true, mensaje: `🧹 Limpieza completada: ${borrados} pases vencidos eliminados.` });
-    } catch (e) {
-        console.error(e);
-        res.status(500).json({ success: false, mensaje: "Error al intentar limpiar la base de datos." });
-    }
+        res.json({ success: true, mensaje: `🧹 ${borrados} pases vencidos eliminados.` });
+    } catch (e) { res.status(500).json({ success: false }); }
 });
 
-// --- 6. BOT TELEGRAM ---
+app.post('/admin/listar-usuarios', async (req, res) => {
+    const { admin_secret } = req.body;
+    if (admin_secret !== ADMIN_SECRET) return res.status(403).json({ success: false });
+    
+    const snap = await db.collection('usuarios').orderBy('creado_el', 'desc').get();
+    const usuariosFormateados = snap.docs.map(d => {
+        const data = d.data();
+        const expiraMillis = data.fecha_expiracion.toMillis();
+        const esActivo = expiraMillis > Date.now();
+        
+        return {
+            ...data,
+            estado: esActivo ? 'ACTIVO' : 'VENCIDO',
+            esActivo: esActivo,
+            tiempo: new Date(expiraMillis).toLocaleString('es-PE', {
+                timeZone: 'America/Lima', year: 'numeric', month: '2-digit', day: '2-digit', hour: '2-digit', minute: '2-digit', hour12: true
+            })
+        };
+    });
+    res.json({ success: true, usuarios: usuariosFormateados });
+});
+
+// --- 7. BOT TELEGRAM ---
 const bot = new Telegraf(process.env.TELEGRAM_BOT_TOKEN);
 const iniciarBot = async () => {
     try {
@@ -179,28 +238,5 @@ const iniciarBot = async () => {
 };
 iniciarBot();
 
-app.post('/admin/listar-usuarios', async (req, res) => {
-    const { admin_secret } = req.body;
-    if (admin_secret !== ADMIN_SECRET) return res.status(403).json({ success: false });
-    
-    const snap = await db.collection('usuarios').orderBy('creado_el', 'desc').get();
-    
-    // Formateamos los datos para que el panel.html los entienda y no diga "undefined"
-    const usuariosFormateados = snap.docs.map(d => {
-        const data = d.data();
-        const expiraMillis = data.fecha_expiracion.toMillis();
-        const esActivo = expiraMillis > Date.now();
-        
-        return {
-            ...data,
-            estado: esActivo ? 'ACTIVO' : 'VENCIDO',
-            esActivo: esActivo,
-            tiempo: new Date(expiraMillis).toLocaleString('es-PE') // Muestra la fecha/hora en formato Perú
-        };
-    });
-
-    res.json({ success: true, usuarios: usuariosFormateados });
-});
-
 const PORT = process.env.PORT || 3000;
-app.listen(PORT, () => console.log(`🚀 GOLAZO v8.5 READY (HEARTBEAT & TABLE FIX)`));
+app.listen(PORT, () => console.log(`🚀 GOLAZO SECURE STREAM READY (FASE 2)`));
