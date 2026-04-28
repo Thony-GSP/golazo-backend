@@ -4,6 +4,10 @@
     <meta charset="UTF-8">
     <meta name="viewport" content="width=device-width, initial-scale=1.0">
     <title>GOLAZO SP - CENTRAL MAESTRA</title>
+    
+    <script src="https://www.gstatic.com/firebasejs/9.17.1/firebase-app-compat.js"></script>
+    <script src="https://www.gstatic.com/firebasejs/9.17.1/firebase-auth-compat.js"></script>
+
     <style>
         :root { --primary: #ef4444; --bg: #0f172a; --card: #1e293b; --text: #f8fafc; }
         body { font-family: 'Segoe UI', sans-serif; background: var(--bg); color: var(--text); padding: 10px; margin: 0; }
@@ -13,7 +17,6 @@
         input, textarea, select { width: 100%; padding: 10px; margin: 5px 0; border-radius: 8px; background: var(--card); color: white; border: 1px solid #475569; box-sizing: border-box; }
         button { width: 100%; padding: 12px; border: none; border-radius: 8px; cursor: pointer; font-weight: bold; text-transform: uppercase; margin-top: 5px; }
         .btn-crear { background: #10b981; color: white; }
-        .btn-bot { background: #a855f7; color: white; }
         .res-box { background: #000; color: #22c55e; padding: 12px; border-radius: 8px; margin-top: 10px; display: none; font-family: 'Courier New', monospace; white-space: pre-wrap; line-height: 1.4; border: 1px solid #22c55e; }
         table { width: 100%; border-collapse: collapse; margin-top: 10px; }
         th, td { padding: 10px; border-bottom: 1px solid #334155; text-align: left; font-size: 13px; }
@@ -23,146 +26,276 @@
 <body>
 <div class="dashboard">
     <h1>⚙️ GOLAZO SP - MANDO CENTRAL</h1>
-    <input type="password" id="adminSecret" placeholder="🔐 Clave Maestra">
-
-    <div class="section">
-        <h2>🤖 CONFIGURACIÓN BOT</h2>
-        <input type="text" id="botPromo" placeholder="Promo hoy">
-        <textarea id="botPartidos" placeholder="Cartelera (Un partido por línea)" style="height: 80px;"></textarea>
-        <input type="text" id="botLinkVip" placeholder="Link Grupo VIP">
-        <button class="btn-bot" onclick="actualizarBot()">Guardar en Bot</button>
+    
+    <div id="loginAdmin" class="section">
+        <h2>🔐 Acceso Administrador</h2>
+        <input type="email" id="adminEmail" placeholder="Correo administrador">
+        <input type="password" id="adminPassword" placeholder="Contraseña">
+        <button class="btn-crear" onclick="loginAdmin()">Ingresar al Panel</button>
     </div>
 
-    <div style="display: grid; grid-template-columns: repeat(auto-fit, minmax(300px, 1fr)); gap: 15px;">
-        <div class="section">
-            <h2>⚡ PASE RÁPIDO</h2>
-            <input type="text" id="nombrePartido" placeholder="Ej: Irak vs Bolivia">
-            <input type="datetime-local" id="fechaCorte">
-            <button class="btn-crear" onclick="generarPase(false)">Crear y Copiar</button>
-            <div id="resPase" class="res-box"></div>
-        </div>
-        <div class="section">
-            <h2>💎 SOCIO VIP</h2>
-            <input type="text" id="socioEmail" placeholder="Email o Nombre">
-            <select id="socioMeses">
-                <option value="720">Plan 1 Mes</option>
-                <option value="1440">Plan 2 Meses</option>
-            </select>
-            <button class="btn-crear" style="background:#f59e0b" onclick="generarPase(true)">Activar VIP</button>
-            <div id="resSocio" class="res-box" style="color:#f59e0b; border-color:#f59e0b"></div>
+    <div id="adminInfo" class="section" style="display:none;">
+        <div style="display:flex; justify-content:space-between; align-items:center; gap:10px; flex-wrap:wrap;">
+            <span id="adminUserText" style="font-weight:bold;">Administrador conectado</span>
+            <button onclick="logoutAdmin()" style="width:auto; background:#475569; padding:8px 15px;">Cerrar sesión</button>
         </div>
     </div>
 
-    <div class="section">
-        <div style="display: flex; justify-content: space-between; align-items: center;">
-            <h2>📊 AUDITORÍA</h2>
-            <div style="display: flex; gap: 10px;">
-                <button onclick="cargarUsuarios()" style="width:auto; padding:8px 15px;">🔄 Refrescar</button>
-                <button onclick="limpiarCaducados()" style="width:auto; background:#475569; padding:8px 15px;">🧹 Limpiar</button>
+    <div id="panelContenido" style="display:none;">
+        <div style="display: grid; grid-template-columns: repeat(auto-fit, minmax(300px, 1fr)); gap: 15px;">
+            <div class="section">
+                <h2>⚡ PASE RÁPIDO</h2>
+                <input type="text" id="nombrePartido" placeholder="Ej: Cristal vs Universitario">
+                <input type="datetime-local" id="fechaCorte">
+                <button class="btn-crear" onclick="generarPase(false)">Crear y Copiar</button>
+                <div id="resPase" class="res-box"></div>
+            </div>
+            
+            <div class="section">
+                <h2>💎 SOCIO VIP</h2>
+                <input type="email" id="socioEmail" placeholder="Email del socio">
+                <input type="text" id="linkVip" placeholder="Link Grupo VIP opcional">
+                <select id="socioMeses">
+                    <option value="30">Plan 1 Mes</option>
+                    <option value="60">Plan 2 Meses</option>
+                </select>
+                <button class="btn-crear" style="background:#f59e0b" onclick="generarPase(true)">Activar VIP</button>
+                <div id="resSocio" class="res-box" style="color:#f59e0b; border-color:#f59e0b"></div>
             </div>
         </div>
-        <table>
-            <thead><tr><th>USUARIO</th><th>TIPO/PARTIDO</th><th>ESTADO</th><th>TIEMPO</th></tr></thead>
-            <tbody id="tablaUsuarios"></tbody>
-        </table>
+
+        <div class="section">
+            <div style="display: flex; justify-content: space-between; align-items: center;">
+                <h2>📊 AUDITORÍA</h2>
+                <div style="display: flex; gap: 10px;">
+                    <button onclick="cargarUsuarios()" style="width:auto; padding:8px 15px;">🔄 Refrescar</button>
+                    <button onclick="limpiarCaducados()" style="width:auto; background:#475569; padding:8px 15px;">🧹 Limpiar</button>
+                </div>
+            </div>
+            <table>
+                <thead>
+                    <tr>
+                        <th>USUARIO</th>
+                        <th>TIPO/PARTIDO</th>
+                        <th>ESTADO</th>
+                        <th>EXPIRA</th>
+                        <th>SESIÓN</th>
+                    </tr>
+                </thead>
+                <tbody id="tablaUsuarios"></tbody>
+            </table>
+        </div>
     </div>
 </div>
 
 <script>
     const BACKEND_URL = "https://golazo-backend-ellz.onrender.com";
 
+    // --- 🔥 FASE 4: Inicialización de Firebase ---
+    const firebaseConfig = {
+        apiKey: "AIzaSyCJ9fHy1ldvHFp6NdMexfoz4KR4d54j_Hw",
+        authDomain: "golazostreamperu-de4fd.firebaseapp.com",
+        projectId: "golazostreamperu-de4fd",
+        storageBucket: "golazostreamperu-de4fd.firebasestorage.app",
+        messagingSenderId: "940862641322",
+        appId: "1:940862641322:web:a2afefcc21a5e5245decd3"
+    };
+
+    firebase.initializeApp(firebaseConfig);
+    const auth = firebase.auth();
+    // 🔥 AJUSTE: Persistencia de sesión
+    auth.setPersistence(firebase.auth.Auth.Persistence.LOCAL);
+
     window.onload = () => {
         let n = new Date();
         n.setHours(n.getHours() + 4);
         n.setMinutes(n.getMinutes() - n.getTimezoneOffset());
         document.getElementById('fechaCorte').value = n.toISOString().slice(0,16);
+
+        auth.onAuthStateChanged(async (user) => {
+            if (!user) return;
+
+            try {
+                const tokenResult = await user.getIdTokenResult(true);
+                if (tokenResult.claims.admin === true) {
+                    mostrarPanelAdmin(user.email);
+                    cargarUsuarios();
+                } else {
+                    await auth.signOut();
+                }
+            } catch (e) {
+                console.error(e);
+            }
+        });
     };
 
-    async function actualizarBot() {
-        const s = document.getElementById('adminSecret').value;
-        if(!s) return alert("Ingresa clave");
+    // --- 🔥 FASE 4: Funciones de Login y UI ---
+    async function loginAdmin() {
+        const email = document.getElementById('adminEmail').value.trim();
+        const password = document.getElementById('adminPassword').value;
+
+        if (!email || !password) {
+            return alert("Ingresa correo y contraseña de administrador.");
+        }
+
         try {
-            const res = await fetch(`${BACKEND_URL}/admin/update-bot`, {
-                method: 'POST', headers: {'Content-Type': 'application/json'},
-                body: JSON.stringify({
-                    admin_secret: s,
-                    promo_hoy: document.getElementById('botPromo').value,
-                    partidos_cartelera: document.getElementById('botPartidos').value,
-                    link_vip: document.getElementById('botLinkVip').value
-                })
-            });
-            if(res.ok) alert("✅ Bot actualizado");
-            else alert("❌ Clave incorrecta");
-        } catch(e) { alert("❌ Error de conexión"); }
+            await auth.signInWithEmailAndPassword(email, password);
+            const user = auth.currentUser;
+            const tokenResult = await user.getIdTokenResult(true);
+
+            if (tokenResult.claims.admin !== true) {
+                await auth.signOut();
+                return alert("Este usuario no tiene permisos de administrador.");
+            }
+
+            mostrarPanelAdmin(user.email);
+            cargarUsuarios();
+
+        } catch (error) {
+            console.error(error);
+            alert("No se pudo iniciar sesión como administrador.");
+        }
     }
 
+    async function logoutAdmin() {
+        await auth.signOut();
+        document.getElementById('loginAdmin').style.display = "block";
+        document.getElementById('adminInfo').style.display = "none";
+        document.getElementById('panelContenido').style.display = "none";
+    }
+
+    function mostrarPanelAdmin(email) {
+        document.getElementById('loginAdmin').style.display = "none";
+        document.getElementById('adminInfo').style.display = "block";
+        document.getElementById('panelContenido').style.display = "block";
+        document.getElementById('adminUserText').innerText = `Administrador: ${email}`;
+    }
+
+    // --- 🔥 FASE 4: Helpers de Petición Segura ---
+    async function getAdminToken() {
+        const user = auth.currentUser;
+        if (!user) {
+            throw new Error("No hay administrador autenticado.");
+        }
+        return await user.getIdToken();
+    }
+
+    async function adminFetch(path, options = {}) {
+        const token = await getAdminToken();
+        return fetch(`${BACKEND_URL}${path}`, {
+            ...options,
+            headers: {
+                'Content-Type': 'application/json',
+                'Authorization': `Bearer ${token}`,
+                ...(options.headers || {})
+            }
+        });
+    }
+
+    function formatearFechaPeru(fecha) {
+        return fecha.toLocaleString('es-PE', {
+            timeZone: 'America/Lima',
+            day: '2-digit',
+            month: '2-digit',
+            year: 'numeric',
+            hour: '2-digit',
+            minute: '2-digit',
+            hour12: true
+        });
+    }
+
+    // --- 🔥 FASE 4: Funciones del Panel ---
     async function generarPase(esSocio) {
-        const s = document.getElementById('adminSecret').value;
-        const nombre = esSocio ? document.getElementById('socioEmail').value : document.getElementById('nombrePartido').value;
-        if(!s || !nombre) return alert("Faltan datos");
+        const nombre = esSocio
+            ? document.getElementById('socioEmail').value.trim()
+            : document.getElementById('nombrePartido').value.trim();
+
+        if (!nombre) return alert("Faltan datos");
+
+        // 🔥 AJUSTE: Validación de correo válido para Firebase
+        if (esSocio && !nombre.includes('@')) {
+            return alert("Ingresa un email válido para el socio VIP.");
+        }
 
         let fecha = esSocio ? new Date() : new Date(document.getElementById('fechaCorte').value);
-        if(esSocio) fecha.setHours(fecha.getHours() + parseInt(document.getElementById('socioMeses').value));
+
+        if (esSocio) {
+            fecha.setDate(fecha.getDate() + parseInt(document.getElementById('socioMeses').value));
+        }
 
         try {
-            const res = await fetch(`${BACKEND_URL}/admin/generar-pase-rapido`, {
-                method: 'POST', headers: {'Content-Type': 'application/json'},
-                body: JSON.stringify({ 
-                    admin_secret: s, fecha_corte: fecha.toISOString(), 
-                    partido: esSocio ? "SOCIO VIP ⭐" : nombre, email_manual: esSocio ? nombre : null 
+            const res = await adminFetch('/admin/generar-pase-rapido', {
+                method: 'POST',
+                body: JSON.stringify({
+                    fecha_corte: fecha.toISOString(),
+                    partido: esSocio ? "SOCIO VIP ⭐" : nombre,
+                    email_manual: esSocio ? nombre : null
                 })
             });
+
             const d = await res.json();
+            
             if(d.success) {
                 const box = esSocio ? document.getElementById('resSocio') : document.getElementById('resPase');
+                const expiraTexto = formatearFechaPeru(fecha);
                 let msg = "";
+
                 if(esSocio) {
-                    const linkVip = document.getElementById('botLinkVip').value || "Solicitar al soporte";
-                    msg = `🔥 ¡BIENVENIDO SOCIO VIP! 🔥\n━━━━━━━━━━━━━━\n1️⃣ Grupo VIP: ${linkVip}\n2️⃣ Web: www.golazosp.net\n👤 User: ${d.usuario}\n🔑 Pass: ${d.clave}\n━━━━━━━━━━━━━━\n¡Disfruta tu acceso mensual! 💎`;
+                    const linkVip = document.getElementById('linkVip').value || "Solicitar al soporte";
+                    msg = `🔥 ¡BIENVENIDO SOCIO VIP! 🔥\n━━━━━━━━━━━━━━\n1️⃣ Grupo VIP: ${linkVip}\n2️⃣ Web: www.golazosp.net\n👤 User: ${d.usuario}\n🔑 Pass: ${d.clave}\n━━━━━━━━━━━━━━\n⏳ Válido hasta: ${expiraTexto}\n¡Disfruta tu acceso VIP! 💎`;
                 } else {
-                    msg = `✅ ¡ACCESO GOLAZO STREAM PERÚ LISTO! ⚽\n━━━━━━━━━━━━━━\n🌐 Web: www.golazosp.net\n👤 Usuario: ${d.usuario}\n🔑 Contraseña: ${d.clave}\n━━━━━━━━━━━━━━\n⏳ Válido para el partido de ${nombre}\n¡Disfruta el partido! 🫡`;
+                    msg = `✅ ¡ACCESO GOLAZO STREAM PERÚ LISTO! ⚽\n━━━━━━━━━━━━━━\n🌐 Web: www.golazosp.net\n👤 Usuario: ${d.usuario}\n🔑 Contraseña: ${d.clave}\n━━━━━━━━━━━━━━\n⚽ Partido: ${nombre}\n⏳ Válido hasta: ${expiraTexto}\n¡Disfruta el partido! 🫡`;
                 }
+                
                 box.innerText = msg;
                 box.style.display = "block";
                 await navigator.clipboard.writeText(msg);
                 alert("🚀 ¡Copiado al portapapeles!");
                 cargarUsuarios();
-            } else { alert("❌ No autorizado"); }
-        } catch(e) { alert("❌ Error de servidor"); }
+            } else { 
+                alert("❌ No autorizado o sesión vencida"); 
+            }
+        } catch(e) { 
+            alert("❌ Error de servidor"); 
+        }
     }
 
     async function cargarUsuarios() {
-        const s = document.getElementById('adminSecret').value;
-        if(!s) return;
         try {
-            const res = await fetch(`${BACKEND_URL}/admin/listar-usuarios`, {
-                method: 'POST', headers: {'Content-Type': 'application/json'},
-                body: JSON.stringify({ admin_secret: s })
+            const res = await adminFetch('/admin/listar-usuarios', {
+                method: 'POST',
+                body: JSON.stringify({})
             });
             const d = await res.json();
+
             if(d.success) {
                 document.getElementById('tablaUsuarios').innerHTML = d.usuarios.map(u => `<tr>
                     <td><b>${u.usuario_corto}</b></td>
-                    <td>${u.etiqueta}</td>
+                    <td>${u.etiqueta || '-'}</td>
                     <td><span class="badge" style="background:${u.esActivo ? '#065f46' : '#7f1d1d'}">${u.estado}</span></td>
                     <td>${u.tiempo}</td>
+                    <td>${u.last_status || '-'}</td>
                 </tr>`).join('');
             }
         } catch(e) {}
     }
 
     async function limpiarCaducados() {
-        const s = document.getElementById('adminSecret').value;
-        if(!confirm("¿Limpiar vencidos?")) return;
+        if (!confirm("¿Limpiar vencidos?")) return;
+
         try {
-            const res = await fetch(`${BACKEND_URL}/admin/limpiar-caducados`, {
-                method: 'POST', headers: {'Content-Type': 'application/json'},
-                body: JSON.stringify({ admin_secret: s })
+            const res = await adminFetch('/admin/limpiar-caducados', {
+                method: 'POST',
+                body: JSON.stringify({})
             });
+
             const d = await res.json();
-            alert(d.mensaje);
+            alert(d.mensaje || "Proceso finalizado.");
             cargarUsuarios();
-        } catch(e) {}
+
+        } catch(e) {
+            alert("❌ Error de servidor");
+        }
     }
 </script>
 </body>
