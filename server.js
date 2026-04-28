@@ -19,7 +19,8 @@ const allowedOrigins = [
     'https://golazosp.net',
     'https://www.golazosp.net',
     'https://zonagolazo.net',
-    'https://www.zonagolazo.net',  
+    'https://www.zonagolazo.net',
+    'https://thony-gsp.github.io/golazo-backend/panel.html',
 ];
 
 const corsOptions = {
