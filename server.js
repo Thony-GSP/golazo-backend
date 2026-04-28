@@ -2,6 +2,7 @@ const express = require('express');
 const admin = require('firebase-admin');
 const crypto = require('crypto');
 const cors = require('cors');
+const rateLimit = require('express-rate-limit');
 const { Telegraf, Markup } = require('telegraf');
 
 // --- 1. FIREBASE ---
@@ -13,8 +14,60 @@ const auth = admin.auth();
 const app = express();
 app.set('trust proxy', 1);
 
-app.use(cors({ origin: '*', methods: ['GET', 'POST', 'OPTIONS'], allowedHeaders: ['Content-Type', 'Authorization'] }));
+// --- 🔥 FASE 3: CORS RESTRINGIDO ---
+const allowedOrigins = [
+    'https://golazosp.net',
+    'https://www.golazosp.net',
+    'https://zonagolazo.net',
+    'https://www.zonagolazo.net',  
+];
+
+const corsOptions = {
+    origin: function (origin, callback) {
+        if (!origin) { return callback(null, true); }
+        if (allowedOrigins.includes(origin)) { return callback(null, true); }
+        
+        console.warn(`❌ CORS bloqueado para origin: ${origin}`);
+        return callback(null, false);
+    },
+    methods: ['GET', 'POST', 'OPTIONS'],
+    allowedHeaders: ['Content-Type', 'Authorization'],
+    credentials: false
+};
+
+app.use(cors(corsOptions));
 app.use(express.json());
+
+// --- 🔥 FASE 3: LIMITADORES DE VELOCIDAD (RATE LIMITS) ---
+const generalLimiter = rateLimit({
+    windowMs: 60 * 1000,
+    max: 120,
+    standardHeaders: true,
+    legacyHeaders: false,
+    skip: (req) => req.method === 'OPTIONS',
+    message: { success: false, code: "RATE_LIMIT", error: "Demasiadas solicitudes. Intenta nuevamente en unos segundos." }
+});
+
+const streamLimiter = rateLimit({
+    windowMs: 60 * 1000,
+    max: 30,
+    standardHeaders: true,
+    legacyHeaders: false,
+    skip: (req) => req.method === 'OPTIONS',
+    message: { success: false, code: "STREAM_RATE_LIMIT", error: "Demasiadas solicitudes de stream. Espera unos segundos." }
+});
+
+const adminLimiter = rateLimit({
+    windowMs: 60 * 1000,
+    max: 20,
+    standardHeaders: true,
+    legacyHeaders: false,
+    skip: (req) => req.method === 'OPTIONS',
+    message: { success: false, code: "ADMIN_RATE_LIMIT", error: "Demasiadas solicitudes administrativas." }
+});
+
+// Aplicar limitador general a todas las rutas
+app.use(generalLimiter);
 
 // --- 2. CONFIGURACIÓN ---
 const BUNNY_URL = 'https://stream.golazosp.net'; 
@@ -32,8 +85,36 @@ function generateBunnyToken(path, securityKey, duration = 120) {
     return { token, expires };
 }
 
-// --- 4. GENERATE STREAM (FASE 2: RENOVACIÓN Y SEGURIDAD CDN) ---
-app.get('/generate-stream', async (req, res) => {
+// --- 🔥 FASE 4: MIDDLEWARE DE SEGURIDAD ADMIN ---
+async function verifyAdmin(req, res, next) {
+    // 1. Soporte temporal: Mantiene vivo tu panel actual con el admin_secret
+    if (req.body.admin_secret && req.body.admin_secret === ADMIN_SECRET) {
+        return next();
+    }
+
+    // 2. Nueva seguridad: Validación por Token de Firebase
+    const authHeader = req.headers.authorization || "";
+    if (!authHeader.startsWith("Bearer ")) {
+        return res.status(401).json({ success: false, message: "Falta token de administrador" });
+    }
+
+    const idToken = authHeader.replace("Bearer ", "").trim();
+    try {
+        const decodedToken = await auth.verifyIdToken(idToken);
+        
+        // Verificamos si el usuario tiene el "sello" de administrador
+        if (decodedToken.admin === true) {
+            return next();
+        } else {
+            return res.status(403).json({ success: false, message: "Permisos denegados. No eres administrador." });
+        }
+    } catch (error) {
+        return res.status(401).json({ success: false, message: "Token de administrador inválido o expirado" });
+    }
+}
+
+// --- 4. GENERATE STREAM (CON LIMITADOR) ---
+app.get('/generate-stream', streamLimiter, async (req, res) => {
     try {
         const authHeader = req.headers.authorization || "";
         if (!authHeader.startsWith("Bearer ")) return res.status(401).json({ success: false, code: "NO_AUTH" });
@@ -65,8 +146,6 @@ app.get('/generate-stream', async (req, res) => {
         }
 
         let sessionIdFinal = userData.session_id || "";
-        
-        // 🔥 AJUSTE FINO: Forzamos a un booleano estricto (true o false)
         const mismaSesion = Boolean(requestedSessionId && requestedSessionId === userData.session_id);
 
         if (!mismaSesion) {
@@ -84,7 +163,6 @@ app.get('/generate-stream', async (req, res) => {
             });
         }
 
-        // Token dura máximo 120s o lo que le quede al pase.
         const tokenDuration = Math.min(120, segundosRestantesPase);
         const { token, expires } = generateBunnyToken(STREAM_PATH, BUNNY_SECURITY_KEY, tokenDuration);
         const finalUrl = `${BUNNY_URL}${STREAM_PATH}?token=${token}&expires=${expires}`;
@@ -133,7 +211,6 @@ app.post('/check-session', async (req, res) => {
         const ahora = Date.now();
 
         if (expiraMillis <= ahora) {
-            // 🔥 AJUSTE FINO: Guardamos last_heartbeat para auditar la hora exacta del cierre
             await userRef.update({ 
                 last_heartbeat: admin.firestore.Timestamp.now(),
                 last_status: "expired" 
@@ -142,7 +219,6 @@ app.post('/check-session', async (req, res) => {
         }
 
         if (session_id !== userData.session_id) {
-            // 🔥 AJUSTE FINO: Guardamos last_heartbeat para auditar la hora exacta del reemplazo
             await userRef.update({ 
                 last_heartbeat: admin.firestore.Timestamp.now(),
                 last_status: "replaced_session" 
@@ -159,9 +235,23 @@ app.post('/check-session', async (req, res) => {
 });
 
 // --- 6. PANEL ADMIN Y LIMPIEZA ---
-app.post('/admin/generar-pase-rapido', async (req, res) => {
-    const { admin_secret, partido, email_manual, pass_manual, fecha_corte } = req.body;
+
+// Ruta temporal para crear al primer administrador mediante Postman
+app.post('/admin/set-admin-claim', adminLimiter, async (req, res) => {
+    const { admin_secret, email } = req.body;
     if (admin_secret !== ADMIN_SECRET) return res.status(403).json({ success: false });
+
+    try {
+        const user = await auth.getUserByEmail(email);
+        await auth.setCustomUserClaims(user.uid, { admin: true });
+        res.json({ success: true, message: `✅ Rol de administrador asignado correctamente a: ${email}` });
+    } catch (error) {
+        res.status(500).json({ success: false, message: error.message });
+    }
+});
+
+app.post('/admin/generar-pase-rapido', adminLimiter, verifyAdmin, async (req, res) => {
+    const { partido, email_manual, pass_manual, fecha_corte } = req.body;
 
     try {
         let emailFinal = email_manual || `${Math.floor(100000 + Math.random() * 900000)}@golazosp.net`;
@@ -184,10 +274,7 @@ app.post('/admin/generar-pase-rapido', async (req, res) => {
     } catch (e) { res.status(500).json({ success: false, message: e.message }); }
 });
 
-app.post('/admin/limpiar-caducados', async (req, res) => {
-    const { admin_secret } = req.body;
-    if (admin_secret !== ADMIN_SECRET) return res.status(403).json({ success: false });
-
+app.post('/admin/limpiar-caducados', adminLimiter, verifyAdmin, async (req, res) => {
     try {
         const ahora = admin.firestore.Timestamp.now();
         const vencidosSnap = await db.collection('usuarios').where('fecha_expiracion', '<', ahora).get();
@@ -205,10 +292,7 @@ app.post('/admin/limpiar-caducados', async (req, res) => {
     } catch (e) { res.status(500).json({ success: false }); }
 });
 
-app.post('/admin/listar-usuarios', async (req, res) => {
-    const { admin_secret } = req.body;
-    if (admin_secret !== ADMIN_SECRET) return res.status(403).json({ success: false });
-    
+app.post('/admin/listar-usuarios', adminLimiter, verifyAdmin, async (req, res) => {
     const snap = await db.collection('usuarios').orderBy('creado_el', 'desc').get();
     const usuariosFormateados = snap.docs.map(d => {
         const data = d.data();
@@ -239,4 +323,4 @@ const iniciarBot = async () => {
 iniciarBot();
 
 const PORT = process.env.PORT || 3000;
-app.listen(PORT, () => console.log(`🚀 GOLAZO SECURE STREAM READY (FASE 2)`));
+app.listen(PORT, () => console.log(`🚀 GOLAZO SECURE STREAM READY (FASE 4: RATE LIMIT & ADMIN MIDDLEWARE)`));
