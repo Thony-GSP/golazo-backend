@@ -163,8 +163,7 @@ app.get('/generate-stream', streamLimiter, async (req, res) => {
             return res.status(403).json({ success: false, code: "PASS_EXPIRED", error: "Pase expirado" });
         }
 
-        // 🔒 FASE 5: BLINDAJE CONTRA CONDICIÓN DE CARRERA
-        // Si la sesión fue revocada por admin, no permitimos que una renovación silenciosa cree otra sesión.
+        // 🔒 FASE 5: BLINDAJE CONTRA CONDICIÓN DE CARRERA (REVOCACIÓN)
         if (
             requestedSessionId &&
             (
@@ -176,6 +175,30 @@ app.get('/generate-stream', streamLimiter, async (req, res) => {
                 success: false,
                 code: "SESSION_REVOKED",
                 error: "Sesión revocada por administración"
+            });
+        }
+
+        // 🔒 FASE 5: Bloqueo de segunda sesión activa reciente (Backend Wall)
+        // Si ya existe una sesión activa y la nueva petición viene sin session_id,
+        // no permitimos crear otra sesión automáticamente.
+        const lastHeartbeatMillis = userData.last_heartbeat && typeof userData.last_heartbeat.toMillis === "function"
+            ? userData.last_heartbeat.toMillis()
+            : 0;
+
+        const sesionActivaReciente = Boolean(
+            userData.session_id &&
+            !String(userData.session_id).startsWith("revoked_") &&
+            userData.last_status !== "expired" &&
+            userData.last_status !== "revoked_by_admin" &&
+            lastHeartbeatMillis &&
+            Date.now() - lastHeartbeatMillis < 45000
+        );
+
+        if (!requestedSessionId && sesionActivaReciente) {
+            return res.status(409).json({
+                success: false,
+                code: "SESSION_ALREADY_ACTIVE",
+                error: "Ya existe una sesión activa para este usuario."
             });
         }
 
@@ -402,5 +425,5 @@ app.post('/admin/listar-usuarios', adminLimiter, verifyAdmin, async (req, res) =
 const PORT = process.env.PORT || 3000;
 
 app.listen(PORT, () => {
-    console.log(`🚀 GOLAZO SECURE STREAM READY (FASE 5 FINAL: BLINDAJE RACE CONDITION)`);
+    console.log(`🚀 GOLAZO SECURE STREAM READY (FASE 5 FINAL: BLINDAJE BACKEND CONTRA MULTISESIÓN)`);
 });
