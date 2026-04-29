@@ -21,6 +21,19 @@
         table { width: 100%; border-collapse: collapse; margin-top: 10px; }
         th, td { padding: 10px; border-bottom: 1px solid #334155; text-align: left; font-size: 13px; }
         .badge { padding: 3px 6px; border-radius: 4px; font-size: 10px; font-weight: bold; }
+        
+        /* 🔥 NUEVOS ESTILOS DE AUDITORÍA */
+        .table-wrap { width: 100%; overflow-x: auto; }
+        .audit-table { min-width: 1050px; }
+        .muted { color: #94a3b8; font-size: 11px; }
+        .btn-small { width: auto; padding: 6px 10px; font-size: 11px; border-radius: 6px; margin: 0; }
+        .btn-danger { background: #dc2626; color: white; }
+        .btn-danger:disabled { background: #475569; cursor: not-allowed; opacity: 0.6; }
+        .badge-session { background: #334155; color: #e2e8f0; }
+        .badge-ok { background: #065f46; color: white; }
+        .badge-warn { background: #92400e; color: white; }
+        .badge-danger { background: #7f1d1d; color: white; }
+        .ip-cell { font-family: 'Courier New', monospace; font-size: 12px; }
     </style>
 </head>
 <body>
@@ -66,24 +79,30 @@
 
         <div class="section">
             <div style="display: flex; justify-content: space-between; align-items: center;">
-                <h2>📊 AUDITORÍA</h2>
+                <h2>📊 AUDITORÍA Y CONTROL</h2>
                 <div style="display: flex; gap: 10px;">
                     <button onclick="cargarUsuarios()" style="width:auto; padding:8px 15px;">🔄 Refrescar</button>
                     <button onclick="limpiarCaducados()" style="width:auto; background:#475569; padding:8px 15px;">🧹 Limpiar</button>
                 </div>
             </div>
-            <table>
-                <thead>
-                    <tr>
-                        <th>USUARIO</th>
-                        <th>TIPO/PARTIDO</th>
-                        <th>ESTADO</th>
-                        <th>EXPIRA</th>
-                        <th>SESIÓN</th>
-                    </tr>
-                </thead>
-                <tbody id="tablaUsuarios"></tbody>
-            </table>
+            <div class="table-wrap">
+                <table class="audit-table">
+                    <thead>
+                        <tr>
+                            <th>USUARIO</th>
+                            <th>TIPO/PARTIDO</th>
+                            <th>ESTADO</th>
+                            <th>EXPIRA</th>
+                            <th>ÚLTIMA ACTIVIDAD</th>
+                            <th>IP</th>
+                            <th>SESIÓN</th>
+                            <th>CLAVE</th>
+                            <th>ACCIÓN</th>
+                        </tr>
+                    </thead>
+                    <tbody id="tablaUsuarios"></tbody>
+                </table>
+            </div>
         </div>
     </div>
 </div>
@@ -91,7 +110,6 @@
 <script>
     const BACKEND_URL = "https://golazo-backend-ellz.onrender.com";
 
-    // --- 🔥 FASE 4: Inicialización de Firebase ---
     const firebaseConfig = {
         apiKey: "AIzaSyCJ9fHy1ldvHFp6NdMexfoz4KR4d54j_Hw",
         authDomain: "golazostreamperu-de4fd.firebaseapp.com",
@@ -103,7 +121,6 @@
 
     firebase.initializeApp(firebaseConfig);
     const auth = firebase.auth();
-    // 🔥 AJUSTE: Persistencia de sesión
     auth.setPersistence(firebase.auth.Auth.Persistence.LOCAL);
 
     window.onload = () => {
@@ -129,7 +146,6 @@
         });
     };
 
-    // --- 🔥 FASE 4: Funciones de Login y UI ---
     async function loginAdmin() {
         const email = document.getElementById('adminEmail').value.trim();
         const password = document.getElementById('adminPassword').value;
@@ -171,7 +187,6 @@
         document.getElementById('adminUserText').innerText = `Administrador: ${email}`;
     }
 
-    // --- 🔥 FASE 4: Helpers de Petición Segura ---
     async function getAdminToken() {
         const user = auth.currentUser;
         if (!user) {
@@ -204,7 +219,62 @@
         });
     }
 
-    // --- 🔥 FASE 4: Funciones del Panel ---
+    function escapeHtml(value) {
+        return String(value ?? "")
+            .replaceAll("&", "&amp;")
+            .replaceAll("<", "&lt;")
+            .replaceAll(">", "&gt;")
+            .replaceAll('"', "&quot;")
+            .replaceAll("'", "&#039;");
+    }
+
+    function escapeAttr(value) {
+        return escapeHtml(value).replaceAll("`", "&#096;");
+    }
+
+    function formatearSesion(status) {
+        const mapa = {
+            active: "Activo",
+            stream_started: "Iniciado",
+            stream_renewed: "Renovado",
+            expired: "Expirado",
+            replaced_session: "Reemplazado",
+            revoked_by_admin: "Revocado",
+            "-": "-"
+        };
+        return mapa[status] || status || "-";
+    }
+
+    function claseSesion(status) {
+        if (status === "active" || status === "stream_renewed" || status === "stream_started") {
+            return "badge-ok";
+        }
+        if (status === "replaced_session") {
+            return "badge-warn";
+        }
+        if (status === "expired" || status === "revoked_by_admin") {
+            return "badge-danger";
+        }
+        return "badge-session";
+    }
+
+    function formatearClave(passwordStored) {
+        if (passwordStored === false) {
+            return `<span class="badge badge-ok">No almacenada</span>`;
+        }
+        return `<span class="badge badge-warn">Antigua</span>`;
+    }
+
+    // 🔥 AJUSTE APLICADO AQUÍ
+    function resumirUserAgent(userAgent) {
+        if (!userAgent || userAgent === "Sin registro") return "Sin registro";
+        if (userAgent.includes("Edg")) return "Edge";
+        if (userAgent.includes("Chrome")) return "Chrome";
+        if (userAgent.includes("Firefox")) return "Firefox";
+        if (userAgent.includes("Safari") && !userAgent.includes("Chrome")) return "Safari";
+        return "Navegador";
+    }
+
     async function generarPase(esSocio) {
         const nombre = esSocio
             ? document.getElementById('socioEmail').value.trim()
@@ -212,7 +282,6 @@
 
         if (!nombre) return alert("Faltan datos");
 
-        // 🔥 AJUSTE: Validación de correo válido para Firebase
         if (esSocio && !nombre.includes('@')) {
             return alert("Ingresa un email válido para el socio VIP.");
         }
@@ -253,10 +322,11 @@
                 alert("🚀 ¡Copiado al portapapeles!");
                 cargarUsuarios();
             } else { 
-                alert("❌ No autorizado o sesión vencida"); 
+                alert(`❌ Error creando pase: ${d.message || d.error || d.code || "No autorizado o sesión vencida"}`);
             }
         } catch(e) { 
-            alert("❌ Error de servidor"); 
+            console.error("Error real creando pase:", e);
+            alert("❌ Error de servidor creando pase. Revisa consola.");
         }
     }
 
@@ -266,18 +336,120 @@
                 method: 'POST',
                 body: JSON.stringify({})
             });
+
+            const rawText = await res.text();
+
+            let d = {};
+            try {
+                d = JSON.parse(rawText);
+            } catch (e) {
+                console.error("Respuesta no JSON al listar usuarios:", rawText);
+                alert("❌ Error inesperado listando usuarios.");
+                return;
+            }
+
+            if (!d.success) {
+                alert(d.message || "❌ No se pudo cargar la auditoría.");
+                return;
+            }
+
+            const rows = d.usuarios.map(u => {
+                const uid = escapeAttr(u.uid || "");
+                const usuario = escapeHtml(u.usuario_corto || "-");
+                const usuarioAttr = escapeAttr(u.usuario_corto || "-");
+                const etiqueta = escapeHtml(u.etiqueta || "-");
+                const estado = escapeHtml(u.estado || "-");
+                const tiempo = escapeHtml(u.tiempo || "-");
+                const ultimaConexion = escapeHtml(u.ultima_conexion || "-");
+                const ip = escapeHtml(u.last_ip || "Sin registro");
+                const status = u.last_status || "-";
+                const statusTexto = escapeHtml(formatearSesion(status));
+                const sessionClass = claseSesion(status);
+                const userAgent = escapeAttr(u.last_user_agent || "Sin registro");
+                const navegador = escapeHtml(resumirUserAgent(u.last_user_agent || ""));
+
+                const puedeRevocar = u.esActivo && status !== "revoked_by_admin";
+
+                return `<tr>
+                    <td>
+                        <b>${usuario}</b>
+                        <div class="muted">${navegador}</div>
+                    </td>
+                    <td>${etiqueta}</td>
+                    <td>
+                        <span class="badge" style="background:${u.esActivo ? '#065f46' : '#7f1d1d'}">${estado}</span>
+                    </td>
+                    <td>${tiempo}</td>
+                    <td>${ultimaConexion}</td>
+                    <td class="ip-cell" title="${userAgent}">${ip}</td>
+                    <td>
+                        <span class="badge ${sessionClass}">${statusTexto}</span>
+                    </td>
+                    <td>${formatearClave(u.password_stored)}</td>
+                    <td>
+                        <button 
+                            class="btn-small btn-danger btn-revocar"
+                            data-uid="${uid}"
+                            data-user="${usuarioAttr}"
+                            ${puedeRevocar ? "" : "disabled"}
+                        >
+                            Revocar
+                        </button>
+                    </td>
+                </tr>`;
+            }).join('');
+
+            document.getElementById('tablaUsuarios').innerHTML = rows || `
+                <tr>
+                    <td colspan="9" style="text-align:center; color:#94a3b8;">
+                        No hay usuarios para mostrar.
+                    </td>
+                </tr>
+            `;
+
+            document.querySelectorAll('.btn-revocar').forEach(btn => {
+                btn.addEventListener('click', () => {
+                    const uid = btn.dataset.uid;
+                    const usuario = btn.dataset.user;
+                    revocarSesion(uid, usuario);
+                });
+            });
+
+        } catch(e) {
+            console.error("Error cargando usuarios:", e);
+            alert("❌ Error de servidor cargando auditoría.");
+        }
+    }
+
+    async function revocarSesion(uid, usuario) {
+        if (!uid) {
+            return alert("UID inválido.");
+        }
+
+        const ok = confirm(`¿Revocar la sesión activa de ${usuario}?\n\nEl usuario será expulsado de la transmisión en breve.`);
+
+        if (!ok) return;
+
+        try {
+            const res = await adminFetch('/admin/revocar-sesion', {
+                method: 'POST',
+                body: JSON.stringify({ uid })
+            });
+
             const d = await res.json();
 
-            if(d.success) {
-                document.getElementById('tablaUsuarios').innerHTML = d.usuarios.map(u => `<tr>
-                    <td><b>${u.usuario_corto}</b></td>
-                    <td>${u.etiqueta || '-'}</td>
-                    <td><span class="badge" style="background:${u.esActivo ? '#065f46' : '#7f1d1d'}">${u.estado}</span></td>
-                    <td>${u.tiempo}</td>
-                    <td>${u.last_status || '-'}</td>
-                </tr>`).join('');
+            if (d.success) {
+                alert(d.message || "✅ Sesión revocada.");
+                cargarUsuarios();
+                return;
             }
-        } catch(e) {}
+
+            alert(d.message || "❌ No se pudo revocar la sesión.");
+
+        } catch (e) {
+            console.error("Error revocando sesión:", e);
+            alert("❌ Error de servidor al revocar sesión.");
+        }
     }
 
     async function limpiarCaducados() {
