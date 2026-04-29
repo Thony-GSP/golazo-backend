@@ -28,7 +28,6 @@ const allowedOrigins = [
 
 const corsOptions = {
     origin: function (origin, callback) {
-        // Permite herramientas server-to-server, Postman o curl.
         if (!origin) {
             return callback(null, true);
         }
@@ -47,10 +46,7 @@ const corsOptions = {
 };
 
 app.use(cors(corsOptions));
-
-// 🔥 Importante para preflight CORS con Authorization Bearer.
 app.options(/.*/, cors(corsOptions));
-
 app.use(express.json());
 
 // --- 3. RATE LIMITS ---
@@ -60,11 +56,7 @@ const generalLimiter = rateLimit({
     standardHeaders: true,
     legacyHeaders: false,
     skip: (req) => req.method === 'OPTIONS',
-    message: {
-        success: false,
-        code: "RATE_LIMIT",
-        error: "Demasiadas solicitudes. Intenta nuevamente en unos segundos."
-    }
+    message: { success: false, code: "RATE_LIMIT", error: "Demasiadas solicitudes." }
 });
 
 const streamLimiter = rateLimit({
@@ -73,11 +65,7 @@ const streamLimiter = rateLimit({
     standardHeaders: true,
     legacyHeaders: false,
     skip: (req) => req.method === 'OPTIONS',
-    message: {
-        success: false,
-        code: "STREAM_RATE_LIMIT",
-        error: "Demasiadas solicitudes de stream. Espera unos segundos."
-    }
+    message: { success: false, code: "STREAM_RATE_LIMIT", error: "Demasiadas solicitudes de stream." }
 });
 
 const adminLimiter = rateLimit({
@@ -86,11 +74,7 @@ const adminLimiter = rateLimit({
     standardHeaders: true,
     legacyHeaders: false,
     skip: (req) => req.method === 'OPTIONS',
-    message: {
-        success: false,
-        code: "ADMIN_RATE_LIMIT",
-        error: "Demasiadas solicitudes administrativas."
-    }
+    message: { success: false, code: "ADMIN_RATE_LIMIT", error: "Demasiadas solicitudes administrativas." }
 });
 
 app.use(generalLimiter);
@@ -99,94 +83,65 @@ app.use(generalLimiter);
 const BUNNY_URL = 'https://stream.golazosp.net';
 const BUNNY_SECURITY_KEY = process.env.BUNNY_KEY.trim();
 const STREAM_PATH = '/stream/canal.m3u8';
-
-// Se mantiene solo por si algún día necesitas reactivar temporalmente set-admin-claim.
 const ADMIN_SECRET = process.env.ADMIN_SECRET;
 
 // --- 5. HEALTH CHECK ---
 app.get('/', (req, res) => {
-    res.json({
-        success: true,
-        service: "Golazo Stream Backend",
-        status: "online"
-    });
+    res.json({ success: true, service: "Golazo Stream Backend", status: "online" });
 });
 
 // --- 6. GENERADOR DE TOKEN BUNNY ---
 function generateBunnyToken(path, securityKey, duration = 120) {
     const expires = Math.floor(Date.now() / 1000) + duration;
     const hashString = securityKey + path + expires;
-
-    const token = crypto
-        .createHash('md5')
-        .update(hashString)
-        .digest('base64')
-        .replace(/\+/g, '-')
-        .replace(/\//g, '_')
-        .replace(/=/g, '')
-        .replace(/\n/g, '');
-
+    const token = crypto.createHash('md5').update(hashString).digest('base64')
+        .replace(/\+/g, '-').replace(/\//g, '_').replace(/=/g, '').replace(/\n/g, '');
     return { token, expires };
 }
 
 // --- 7. MIDDLEWARE ADMIN ESTRICTO ---
 async function verifyAdmin(req, res, next) {
     const authHeader = req.headers.authorization || "";
-
     if (!authHeader.startsWith("Bearer ")) {
-        return res.status(401).json({
-            success: false,
-            message: "Falta token de administrador"
-        });
+        return res.status(401).json({ success: false, message: "Falta token de administrador" });
     }
 
     const idToken = authHeader.replace("Bearer ", "").trim();
-
     try {
         const decodedToken = await auth.verifyIdToken(idToken);
-
         if (decodedToken.admin === true) {
             return next();
         }
-
-        return res.status(403).json({
-            success: false,
-            message: "Permisos denegados. No eres administrador."
-        });
-
+        return res.status(403).json({ success: false, message: "Permisos denegados. No eres administrador." });
     } catch (error) {
         console.error("❌ Token admin inválido:", error.message);
-
-        return res.status(401).json({
-            success: false,
-            message: "Token de administrador inválido o expirado"
-        });
+        return res.status(401).json({ success: false, message: "Token de administrador inválido o expirado" });
     }
 }
 
-// --- 8. GENERATE STREAM ---
+// --- 8. EXTRAER IP y USER-AGENT ---
+function getClientData(req) {
+    const forwardedFor = req.headers['x-forwarded-for'];
+    const ip = forwardedFor
+        ? forwardedFor.split(',')[0].trim()
+        : (req.ip || req.connection.remoteAddress || 'Desconocida');
+
+    const userAgent = req.headers['user-agent'] || 'Desconocido';
+
+    return { ip, userAgent };
+}
+
+// --- 9. GENERATE STREAM ---
 app.get('/generate-stream', streamLimiter, async (req, res) => {
     try {
         const authHeader = req.headers.authorization || "";
 
-        if (!authHeader.startsWith("Bearer ")) {
-            return res.status(401).json({
-                success: false,
-                code: "NO_AUTH"
-            });
-        }
+        if (!authHeader.startsWith("Bearer ")) return res.status(401).json({ success: false, code: "NO_AUTH" });
 
         const idToken = authHeader.replace("Bearer ", "").trim();
-
         let decodedToken;
-        try {
-            decodedToken = await auth.verifyIdToken(idToken);
-        } catch (authError) {
-            return res.status(401).json({
-                success: false,
-                code: "INVALID_AUTH"
-            });
-        }
+        try { decodedToken = await auth.verifyIdToken(idToken); } 
+        catch (authError) { return res.status(401).json({ success: false, code: "INVALID_AUTH" }); }
 
         const uid = decodedToken.uid;
         const requestedSessionId = req.query.session_id || null;
@@ -194,224 +149,133 @@ app.get('/generate-stream', streamLimiter, async (req, res) => {
         const userRef = db.collection('usuarios').doc(uid);
         const userDoc = await userRef.get();
 
-        if (!userDoc.exists) {
-            return res.status(403).json({
-                success: false,
-                code: "PASS_INACTIVE"
-            });
-        }
+        if (!userDoc.exists) return res.status(403).json({ success: false, code: "PASS_INACTIVE" });
 
         const userData = userDoc.data();
 
-        if (!userData.fecha_expiracion) {
-            return res.status(403).json({
-                success: false,
-                code: "NO_EXPIRATION"
-            });
-        }
+        if (!userData.fecha_expiracion) return res.status(403).json({ success: false, code: "NO_EXPIRATION" });
 
         const ahora = Date.now();
         const expiraMillis = userData.fecha_expiracion.toMillis();
         const segundosRestantesPase = Math.floor((expiraMillis - ahora) / 1000);
 
         if (segundosRestantesPase <= 0) {
+            return res.status(403).json({ success: false, code: "PASS_EXPIRED", error: "Pase expirado" });
+        }
+
+        // 🔒 FASE 5: BLINDAJE CONTRA CONDICIÓN DE CARRERA
+        // Si la sesión fue revocada por admin, no permitimos que una renovación silenciosa cree otra sesión.
+        if (
+            requestedSessionId &&
+            (
+                userData.last_status === "revoked_by_admin" ||
+                String(userData.session_id || "").startsWith("revoked_")
+            )
+        ) {
             return res.status(403).json({
                 success: false,
-                code: "PASS_EXPIRED",
-                error: "Pase expirado"
+                code: "SESSION_REVOKED",
+                error: "Sesión revocada por administración"
             });
         }
 
+        const { ip, userAgent } = getClientData(req);
         let sessionIdFinal = userData.session_id || "";
-        const mismaSesion = Boolean(
-            requestedSessionId && requestedSessionId === userData.session_id
-        );
+        const mismaSesion = Boolean(requestedSessionId && requestedSessionId === userData.session_id);
 
         if (!mismaSesion) {
             sessionIdFinal = crypto.randomUUID();
-
             await userRef.update({
                 session_id: sessionIdFinal,
                 session_started_at: admin.firestore.Timestamp.now(),
                 last_heartbeat: admin.firestore.Timestamp.now(),
-                last_status: "stream_started"
+                last_status: "stream_started",
+                last_ip: ip,                 
+                last_user_agent: userAgent   
             });
-
         } else {
             await userRef.update({
                 last_heartbeat: admin.firestore.Timestamp.now(),
-                last_status: "stream_renewed"
+                last_status: "stream_renewed",
+                last_ip: ip,                 
+                last_user_agent: userAgent   
             });
         }
 
         const tokenDuration = Math.min(120, segundosRestantesPase);
-
-        const { token, expires } = generateBunnyToken(
-            STREAM_PATH,
-            BUNNY_SECURITY_KEY,
-            tokenDuration
-        );
-
+        const { token, expires } = generateBunnyToken(STREAM_PATH, BUNNY_SECURITY_KEY, tokenDuration);
         const finalUrl = `${BUNNY_URL}${STREAM_PATH}?token=${token}&expires=${expires}`;
 
-        console.log(
-            `✅ Stream [${mismaSesion ? 'RENOVADO' : 'NUEVO'}] | uid=${uid} | duration=${tokenDuration}s`
-        );
+        console.log(`✅ Stream [${mismaSesion ? 'RENOVADO' : 'NUEVO'}] | uid=${uid} | duration=${tokenDuration}s`);
 
         return res.json({
-            success: true,
-            stream_url: finalUrl,
-            session_id: sessionIdFinal,
-            reused_session: mismaSesion,
-            bunny_expires: expires,
-            pase_expira: expiraMillis
+            success: true, stream_url: finalUrl, session_id: sessionIdFinal, reused_session: mismaSesion, bunny_expires: expires, pase_expira: expiraMillis
         });
 
     } catch (error) {
         console.error("❌ Error en /generate-stream:", error);
-
-        return res.status(500).json({
-            success: false,
-            code: "SERVER_ERROR"
-        });
+        return res.status(500).json({ success: false, code: "SERVER_ERROR" });
     }
 });
 
-// --- 9. CHECK SESSION ---
+// --- 10. CHECK SESSION ---
 app.post('/check-session', async (req, res) => {
     try {
         const authHeader = req.headers.authorization || "";
-
-        if (!authHeader.startsWith("Bearer ")) {
-            return res.status(401).json({
-                valid: false,
-                motivo: "no_auth"
-            });
-        }
+        if (!authHeader.startsWith("Bearer ")) return res.status(401).json({ valid: false, motivo: "no_auth" });
 
         const idToken = authHeader.replace("Bearer ", "").trim();
-
         let decodedToken;
-        try {
-            decodedToken = await auth.verifyIdToken(idToken);
-        } catch (e) {
-            return res.status(401).json({
-                valid: false,
-                motivo: "no_auth"
-            });
-        }
+        try { decodedToken = await auth.verifyIdToken(idToken); } 
+        catch (e) { return res.status(401).json({ valid: false, motivo: "no_auth" }); }
 
         const { session_id } = req.body || {};
-
-        if (!session_id) {
-            return res.status(400).json({
-                valid: false,
-                motivo: "missing_session"
-            });
-        }
+        if (!session_id) return res.status(400).json({ valid: false, motivo: "missing_session" });
 
         const uid = decodedToken.uid;
         const userRef = db.collection('usuarios').doc(uid);
         const userDoc = await userRef.get();
-
-        if (!userDoc.exists) {
-            return res.status(403).json({
-                valid: false,
-                motivo: "pase_inactivo"
-            });
-        }
+        if (!userDoc.exists) return res.status(403).json({ valid: false, motivo: "pase_inactivo" });
 
         const userData = userDoc.data();
-
-        if (!userData.fecha_expiracion) {
-            return res.status(403).json({
-                valid: false,
-                motivo: "pase_sin_expiracion"
-            });
-        }
+        if (!userData.fecha_expiracion) return res.status(403).json({ valid: false, motivo: "pase_sin_expiracion" });
 
         const expiraMillis = userData.fecha_expiracion.toMillis();
         const ahora = Date.now();
+        const { ip, userAgent } = getClientData(req);
 
         if (expiraMillis <= ahora) {
             await userRef.update({
-                last_heartbeat: admin.firestore.Timestamp.now(),
-                last_status: "expired"
+                last_heartbeat: admin.firestore.Timestamp.now(), last_status: "expired", last_ip: ip, last_user_agent: userAgent
             });
+            return res.json({ valid: false, motivo: "expirado" });
+        }
 
-            return res.json({
-                valid: false,
-                motivo: "expirado"
+        if (userData.last_status === "revoked_by_admin" || String(userData.session_id || "").startsWith("revoked_")) {
+            await userRef.update({
+                last_heartbeat: admin.firestore.Timestamp.now(), last_status: "revoked_by_admin", last_ip: ip, last_user_agent: userAgent
             });
+            return res.json({ valid: false, motivo: "revocado" });
         }
 
         if (session_id !== userData.session_id) {
             await userRef.update({
-                last_heartbeat: admin.firestore.Timestamp.now(),
-                last_status: "replaced_session"
+                last_heartbeat: admin.firestore.Timestamp.now(), last_status: "replaced_session", last_ip: ip, last_user_agent: userAgent
             });
-
-            return res.json({
-                valid: false,
-                motivo: "pirateria"
-            });
+            return res.json({ valid: false, motivo: "pirateria" });
         }
 
         await userRef.update({
-            last_heartbeat: admin.firestore.Timestamp.now(),
-            last_status: "active"
+            last_heartbeat: admin.firestore.Timestamp.now(), last_status: "active", last_ip: ip, last_user_agent: userAgent
         });
 
-        return res.json({
-            valid: true,
-            motivo: "ok",
-            pase_expira: expiraMillis
-        });
+        return res.json({ valid: true, motivo: "ok", pase_expira: expiraMillis });
 
     } catch (e) {
         console.error("❌ Error en /check-session:", e);
-
-        return res.status(500).json({
-            valid: false,
-            motivo: "server_error"
-        });
+        return res.status(500).json({ valid: false, motivo: "server_error" });
     }
 });
-
-// --- 10. RUTA TEMPORAL DESACTIVADA PARA SET ADMIN CLAIM ---
-/*
-app.post('/admin/set-admin-claim', adminLimiter, async (req, res) => {
-    const { admin_secret, email } = req.body;
-
-    if (admin_secret !== ADMIN_SECRET) {
-        return res.status(403).json({
-            success: false,
-            message: "Admin secret incorrecto"
-        });
-    }
-
-    try {
-        const user = await auth.getUserByEmail(email);
-
-        await auth.setCustomUserClaims(user.uid, {
-            admin: true
-        });
-
-        return res.json({
-            success: true,
-            message: `✅ Rol de administrador asignado correctamente a: ${email}`
-        });
-
-    } catch (error) {
-        console.error("❌ Error asignando admin claim:", error);
-
-        return res.status(500).json({
-            success: false,
-            message: error.message
-        });
-    }
-});
-*/
 
 // --- 11. PANEL ADMIN: GENERAR PASE ---
 app.post('/admin/generar-pase-rapido', adminLimiter, verifyAdmin, async (req, res) => {
@@ -421,58 +285,54 @@ app.post('/admin/generar-pase-rapido', adminLimiter, verifyAdmin, async (req, re
         let emailFinal = email_manual || `${Math.floor(100000 + Math.random() * 900000)}@golazosp.net`;
         let claveFinal = pass_manual || Math.floor(100000 + Math.random() * 900000).toString();
 
-        const userRecord = await auth.createUser({
-            email: emailFinal,
-            password: claveFinal,
-            displayName: partido
-        });
+        const userRecord = await auth.createUser({ email: emailFinal, password: claveFinal, displayName: partido });
 
-        const exp = fecha_corte
-            ? new Date(fecha_corte)
-            : new Date(Date.now() + 24 * 60 * 60 * 1000);
+        const exp = fecha_corte ? new Date(fecha_corte) : new Date(Date.now() + 24 * 60 * 60 * 1000);
 
         await db.collection('usuarios').doc(userRecord.uid).set({
             uid: userRecord.uid,
             usuario_corto: emailFinal,
-            clave: claveFinal,
             etiqueta: partido,
             fecha_expiracion: admin.firestore.Timestamp.fromDate(exp),
             creado_el: admin.firestore.Timestamp.now(),
-            session_id: ""
+            session_id: "",
+            password_stored: false
         });
 
-        return res.json({
-            success: true,
-            usuario: emailFinal,
-            clave: claveFinal
-        });
+        return res.json({ success: true, usuario: emailFinal, clave: claveFinal });
 
     } catch (e) {
         console.error("❌ Error creando pase:", e);
-
-        return res.status(500).json({
-            success: false,
-            message: e.message
-        });
+        return res.status(500).json({ success: false, message: e.message });
     }
 });
 
-// --- 12. PANEL ADMIN: LIMPIAR CADUCADOS ---
+// --- 12. PANEL ADMIN: REVOCAR SESIÓN MANUALMENTE ---
+app.post('/admin/revocar-sesion', adminLimiter, verifyAdmin, async (req, res) => {
+    const { uid } = req.body;
+    if (!uid) return res.status(400).json({ success: false, message: "Falta UID" });
+
+    try {
+        await db.collection('usuarios').doc(uid).update({
+            session_id: "revoked_" + Date.now(),
+            last_status: "revoked_by_admin",
+            last_heartbeat: admin.firestore.Timestamp.now()
+        });
+        
+        return res.json({ success: true, message: "Sesión revocada exitosamente. El usuario será expulsado pronto." });
+    } catch (e) {
+        console.error("❌ Error revocando sesión:", e);
+        return res.status(500).json({ success: false, message: "Error al revocar sesión" });
+    }
+});
+
+// --- 13. PANEL ADMIN: LIMPIAR CADUCADOS ---
 app.post('/admin/limpiar-caducados', adminLimiter, verifyAdmin, async (req, res) => {
     try {
         const ahora = admin.firestore.Timestamp.now();
+        const vencidosSnap = await db.collection('usuarios').where('fecha_expiracion', '<', ahora).get();
 
-        const vencidosSnap = await db
-            .collection('usuarios')
-            .where('fecha_expiracion', '<', ahora)
-            .get();
-
-        if (vencidosSnap.empty) {
-            return res.json({
-                success: true,
-                mensaje: "✅ No hay usuarios vencidos."
-            });
-        }
+        if (vencidosSnap.empty) return res.json({ success: true, mensaje: "✅ No hay usuarios vencidos." });
 
         let borrados = 0;
 
@@ -481,41 +341,36 @@ app.post('/admin/limpiar-caducados', adminLimiter, verifyAdmin, async (req, res)
                 await auth.deleteUser(doc.id);
                 await doc.ref.delete();
                 borrados++;
-            } catch (err) {
-                console.error("❌ Error borrando usuario vencido:", doc.id, err.message);
-            }
+            } catch (err) { console.error("❌ Error borrando usuario vencido:", doc.id, err.message); }
         }
 
-        return res.json({
-            success: true,
-            mensaje: `🧹 ${borrados} pases vencidos eliminados.`
-        });
+        return res.json({ success: true, mensaje: `🧹 ${borrados} pases vencidos eliminados.` });
 
     } catch (e) {
         console.error("❌ Error limpiando caducados:", e);
-
-        return res.status(500).json({
-            success: false,
-            mensaje: "Error al limpiar usuarios caducados."
-        });
+        return res.status(500).json({ success: false, mensaje: "Error al limpiar usuarios caducados." });
     }
 });
 
-// --- 13. PANEL ADMIN: LISTAR USUARIOS ---
+// --- 14. PANEL ADMIN: LISTAR USUARIOS ---
 app.post('/admin/listar-usuarios', adminLimiter, verifyAdmin, async (req, res) => {
     try {
-        const snap = await db
-            .collection('usuarios')
-            .orderBy('creado_el', 'desc')
-            .get();
+        const snap = await db.collection('usuarios').orderBy('creado_el', 'desc').get();
 
         const usuariosFormateados = snap.docs.map(d => {
             const data = d.data();
             const expiraMillis = data.fecha_expiracion.toMillis();
             const esActivo = expiraMillis > Date.now();
 
+            let ultimaConexion = "-";
+            if (data.last_heartbeat) {
+                ultimaConexion = new Date(data.last_heartbeat.toMillis()).toLocaleTimeString('es-PE', { timeZone: 'America/Lima' });
+            }
+
             return {
-                ...data,
+                uid: data.uid || d.id,
+                usuario_corto: data.usuario_corto || "-",
+                etiqueta: data.etiqueta || "-",
                 estado: esActivo ? 'ACTIVO' : 'VENCIDO',
                 esActivo: esActivo,
                 tiempo: new Date(expiraMillis).toLocaleString('es-PE', {
@@ -526,28 +381,26 @@ app.post('/admin/listar-usuarios', adminLimiter, verifyAdmin, async (req, res) =
                     hour: '2-digit',
                     minute: '2-digit',
                     hour12: true
-                })
+                }),
+                ultima_conexion: ultimaConexion,
+                last_status: data.last_status || "-",
+                last_ip: data.last_ip || "Sin registro",
+                last_user_agent: data.last_user_agent || "Sin registro",
+                password_stored: data.password_stored === false ? false : true
             };
         });
 
-        return res.json({
-            success: true,
-            usuarios: usuariosFormateados
-        });
+        return res.json({ success: true, usuarios: usuariosFormateados });
 
     } catch (e) {
         console.error("❌ Error listando usuarios:", e);
-
-        return res.status(500).json({
-            success: false,
-            message: "Error listando usuarios."
-        });
+        return res.status(500).json({ success: false, message: "Error listando usuarios." });
     }
 });
 
-// --- 14. START SERVER ---
+// --- 15. START SERVER ---
 const PORT = process.env.PORT || 3000;
 
 app.listen(PORT, () => {
-    console.log(`🚀 GOLAZO SECURE STREAM READY (FASE 4 FINAL + CORS OPTIONS FIX)`);
+    console.log(`🚀 GOLAZO SECURE STREAM READY (FASE 5 FINAL: BLINDAJE RACE CONDITION)`);
 });
