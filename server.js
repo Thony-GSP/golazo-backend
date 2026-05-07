@@ -80,9 +80,9 @@ const adminLimiter = rateLimit({
 app.use(generalLimiter);
 
 // --- 4. CONFIGURACIÓN ---
-const BUNNY_URL = 'https://stream.golazosp.net';
+const BUNNY_CDN_URL = 'https://stream.golazosp.net'; // 🔥 AJUSTADO para coincidir con la variable en generateBunnyTokenForStream
 const BUNNY_SECURITY_KEY = process.env.BUNNY_KEY.trim();
-const STREAM_PATH = '/stream/master.m3u8';
+const STREAM_PATH = '/stream/master.m3u8'; // 🔥 AJUSTADO: Apunta al playlist principal ABR
 const ADMIN_SECRET = process.env.ADMIN_SECRET;
 
 // --- 5. HEALTH CHECK ---
@@ -90,13 +90,31 @@ app.get('/', (req, res) => {
     res.json({ success: true, service: "Golazo Stream Backend", status: "online" });
 });
 
-// --- 6. GENERADOR DE TOKEN BUNNY ---
-function generateBunnyToken(path, securityKey, duration = 120) {
+// --- 6. GENERADOR DE TOKEN BUNNY PARA DIRECTORIOS (ABR SUPPORT) ---
+function generateBunnyTokenForStream(path, securityKey, duration = 120) {
     const expires = Math.floor(Date.now() / 1000) + duration;
-    const hashString = securityKey + path + expires;
-    const token = crypto.createHash('md5').update(hashString).digest('base64')
-        .replace(/\+/g, '-').replace(/\//g, '_').replace(/=/g, '').replace(/\n/g, '');
-    return { token, expires };
+
+    // 🔥 Token válido para todo el directorio /stream/
+    const tokenPath = "/stream/";
+
+    const hashableBase = `${securityKey}${tokenPath}${expires}`;
+
+    const token = Buffer.from(
+        crypto.createHash("sha256")
+            .update(hashableBase)
+            .digest()
+    ).toString("base64")
+        .replace(/\n/g, "")
+        .replace(/\+/g, "-")
+        .replace(/\//g, "_")
+        .replace(/=/g, "");
+
+    return {
+        token,
+        expires,
+        token_path: tokenPath,
+        url: `${BUNNY_CDN_URL}${path}?token=${token}&expires=${expires}&token_path=${encodeURIComponent(tokenPath)}`
+    };
 }
 
 // --- 7. MIDDLEWARE ADMIN ESTRICTO ---
@@ -179,8 +197,6 @@ app.get('/generate-stream', streamLimiter, async (req, res) => {
         }
 
         // 🔒 FASE 5: Bloqueo de segunda sesión activa reciente (Backend Wall)
-        // Si ya existe una sesión activa y la nueva petición viene sin session_id,
-        // no permitimos crear otra sesión automáticamente.
         const lastHeartbeatMillis = userData.last_heartbeat && typeof userData.last_heartbeat.toMillis === "function"
             ? userData.last_heartbeat.toMillis()
             : 0;
@@ -226,13 +242,15 @@ app.get('/generate-stream', streamLimiter, async (req, res) => {
         }
 
         const tokenDuration = Math.min(120, segundosRestantesPase);
-        const { token, expires } = generateBunnyToken(STREAM_PATH, BUNNY_SECURITY_KEY, tokenDuration);
-        const finalUrl = `${BUNNY_URL}${STREAM_PATH}?token=${token}&expires=${expires}`;
+        
+        // 🔥 AJUSTE: Generación de token validando la carpeta completa
+        const signed = generateBunnyTokenForStream(STREAM_PATH, BUNNY_SECURITY_KEY, tokenDuration);
+        const finalUrl = signed.url;
 
         console.log(`✅ Stream [${mismaSesion ? 'RENOVADO' : 'NUEVO'}] | uid=${uid} | duration=${tokenDuration}s`);
 
         return res.json({
-            success: true, stream_url: finalUrl, session_id: sessionIdFinal, reused_session: mismaSesion, bunny_expires: expires, pase_expira: expiraMillis
+            success: true, stream_url: finalUrl, session_id: sessionIdFinal, reused_session: mismaSesion, bunny_expires: signed.expires, pase_expira: expiraMillis
         });
 
     } catch (error) {
@@ -425,5 +443,5 @@ app.post('/admin/listar-usuarios', adminLimiter, verifyAdmin, async (req, res) =
 const PORT = process.env.PORT || 3000;
 
 app.listen(PORT, () => {
-    console.log(`🚀 GOLAZO SECURE STREAM READY (FASE 5 FINAL: BLINDAJE BACKEND CONTRA MULTISESIÓN)`);
+    console.log(`🚀 GOLAZO SECURE STREAM READY (FASE 6: TOKEN ABR DIRECTORIO ACTIVO)`);
 });
