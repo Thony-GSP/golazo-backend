@@ -80,9 +80,9 @@ const adminLimiter = rateLimit({
 app.use(generalLimiter);
 
 // --- 4. CONFIGURACIÓN ---
-const BUNNY_CDN_URL = 'https://stream.golazosp.net'; // 🔥 AJUSTADO para coincidir con la variable en generateBunnyTokenForStream
+const BUNNY_CDN_URL = 'https://stream.golazosp.net'; 
 const BUNNY_SECURITY_KEY = process.env.BUNNY_KEY.trim();
-const STREAM_PATH = '/stream/master.m3u8'; // 🔥 AJUSTADO: Apunta al playlist principal ABR
+const STREAM_PATH = '/stream/master.m3u8'; 
 const ADMIN_SECRET = process.env.ADMIN_SECRET;
 
 // --- 5. HEALTH CHECK ---
@@ -90,24 +90,38 @@ app.get('/', (req, res) => {
     res.json({ success: true, service: "Golazo Stream Backend", status: "online" });
 });
 
-// --- 6. GENERADOR DE TOKEN BUNNY PARA DIRECTORIOS (ABR SUPPORT) ---
+// --- 6. GENERADOR DE TOKEN BUNNY PARA DIRECTORIOS (BUNNY TOKEN V2 HMAC-SHA256) ---
+function base64Url(buffer) {
+    return buffer.toString("base64")
+        .replace(/\+/g, "-")
+        .replace(/\//g, "_")
+        .replace(/=/g, "")
+        .replace(/\n/g, "");
+}
+
 function generateBunnyTokenForStream(path, securityKey, duration = 120) {
     const expires = Math.floor(Date.now() / 1000) + duration;
 
-    // 🔥 Token válido para todo el directorio /stream/
+    // Autoriza todo lo que está debajo de /stream/
     const tokenPath = "/stream/";
 
-    const hashableBase = `${securityKey}${tokenPath}${expires}`;
+    // Para directory token, Bunny firma usando token_path como signature_path
+    const signaturePath = tokenPath;
 
-    const token = Buffer.from(
-        crypto.createHash("sha256")
-            .update(hashableBase)
+    // signing_data incluye parámetros extra ordenados alfabéticamente, excluyendo token y expires
+    const signingData = `token_path=${encodeURIComponent(tokenPath)}`;
+
+    // No usamos IP porque Token IP Validation está OFF
+    const userIp = "";
+
+    const message = `${signaturePath}${expires}${signingData}${userIp}`;
+
+    // 🔥 Generación estricta con HMAC-SHA256 y prefijo HS256-
+    const token = "HS256-" + base64Url(
+        crypto.createHmac("sha256", securityKey)
+            .update(message)
             .digest()
-    ).toString("base64")
-        .replace(/\n/g, "")
-        .replace(/\+/g, "-")
-        .replace(/\//g, "_")
-        .replace(/=/g, "");
+    );
 
     return {
         token,
@@ -243,7 +257,6 @@ app.get('/generate-stream', streamLimiter, async (req, res) => {
 
         const tokenDuration = Math.min(120, segundosRestantesPase);
         
-        // 🔥 AJUSTE: Generación de token validando la carpeta completa
         const signed = generateBunnyTokenForStream(STREAM_PATH, BUNNY_SECURITY_KEY, tokenDuration);
         const finalUrl = signed.url;
 
@@ -443,5 +456,5 @@ app.post('/admin/listar-usuarios', adminLimiter, verifyAdmin, async (req, res) =
 const PORT = process.env.PORT || 3000;
 
 app.listen(PORT, () => {
-    console.log(`🚀 GOLAZO SECURE STREAM READY (FASE 6: TOKEN ABR DIRECTORIO ACTIVO)`);
+    console.log(`🚀 GOLAZO SECURE STREAM READY (FASE 6 FINAL: BUNNY TOKEN V2 HMAC-SHA256)`);
 });
