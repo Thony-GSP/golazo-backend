@@ -255,7 +255,7 @@ app.get('/generate-stream', streamLimiter, async (req, res) => {
             });
         }
 
-        const tokenDuration = Math.min(300, segundosRestantesPase);
+        const tokenDuration = Math.min(600, segundosRestantesPase);
         
         const signed = generateBunnyTokenForStream(STREAM_PATH, BUNNY_SECURITY_KEY, tokenDuration);
         const finalUrl = signed.url;
