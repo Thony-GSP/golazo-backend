@@ -104,30 +104,30 @@ function generateBunnyTokenForStream(path, securityKey, duration = 120) {
 
     // Autoriza todo lo que está debajo de /stream/
     const tokenPath = "/stream/";
-
-    // Para directory token, Bunny firma usando token_path como signature_path
     const signaturePath = tokenPath;
 
-    // signing_data incluye parámetros extra ordenados alfabéticamente, excluyendo token y expires
-    const signingData = `token_path=${encodeURIComponent(tokenPath)}`;
+    // Para firmar: token_path SIN encodear.
+    // Para URL final: token_path SÍ encodeado.
+    const signingData = `token_path=${tokenPath}`;
 
-    // No usamos IP porque Token IP Validation está OFF
+    // Token IP Validation está OFF, así que no firmamos IP.
     const userIp = "";
 
     const message = `${signaturePath}${expires}${signingData}${userIp}`;
 
-    // 🔥 Generación estricta con HMAC-SHA256 y prefijo HS256-
     const token = "HS256-" + base64Url(
         crypto.createHmac("sha256", securityKey)
             .update(message)
             .digest()
     );
 
+    const encodedTokenPath = encodeURIComponent(tokenPath);
+
     return {
         token,
         expires,
         token_path: tokenPath,
-        url: `${BUNNY_CDN_URL}${path}?token=${token}&expires=${expires}&token_path=${encodeURIComponent(tokenPath)}`
+        url: `${BUNNY_CDN_URL}/bcdn_token=${token}&expires=${expires}&token_path=${encodedTokenPath}${path}`
     };
 }
 
@@ -456,5 +456,5 @@ app.post('/admin/listar-usuarios', adminLimiter, verifyAdmin, async (req, res) =
 const PORT = process.env.PORT || 3000;
 
 app.listen(PORT, () => {
-    console.log(`🚀 GOLAZO SECURE STREAM READY (FASE 6 FINAL: BUNNY TOKEN V2 HMAC-SHA256)`);
+    console.log(`🚀 GOLAZO SECURE STREAM READY (FASE 6 FINAL: PATH-BASED TOKEN ABR CORREGIDO)`);
 });
