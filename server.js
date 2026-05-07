@@ -82,7 +82,7 @@ app.use(generalLimiter);
 // --- 4. CONFIGURACIÓN ---
 const BUNNY_URL = 'https://stream.golazosp.net';
 const BUNNY_SECURITY_KEY = process.env.BUNNY_KEY.trim();
-const STREAM_PATH = '/stream/canal.m3u8';
+const STREAM_PATH = '/stream/master.m3u8';
 const ADMIN_SECRET = process.env.ADMIN_SECRET;
 
 // --- 5. HEALTH CHECK ---
