@@ -121,7 +121,33 @@
 
     firebase.initializeApp(firebaseConfig);
     const auth = firebase.auth();
-    auth.setPersistence(firebase.auth.Auth.Persistence.LOCAL);
+    
+    // 🔐 Seguridad admin: la sesión del panel dura solo mientras el navegador siga abierto.
+    auth.setPersistence(firebase.auth.Auth.Persistence.SESSION);
+
+    let autoRefreshInterval = null;
+    let cargandoUsuarios = false;
+
+    function iniciarAutoRefresh() {
+        if (autoRefreshInterval) {
+            clearInterval(autoRefreshInterval);
+        }
+
+        autoRefreshInterval = setInterval(() => {
+            const panelVisible = document.getElementById('panelContenido').style.display !== "none";
+
+            if (auth.currentUser && panelVisible && !cargandoUsuarios) {
+                cargarUsuarios();
+            }
+        }, 30000);
+    }
+
+    function detenerAutoRefresh() {
+        if (autoRefreshInterval) {
+            clearInterval(autoRefreshInterval);
+            autoRefreshInterval = null;
+        }
+    }
 
     window.onload = () => {
         let n = new Date();
@@ -174,7 +200,10 @@
     }
 
     async function logoutAdmin() {
+        detenerAutoRefresh();
+
         await auth.signOut();
+
         document.getElementById('loginAdmin').style.display = "block";
         document.getElementById('adminInfo').style.display = "none";
         document.getElementById('panelContenido').style.display = "none";
@@ -185,6 +214,8 @@
         document.getElementById('adminInfo').style.display = "block";
         document.getElementById('panelContenido').style.display = "block";
         document.getElementById('adminUserText').innerText = `Administrador: ${email}`;
+
+        iniciarAutoRefresh();
     }
 
     async function getAdminToken() {
@@ -265,13 +296,29 @@
         return `<span class="badge badge-warn">Antigua</span>`;
     }
 
-    // 🔥 AJUSTE APLICADO AQUÍ
     function resumirUserAgent(userAgent) {
         if (!userAgent || userAgent === "Sin registro") return "Sin registro";
-        if (userAgent.includes("Edg")) return "Edge";
-        if (userAgent.includes("Chrome")) return "Chrome";
-        if (userAgent.includes("Firefox")) return "Firefox";
-        if (userAgent.includes("Safari") && !userAgent.includes("Chrome")) return "Safari";
+
+        const ua = userAgent.toLowerCase();
+
+        if (ua.includes("tizen")) return "Samsung TV";
+        if (ua.includes("webos")) return "LG Smart TV";
+        if (ua.includes("android tv")) return "Android TV";
+        if (ua.includes("aft") || ua.includes("fire tv")) return "Fire TV";
+        if (ua.includes("roku")) return "Roku TV";
+        if (ua.includes("smart-tv") || ua.includes("smarttv") || ua.includes("hbbtv")) return "Smart TV";
+
+        if (ua.includes("iphone")) return "iPhone";
+        if (ua.includes("ipad")) return "iPad";
+        if (ua.includes("android")) return "Android";
+        if (ua.includes("windows")) return "Windows";
+        if (ua.includes("mac os")) return "Mac";
+
+        if (ua.includes("edg")) return "Edge";
+        if (ua.includes("chrome")) return "Chrome";
+        if (ua.includes("firefox")) return "Firefox";
+        if (ua.includes("safari") && !ua.includes("chrome")) return "Safari";
+
         return "Navegador";
     }
 
@@ -311,9 +358,10 @@
 
                 if(esSocio) {
                     const linkVip = document.getElementById('linkVip').value || "Solicitar al soporte";
-                    msg = `🔥 ¡BIENVENIDO SOCIO VIP! 🔥\n━━━━━━━━━━━━━━\n1️⃣ Grupo VIP: ${linkVip}\n2️⃣ Web: www.golazosp.net\n👤 User: ${d.usuario}\n🔑 Pass: ${d.clave}\n━━━━━━━━━━━━━━\n⏳ Válido hasta: ${expiraTexto}\n¡Disfruta tu acceso VIP! 💎`;
+
+                    msg = `🔥 ¡BIENVENIDO SOCIO VIP GOLAZO SP! 🔥\n━━━━━━━━━━━━━━\n✅ Tu acceso VIP ya está activo.\n\n🌐 WEB PARA VER LOS PARTIDOS:\nwww.golazosp.net\n\n👤 USUARIO:\n${d.usuario}\n\n🔑 CONTRASEÑA:\n${d.clave}\n\n📲 ¿CÓMO INGRESAR?\n1️⃣ Abre la web: www.golazosp.net\n2️⃣ Escribe tu usuario y contraseña exactamente como aparecen aquí.\n3️⃣ Presiona el botón "EMPEZAR A VER".\n4️⃣ El sistema te llevará automáticamente al reproductor.\n\n📺 Puedes ingresar desde celular, laptop, PC, tablet o Smart TV compatible.\n\n💎 GRUPO VIP:\n${linkVip}\n\n⏳ ACCESO VÁLIDO HASTA:\n${expiraTexto}\n\n⚠️ IMPORTANTE:\nEste acceso es personal y permite solo 1 dispositivo activo a la vez.\nNo compartas tus datos para evitar cierre de sesión o bloqueo del pase.\n\n¡Disfruta tu acceso VIP! 💎`;
                 } else {
-                    msg = `✅ ¡ACCESO GOLAZO STREAM PERÚ LISTO! ⚽\n━━━━━━━━━━━━━━\n🌐 Web: www.golazosp.net\n👤 Usuario: ${d.usuario}\n🔑 Contraseña: ${d.clave}\n━━━━━━━━━━━━━━\n⚽ Partido: ${nombre}\n⏳ Válido hasta: ${expiraTexto}\n¡Disfruta el partido! 🫡`;
+                    msg = `✅ ¡ACCESO GOLAZO SP LISTO! ⚽\n━━━━━━━━━━━━━━\nTu pase para el partido ya está activo.\n\n⚽ PARTIDO:\n${nombre}\n\n🌐 WEB PARA VER EL PARTIDO:\nwww.golazosp.net\n\n👤 USUARIO:\n${d.usuario}\n\n🔑 CONTRASEÑA:\n${d.clave}\n\n📲 ¿CÓMO INGRESAR?\n1️⃣ Abre la web: www.golazosp.net\n2️⃣ Escribe tu usuario y contraseña exactamente como aparecen aquí.\n3️⃣ Presiona el botón "EMPEZAR A VER".\n4️⃣ El sistema te llevará automáticamente al reproductor.\n\n📺 Puedes ingresar desde celular, laptop, PC, tablet o Smart TV compatible.\n\n⏳ VÁLIDO HASTA:\n${expiraTexto}\n\n⚠️ IMPORTANTE:\nEste acceso es personal y permite solo 1 dispositivo activo a la vez.\nSi compartes tu usuario, tu sesión puede cerrarse automáticamente.\n\n¡Disfruta el partido! 🫡`;
                 }
                 
                 box.innerText = msg;
@@ -331,6 +379,10 @@
     }
 
     async function cargarUsuarios() {
+        if (cargandoUsuarios) return;
+
+        cargandoUsuarios = true;
+
         try {
             const res = await adminFetch('/admin/listar-usuarios', {
                 method: 'POST',
@@ -418,6 +470,8 @@
         } catch(e) {
             console.error("Error cargando usuarios:", e);
             alert("❌ Error de servidor cargando auditoría.");
+        } finally {
+            cargandoUsuarios = false;
         }
     }
 
@@ -453,7 +507,7 @@
     }
 
     async function limpiarCaducados() {
-        if (!confirm("¿Limpiar vencidos?")) return;
+        if (!confirm("¿Limpiar usuarios vencidos?\n\nRecomendación: úsalo solo después de terminar la transmisión o cuando ya no necesites revisar esos accesos en auditoría.")) return;
 
         try {
             const res = await adminFetch('/admin/limpiar-caducados', {
