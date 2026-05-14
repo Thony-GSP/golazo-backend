@@ -77,13 +77,35 @@ const adminLimiter = rateLimit({
     message: { success: false, code: "ADMIN_RATE_LIMIT", error: "Demasiadas solicitudes administrativas." }
 });
 
+// 🔥 AJUSTE: Limitador para los intentos de código rápido
+const quickLoginLimiter = rateLimit({
+    windowMs: 60 * 1000,
+    max: 12,
+    standardHeaders: true,
+    legacyHeaders: false,
+    skip: (req) => req.method === 'OPTIONS',
+    message: {
+        success: false,
+        code: "QUICK_LOGIN_RATE_LIMIT",
+        error: "Demasiados intentos de código. Intenta nuevamente en un momento."
+    }
+});
+
 app.use(generalLimiter);
 
 // --- 4. CONFIGURACIÓN ---
-const BUNNY_CDN_URL = 'https://stream.golazosp.net'; 
+const BUNNY_CDN_URL = 'https://stream.golazosp.net';
 const BUNNY_SECURITY_KEY = process.env.BUNNY_KEY.trim();
-const STREAM_PATH = '/stream/master.m3u8'; 
+const STREAM_PATH = '/stream/master.m3u8';
 const ADMIN_SECRET = process.env.ADMIN_SECRET;
+
+// 🔐 Código rápido
+// Recomendado: crear QUICK_CODE_SECRET en Render.
+// Si no existe, usa BUNNY_KEY como respaldo.
+const QUICK_CODE_SECRET = (process.env.QUICK_CODE_SECRET || process.env.BUNNY_KEY || "").trim();
+
+// 🌐 URL pública de la web para generar links rápidos
+const APP_BASE_URL = process.env.APP_BASE_URL || "https://golazosp.net";
 
 // --- 5. HEALTH CHECK ---
 app.get('/', (req, res) => {
@@ -162,6 +184,148 @@ function getClientData(req) {
 
     return { ip, userAgent };
 }
+
+// --- 8.1. CÓDIGO RÁPIDO DE ACCESO ---
+function normalizarCodigoRapido(value) {
+    return String(value || "")
+        .replace(/\D/g, "")
+        .trim();
+}
+
+function hashQuickCode(code) {
+    if (!QUICK_CODE_SECRET) {
+        throw new Error("Falta QUICK_CODE_SECRET o BUNNY_KEY para firmar códigos rápidos.");
+    }
+
+    return crypto
+        .createHmac("sha256", QUICK_CODE_SECRET)
+        .update(String(code).trim())
+        .digest("hex");
+}
+
+function generarCodigoSeisDigitos() {
+    return crypto.randomInt(100000, 1000000).toString();
+}
+
+async function generarCodigoRapidoUnico(maxIntentos = 20) {
+    for (let i = 0; i < maxIntentos; i++) {
+        const codigo = generarCodigoSeisDigitos();
+        const hash = hashQuickCode(codigo);
+
+        const snap = await db.collection("usuarios")
+            .where("quick_code_hash", "==", hash)
+            .limit(1)
+            .get();
+
+        if (snap.empty) {
+            return { codigo, hash };
+        }
+    }
+
+    throw new Error("No se pudo generar un código rápido único.");
+}
+
+function generarPasswordInternoSeguro() {
+    return crypto.randomBytes(24).toString("base64url");
+}
+
+// --- 8.2. LOGIN RÁPIDO POR CÓDIGO ---
+app.post('/auth/quick-login', quickLoginLimiter, async (req, res) => {
+    try {
+        const codigo = normalizarCodigoRapido(req.body?.codigo);
+
+        if (!/^\d{6}$/.test(codigo)) {
+            return res.status(400).json({
+                success: false,
+                code: "INVALID_CODE",
+                error: "Código inválido."
+            });
+        }
+
+        const codeHash = hashQuickCode(codigo);
+
+        const snap = await db.collection("usuarios")
+            .where("quick_code_hash", "==", codeHash)
+            .limit(1)
+            .get();
+
+        if (snap.empty) {
+            return res.status(401).json({
+                success: false,
+                code: "CODE_NOT_FOUND",
+                error: "Código incorrecto."
+            });
+        }
+
+        const doc = snap.docs[0];
+        const uid = doc.id;
+        const userData = doc.data();
+
+        if (!userData.fecha_expiracion || typeof userData.fecha_expiracion.toMillis !== "function") {
+            return res.status(403).json({
+                success: false,
+                code: "NO_EXPIRATION",
+                error: "Pase sin expiración."
+            });
+        }
+
+        const expiraMillis = userData.fecha_expiracion.toMillis();
+        const ahora = Date.now();
+
+        if (expiraMillis <= ahora) {
+            await doc.ref.update({
+                last_status: "expired",
+                last_heartbeat: admin.firestore.Timestamp.now()
+            });
+
+            return res.status(403).json({
+                success: false,
+                code: "PASS_EXPIRED",
+                error: "El pase ha caducado."
+            });
+        }
+
+        if (
+            userData.last_status === "revoked_by_admin" ||
+            String(userData.session_id || "").startsWith("revoked_")
+        ) {
+            return res.status(403).json({
+                success: false,
+                code: "SESSION_REVOKED",
+                error: "Pase revocado por administración."
+            });
+        }
+
+        const { ip, userAgent } = getClientData(req);
+
+        const customToken = await auth.createCustomToken(uid, {
+            login_mode: "quick_code",
+            tipo_acceso: "partido"
+        });
+
+        await doc.ref.update({
+            last_login_method: "quick_code",
+            last_quick_login_at: admin.firestore.Timestamp.now(),
+            last_ip: ip,
+            last_user_agent: userAgent
+        });
+
+        return res.json({
+            success: true,
+            customToken,
+            expires_at: expiraMillis
+        });
+
+    } catch (error) {
+        console.error("❌ Error en /auth/quick-login:", error);
+
+        return res.status(500).json({
+            success: false,
+            code: "SERVER_ERROR",
+            error: "Error del servidor."
+        });
+    }
+});
 
 // --- 9. GENERATE STREAM ---
 app.get('/generate-stream', streamLimiter, async (req, res) => {
@@ -336,28 +500,147 @@ app.post('/admin/generar-pase-rapido', adminLimiter, verifyAdmin, async (req, re
     const { partido, email_manual, pass_manual, fecha_corte } = req.body;
 
     try {
-        let emailFinal = email_manual || `${Math.floor(100000 + Math.random() * 900000)}@golazosp.net`;
-        let claveFinal = pass_manual || Math.floor(100000 + Math.random() * 900000).toString();
+        if (!partido) {
+            return res.status(400).json({
+                success: false,
+                code: "MISSING_MATCH",
+                message: "Falta el partido o etiqueta del pase."
+            });
+        }
 
-        const userRecord = await auth.createUser({ email: emailFinal, password: claveFinal, displayName: partido });
+        const exp = fecha_corte
+            ? new Date(fecha_corte)
+            : new Date(Date.now() + 24 * 60 * 60 * 1000);
 
-        const exp = fecha_corte ? new Date(fecha_corte) : new Date(Date.now() + 24 * 60 * 60 * 1000);
+        if (Number.isNaN(exp.getTime())) {
+            return res.status(400).json({
+                success: false,
+                code: "INVALID_DATE",
+                message: "Fecha de corte inválida."
+            });
+        }
+
+        const esSocioVip = Boolean(email_manual);
+
+        // ==========================
+        // 💎 SOCIO VIP: email + clave
+        // ==========================
+        if (esSocioVip) {
+            const emailFinal = String(email_manual).trim().toLowerCase();
+
+            if (!emailFinal.includes("@")) {
+                return res.status(400).json({
+                    success: false,
+                    code: "INVALID_EMAIL",
+                    message: "Email VIP inválido."
+                });
+            }
+
+            const claveFinal = pass_manual || Math.floor(100000 + Math.random() * 900000).toString();
+
+            const userRecord = await auth.createUser({
+                email: emailFinal,
+                password: claveFinal,
+                displayName: partido
+            });
+
+            await db.collection('usuarios').doc(userRecord.uid).set({
+                uid: userRecord.uid,
+                usuario_corto: emailFinal,
+                etiqueta: partido,
+                tipo_acceso: "vip",
+                login_mode: "email_password",
+                fecha_expiracion: admin.firestore.Timestamp.fromDate(exp),
+                creado_el: admin.firestore.Timestamp.now(),
+                session_id: "",
+                password_stored: false,
+                last_status: "created"
+            });
+
+            return res.json({
+                success: true,
+                tipo_acceso: "vip",
+                usuario: emailFinal,
+                clave: claveFinal
+            });
+        }
+
+        // =====================================
+        // ⚽ PASE POR PARTIDO: código rápido
+        // =====================================
+        let userRecord = null;
+        let codigo = null;
+        let codeHash = null;
+        let emailFinal = null;
+        let claveInterna = null;
+
+        for (let intento = 0; intento < 20; intento++) {
+            const generado = await generarCodigoRapidoUnico();
+
+            codigo = generado.codigo;
+            codeHash = generado.hash;
+            emailFinal = `${codigo}@golazosp.net`;
+
+            // Contraseña interna. No se muestra al cliente.
+            claveInterna = generarPasswordInternoSeguro();
+
+            try {
+                userRecord = await auth.createUser({
+                    email: emailFinal,
+                    password: claveInterna,
+                    displayName: partido
+                });
+
+                break;
+
+            } catch (e) {
+                // Si justo existe ese correo interno, intentamos con otro código.
+                if (e.code === "auth/email-already-exists") {
+                    continue;
+                }
+
+                throw e;
+            }
+        }
+
+        if (!userRecord) {
+            throw new Error("No se pudo crear usuario para código rápido.");
+        }
+
+        const linkRapido = `${APP_BASE_URL}/?c=${encodeURIComponent(codigo)}`;
 
         await db.collection('usuarios').doc(userRecord.uid).set({
             uid: userRecord.uid,
             usuario_corto: emailFinal,
             etiqueta: partido,
+            tipo_acceso: "partido",
+            login_mode: "quick_code",
+            quick_code_hash: codeHash,
+            quick_code_created_at: admin.firestore.Timestamp.now(),
             fecha_expiracion: admin.firestore.Timestamp.fromDate(exp),
             creado_el: admin.firestore.Timestamp.now(),
             session_id: "",
-            password_stored: false
+            password_stored: false,
+            last_status: "created"
         });
 
-        return res.json({ success: true, usuario: emailFinal, clave: claveFinal });
+        return res.json({
+            success: true,
+            tipo_acceso: "partido",
+            codigo,
+            link_rapido: linkRapido,
+            usuario: emailFinal,
+            clave: null
+        });
 
     } catch (e) {
         console.error("❌ Error creando pase:", e);
-        return res.status(500).json({ success: false, message: e.message });
+
+        return res.status(500).json({
+            success: false,
+            code: "CREATE_PASS_ERROR",
+            message: e.message
+        });
     }
 });
 
@@ -425,8 +708,19 @@ app.post('/admin/listar-usuarios', adminLimiter, verifyAdmin, async (req, res) =
                 uid: data.uid || d.id,
                 usuario_corto: data.usuario_corto || "-",
                 etiqueta: data.etiqueta || "-",
+            
+                tipo_acceso: data.tipo_acceso || (
+                    data.login_mode === "quick_code"
+                        ? "partido"
+                        : "manual"
+                ),
+            
+                login_mode: data.login_mode || "-",
+                tiene_codigo_rapido: Boolean(data.quick_code_hash),
+            
                 estado: esActivo ? 'ACTIVO' : 'VENCIDO',
                 esActivo: esActivo,
+            
                 tiempo: new Date(expiraMillis).toLocaleString('es-PE', {
                     timeZone: 'America/Lima',
                     year: 'numeric',
@@ -436,6 +730,7 @@ app.post('/admin/listar-usuarios', adminLimiter, verifyAdmin, async (req, res) =
                     minute: '2-digit',
                     hour12: true
                 }),
+            
                 ultima_conexion: ultimaConexion,
                 last_status: data.last_status || "-",
                 last_ip: data.last_ip || "Sin registro",
@@ -456,5 +751,5 @@ app.post('/admin/listar-usuarios', adminLimiter, verifyAdmin, async (req, res) =
 const PORT = process.env.PORT || 3000;
 
 app.listen(PORT, () => {
-    console.log(`🚀 GOLAZO SECURE STREAM READY (FASE 6 FINAL: PATH-BASED TOKEN ABR CORREGIDO)`);
+    console.log(`🚀 GOLAZO SECURE STREAM READY (FASE 7: QUICK CODE LOGIN + PATH-BASED TOKEN)`);
 });
