@@ -322,7 +322,6 @@
         return "Navegador";
     }
 
-    // 🔥 NUEVO: Formateador para mostrar el tipo de acceso en auditoría
     function formatearTipoAcceso(u) {
         if (u.tipo_acceso === "partido" || u.login_mode === "quick_code") {
             return "⚡ Código rápido";
@@ -339,7 +338,6 @@
         return "Manual / antiguo";
     }
 
-    // 🔥 NUEVO: Generar Pase actualizado para manejar códigos rápidos y respuestas limpias
     async function generarPase(esSocio) {
         const nombre = esSocio
             ? document.getElementById('socioEmail').value.trim()
@@ -414,10 +412,14 @@ Este acceso es válido para 1 dispositivo.
                     const codigo = d.codigo || "NO_GENERADO";
                     const linkRapido = d.link_rapido || `https://golazosp.net/?c=${encodeURIComponent(codigo)}`;
 
+                    // 🔥 AJUSTE: Mensaje perfeccionado de Pase Rápido
                     msg = `✅ ¡ACCESO GOLAZO SP LISTO! ⚽
 ━━━━━━━━━━━━━━
 ⚽ PARTIDO:
 ${nombre}
+
+🔗 INGRESA AQUÍ:
+${linkRapido}
 
 🔐 CÓDIGO DE ACCESO:
 ${codigo}
@@ -426,12 +428,9 @@ ${codigo}
 www.golazosp.net
 
 📲 ¿CÓMO INGRESAR?
-1️⃣ Abre www.golazosp.net
-2️⃣ Escribe tu código: ${codigo}
-3️⃣ Presiona "EMPEZAR A VER"
-
-🔗 LINK RÁPIDO:
-${linkRapido}
+1️⃣ Toca el link rápido.
+2️⃣ Verifica que el código aparezca cargado.
+3️⃣ Presiona "EMPEZAR A VER".
 
 ⏳ VÁLIDO HASTA:
 ${expiraTexto}
@@ -492,7 +491,7 @@ Este acceso es válido para 1 dispositivo.
                 const usuario = escapeHtml(u.usuario_corto || "-");
                 const usuarioAttr = escapeAttr(u.usuario_corto || "-");
                 const etiqueta = escapeHtml(u.etiqueta || "-");
-                const tipoAcceso = escapeHtml(formatearTipoAcceso(u)); // 🔥 NUEVO: Tipo de acceso
+                const tipoAcceso = escapeHtml(formatearTipoAcceso(u));
                 const estado = escapeHtml(u.estado || "-");
                 const tiempo = escapeHtml(u.tiempo || "-");
                 const ultimaConexion = escapeHtml(u.ultima_conexion || "-");
