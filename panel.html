@@ -322,6 +322,24 @@
         return "Navegador";
     }
 
+    // 🔥 NUEVO: Formateador para mostrar el tipo de acceso en auditoría
+    function formatearTipoAcceso(u) {
+        if (u.tipo_acceso === "partido" || u.login_mode === "quick_code") {
+            return "⚡ Código rápido";
+        }
+
+        if (u.tipo_acceso === "vip" || u.login_mode === "email_password") {
+            return "💎 Socio VIP";
+        }
+
+        if (u.tiene_codigo_rapido) {
+            return "⚡ Código rápido";
+        }
+
+        return "Manual / antiguo";
+    }
+
+    // 🔥 NUEVO: Generar Pase actualizado para manejar códigos rápidos y respuestas limpias
     async function generarPase(esSocio) {
         const nombre = esSocio
             ? document.getElementById('socioEmail').value.trim()
@@ -334,6 +352,10 @@
         }
 
         let fecha = esSocio ? new Date() : new Date(document.getElementById('fechaCorte').value);
+
+        if (Number.isNaN(fecha.getTime())) {
+            return alert("Selecciona una fecha válida.");
+        }
 
         if (esSocio) {
             fecha.setDate(fecha.getDate() + parseInt(document.getElementById('socioMeses').value));
@@ -350,29 +372,89 @@
             });
 
             const d = await res.json();
-            
-            if(d.success) {
+
+            if (d.success) {
                 const box = esSocio ? document.getElementById('resSocio') : document.getElementById('resPase');
                 const expiraTexto = formatearFechaPeru(fecha);
                 let msg = "";
 
-                if(esSocio) {
+                if (esSocio) {
                     const linkVip = document.getElementById('linkVip').value || "Solicitar al soporte";
 
-                    msg = `🔥 ¡BIENVENIDO SOCIO VIP GOLAZO SP! 🔥\n━━━━━━━━━━━━━━\n✅ Tu acceso VIP ya está activo.\n\n🌐 WEB PARA VER LOS PARTIDOS:\nwww.golazosp.net\n\n👤 USUARIO:\n${d.usuario}\n\n🔑 CONTRASEÑA:\n${d.clave}\n\n📲 ¿CÓMO INGRESAR?\n1️⃣ Abre la web: www.golazosp.net\n2️⃣ Escribe tu usuario y contraseña exactamente como aparecen aquí.\n3️⃣ Presiona el botón "EMPEZAR A VER".\n4️⃣ El sistema te llevará automáticamente al reproductor.\n\n📺 Puedes ingresar desde celular, laptop, PC, tablet o Smart TV compatible.\n\n💎 GRUPO VIP:\n${linkVip}\n\n⏳ ACCESO VÁLIDO HASTA:\n${expiraTexto}\n\n⚠️ IMPORTANTE:\nEste acceso es personal y permite solo 1 dispositivo activo a la vez.\nNo compartas tus datos para evitar cierre de sesión o bloqueo del pase.\n\n¡Disfruta tu acceso VIP! 💎`;
+                    msg = `🔥 ¡BIENVENIDO SOCIO VIP GOLAZO SP! 🔥
+━━━━━━━━━━━━━━
+✅ Tu acceso VIP ya está activo.
+
+🌐 WEB:
+www.golazosp.net
+
+👤 USUARIO:
+${d.usuario}
+
+🔑 CONTRASEÑA:
+${d.clave}
+
+📲 ¿CÓMO INGRESAR?
+1️⃣ Abre www.golazosp.net
+2️⃣ Ingresa tu usuario y contraseña.
+3️⃣ Presiona "EMPEZAR A VER".
+
+💎 GRUPO VIP:
+${linkVip}
+
+⏳ VÁLIDO HASTA:
+${expiraTexto}
+
+⚠️ IMPORTANTE:
+Este acceso es válido para 1 dispositivo.
+
+¡Disfruta tu acceso VIP! 💎`;
+
                 } else {
-                    msg = `✅ ¡ACCESO GOLAZO SP LISTO! ⚽\n━━━━━━━━━━━━━━\nTu pase para el partido ya está activo.\n\n⚽ PARTIDO:\n${nombre}\n\n🌐 WEB PARA VER EL PARTIDO:\nwww.golazosp.net\n\n👤 USUARIO:\n${d.usuario}\n\n🔑 CONTRASEÑA:\n${d.clave}\n\n📲 ¿CÓMO INGRESAR?\n1️⃣ Abre la web: www.golazosp.net\n2️⃣ Escribe tu usuario y contraseña exactamente como aparecen aquí.\n3️⃣ Presiona el botón "EMPEZAR A VER".\n4️⃣ El sistema te llevará automáticamente al reproductor.\n\n📺 Puedes ingresar desde celular, laptop, PC, tablet o Smart TV compatible.\n\n⏳ VÁLIDO HASTA:\n${expiraTexto}\n\n⚠️ IMPORTANTE:\nEste acceso es personal y permite solo 1 dispositivo activo a la vez.\nSi compartes tu usuario, tu sesión puede cerrarse automáticamente.\n\n¡Disfruta el partido! 🫡`;
+                    const codigo = d.codigo || "NO_GENERADO";
+                    const linkRapido = d.link_rapido || `https://golazosp.net/?c=${encodeURIComponent(codigo)}`;
+
+                    msg = `✅ ¡ACCESO GOLAZO SP LISTO! ⚽
+━━━━━━━━━━━━━━
+⚽ PARTIDO:
+${nombre}
+
+🔐 CÓDIGO DE ACCESO:
+${codigo}
+
+🌐 WEB:
+www.golazosp.net
+
+📲 ¿CÓMO INGRESAR?
+1️⃣ Abre www.golazosp.net
+2️⃣ Escribe tu código: ${codigo}
+3️⃣ Presiona "EMPEZAR A VER"
+
+🔗 LINK RÁPIDO:
+${linkRapido}
+
+⏳ VÁLIDO HASTA:
+${expiraTexto}
+
+⚠️ IMPORTANTE:
+Este acceso es válido para 1 dispositivo.
+
+¡Disfruta el partido! 🫡`;
                 }
-                
+
                 box.innerText = msg;
                 box.style.display = "block";
+
                 await navigator.clipboard.writeText(msg);
-                alert("🚀 ¡Copiado al portapapeles!");
+                alert("🚀 ¡Mensaje copiado al portapapeles!");
+
                 cargarUsuarios();
-            } else { 
+
+            } else {
                 alert(`❌ Error creando pase: ${d.message || d.error || d.code || "No autorizado o sesión vencida"}`);
             }
-        } catch(e) { 
+
+        } catch (e) {
             console.error("Error real creando pase:", e);
             alert("❌ Error de servidor creando pase. Revisa consola.");
         }
@@ -410,6 +492,7 @@
                 const usuario = escapeHtml(u.usuario_corto || "-");
                 const usuarioAttr = escapeAttr(u.usuario_corto || "-");
                 const etiqueta = escapeHtml(u.etiqueta || "-");
+                const tipoAcceso = escapeHtml(formatearTipoAcceso(u)); // 🔥 NUEVO: Tipo de acceso
                 const estado = escapeHtml(u.estado || "-");
                 const tiempo = escapeHtml(u.tiempo || "-");
                 const ultimaConexion = escapeHtml(u.ultima_conexion || "-");
@@ -427,7 +510,10 @@
                         <b>${usuario}</b>
                         <div class="muted">${navegador}</div>
                     </td>
-                    <td>${etiqueta}</td>
+                    <td>
+                        <b>${etiqueta}</b>
+                        <div class="muted">${tipoAcceso}</div>
+                    </td>
                     <td>
                         <span class="badge" style="background:${u.esActivo ? '#065f46' : '#7f1d1d'}">${estado}</span>
                     </td>
