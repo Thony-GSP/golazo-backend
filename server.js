@@ -50,8 +50,6 @@ app.options(/.*/, cors(corsOptions));
 app.use(express.json());
 
 // --- 3. RATE LIMITS CONFIGURABLES ---
-// Valores normales de producción.
-// Para prueba de carga controlada puedes subirlos temporalmente desde Render env vars.
 const GENERAL_RATE_LIMIT_MAX = parseInt(process.env.GENERAL_RATE_LIMIT_MAX || "120", 10);
 const STREAM_RATE_LIMIT_MAX = parseInt(process.env.STREAM_RATE_LIMIT_MAX || "30", 10);
 const ADMIN_RATE_LIMIT_MAX = parseInt(process.env.ADMIN_RATE_LIMIT_MAX || "20", 10);
@@ -117,37 +115,41 @@ const BUNNY_SECURITY_KEY = process.env.BUNNY_KEY.trim();
 const STREAM_PATH = '/stream/master.m3u8';
 const ADMIN_SECRET = process.env.ADMIN_SECRET;
 
+// ✅ NUEVO: selector de fuente de stream.
+// Valores permitidos:
+// bunny    = usa Bunny CDN con token firmado.
+// external = usa la señal directa de live.site.pe.
+const STREAM_MODE_DEFAULT = String(process.env.STREAM_MODE || "bunny").trim().toLowerCase();
+const EXTERNAL_STREAM_URL_DEFAULT = String(
+    process.env.EXTERNAL_STREAM_URL || "https://live.site.pe/live/golazosp.m3u8"
+).trim();
+
+// Cache para no leer Firestore en cada /generate-stream.
+const STREAM_CONFIG_CACHE_TTL_MS = parseInt(
+    process.env.STREAM_CONFIG_CACHE_TTL_MS || "15000",
+    10
+);
+
+let cachedStreamConfig = null;
+let cachedStreamConfigExpiresAt = 0;
+
 // 🔐 Código rápido
-// Recomendado: crear QUICK_CODE_SECRET en Render.
-// Si no existe, usa BUNNY_KEY como respaldo.
 const QUICK_CODE_SECRET = (process.env.QUICK_CODE_SECRET || process.env.BUNNY_KEY || "").trim();
 
 // 🌐 URL pública de la web para generar links rápidos
 const APP_BASE_URL = process.env.APP_BASE_URL || "https://golazosp.net";
 
 // --- 4.1 OPTIMIZACIÓN DE ESCALA ---
-// Frontend recomendado:
-// check-session cada 60-75s con jitter.
-// generate-stream / renovación cada 8-8.5 min.
-//
-// Firestore no debe recibir escritura en cada heartbeat.
-// Se escribirá heartbeat solo si ya pasó este tiempo.
 const HEARTBEAT_WRITE_MIN_INTERVAL_MS = parseInt(
     process.env.HEARTBEAT_WRITE_MIN_INTERVAL_MS || "90000",
     10
 );
 
-// Ventana para considerar que una sesión sigue activa.
-// Debe ser mayor al heartbeat + jitter + margen.
-// Con heartbeat 60-75s y escritura cada 90s, 150s es buen equilibrio.
 const ACTIVE_SESSION_WINDOW_MS = parseInt(
     process.env.ACTIVE_SESSION_WINDOW_MS || "150000",
     10
 );
 
-// Token Bunny máximo.
-// El frontend renovará aprox. cada 8 min.
-// 600s = 10 min, deja margen suficiente.
 const BUNNY_TOKEN_DURATION_SECONDS = parseInt(
     process.env.BUNNY_TOKEN_DURATION_SECONDS || "600",
     10
@@ -159,7 +161,8 @@ app.get('/', (req, res) => {
         success: true,
         service: "Golazo Stream Backend",
         status: "online",
-        version: "FASE 8 - backend optimized for 400-500 users"
+        version: "FASE 9 - selector Bunny / External Stream",
+        stream_mode_default: STREAM_MODE_DEFAULT
     });
 });
 
@@ -181,6 +184,84 @@ function nowTimestamp() {
     return admin.firestore.Timestamp.now();
 }
 
+function normalizeStreamSource(value) {
+    const source = String(value || "").trim().toLowerCase();
+
+    if (source === "external") return "external";
+    if (source === "bunny") return "bunny";
+
+    return "bunny";
+}
+
+function isValidHttpUrl(value) {
+    try {
+        const url = new URL(String(value || "").trim());
+        return url.protocol === "http:" || url.protocol === "https:";
+    } catch (_) {
+        return false;
+    }
+}
+
+// ✅ NUEVO: lee la fuente activa desde Firestore.
+// Ruta Firestore recomendada:
+// collection: config
+// document: stream
+//
+// Ejemplo external:
+// {
+//   active_source: "external",
+//   external_url: "https://live.site.pe/live/golazosp.m3u8"
+// }
+//
+// Ejemplo bunny:
+// {
+//   active_source: "bunny",
+//   external_url: "https://live.site.pe/live/golazosp.m3u8"
+// }
+async function getActiveStreamConfig() {
+    const now = Date.now();
+
+    if (cachedStreamConfig && now < cachedStreamConfigExpiresAt) {
+        return cachedStreamConfig;
+    }
+
+    let config = {
+        active_source: normalizeStreamSource(STREAM_MODE_DEFAULT),
+        external_url: EXTERNAL_STREAM_URL_DEFAULT
+    };
+
+    try {
+        const doc = await db.collection("config").doc("stream").get();
+
+        if (doc.exists) {
+            const data = doc.data() || {};
+
+            config = {
+                active_source: normalizeStreamSource(data.active_source || STREAM_MODE_DEFAULT),
+                external_url: String(data.external_url || EXTERNAL_STREAM_URL_DEFAULT).trim()
+            };
+        }
+
+        if (config.active_source === "external" && !isValidHttpUrl(config.external_url)) {
+            console.warn("⚠️ external_url inválida. Se usará Bunny como respaldo.");
+            config.active_source = "bunny";
+        }
+
+        cachedStreamConfig = config;
+        cachedStreamConfigExpiresAt = now + STREAM_CONFIG_CACHE_TTL_MS;
+
+        return config;
+
+    } catch (error) {
+        console.error("❌ Error leyendo config stream desde Firestore:", error.message);
+
+        cachedStreamConfig = config;
+        cachedStreamConfigExpiresAt = now + STREAM_CONFIG_CACHE_TTL_MS;
+
+        return config;
+    }
+}
+
 // --- 7. GENERADOR DE TOKEN BUNNY PARA DIRECTORIOS (BUNNY TOKEN V2 HMAC-SHA256) ---
 function base64Url(buffer) {
     return buffer.toString("base64")
@@ -193,15 +274,9 @@ function base64Url(buffer) {
 function generateBunnyTokenForStream(path, securityKey, duration = 120) {
     const expires = Math.floor(Date.now() / 1000) + duration;
 
-    // Autoriza todo lo que está debajo de /stream/
     const tokenPath = "/stream/";
     const signaturePath = tokenPath;
-
-    // Para firmar: token_path SIN encodear.
-    // Para URL final: token_path SÍ encodeado.
     const signingData = `token_path=${tokenPath}`;
-
-    // Token IP Validation está OFF, así que no firmamos IP.
     const userIp = "";
 
     const message = `${signaturePath}${expires}${signingData}${userIp}`;
@@ -412,7 +487,7 @@ app.post('/auth/quick-login', quickLoginLimiter, async (req, res) => {
     }
 });
 
-// --- 12. GENERATE STREAM OPTIMIZADO ---
+// --- 12. GENERATE STREAM OPTIMIZADO + SELECTOR BUNNY/EXTERNAL ---
 app.get('/generate-stream', streamLimiter, async (req, res) => {
     try {
         const authHeader = req.headers.authorization || "";
@@ -470,7 +545,6 @@ app.get('/generate-stream', streamLimiter, async (req, res) => {
             });
         }
 
-        // Bloqueo por revocación.
         if (
             requestedSessionId &&
             (
@@ -485,8 +559,6 @@ app.get('/generate-stream', streamLimiter, async (req, res) => {
             });
         }
 
-        // Bloqueo de segunda sesión activa reciente.
-        // Antes era 45s. Ahora se amplía porque el heartbeat frontend será 60-75s.
         const lastHeartbeatMillis = getTimestampMillis(userData.last_heartbeat);
 
         const sesionActivaReciente = Boolean(
@@ -524,9 +596,6 @@ app.get('/generate-stream', streamLimiter, async (req, res) => {
             });
 
         } else {
-            // Optimización:
-            // Renovar URL no debe escribir en Firestore siempre.
-            // Solo refrescamos auditoría/heartbeat si ya pasó el intervalo mínimo.
             if (shouldWriteHeartbeat(userData, ahora)) {
                 await userRef.update({
                     last_heartbeat: nowTimestamp(),
@@ -539,24 +608,38 @@ app.get('/generate-stream', streamLimiter, async (req, res) => {
 
         const tokenDuration = Math.min(BUNNY_TOKEN_DURATION_SECONDS, segundosRestantesPase);
 
-        const signed = generateBunnyTokenForStream(
-            STREAM_PATH,
-            BUNNY_SECURITY_KEY,
-            tokenDuration
-        );
+        // ✅ NUEVO: aquí se decide si se devuelve Bunny o live.site.pe.
+        const streamConfig = await getActiveStreamConfig();
 
-        const finalUrl = signed.url;
+        let finalUrl = "";
+        let bunnyExpires = Math.floor(Date.now() / 1000) + tokenDuration;
+        let streamSource = streamConfig.active_source;
+
+        if (streamConfig.active_source === "external") {
+            finalUrl = streamConfig.external_url;
+        } else {
+            const signed = generateBunnyTokenForStream(
+                STREAM_PATH,
+                BUNNY_SECURITY_KEY,
+                tokenDuration
+            );
+
+            finalUrl = signed.url;
+            bunnyExpires = signed.expires;
+            streamSource = "bunny";
+        }
 
         console.log(
-            `✅ Stream [${mismaSesion ? 'RENOVADO' : 'NUEVO'}] | uid=${uid} | duration=${tokenDuration}s`
+            `✅ Stream [${mismaSesion ? 'RENOVADO' : 'NUEVO'}] | uid=${uid} | source=${streamSource} | duration=${tokenDuration}s`
         );
 
         return res.json({
             success: true,
             stream_url: finalUrl,
+            stream_source: streamSource,
             session_id: sessionIdFinal,
             reused_session: mismaSesion,
-            bunny_expires: signed.expires,
+            bunny_expires: bunnyExpires,
             pase_expira: expiraMillis
         });
 
@@ -674,9 +757,6 @@ app.post('/check-session', async (req, res) => {
             });
         }
 
-        // Optimización principal:
-        // No escribir en Firestore en cada heartbeat correcto.
-        // Solo actualizar last_heartbeat si ya pasó el intervalo mínimo.
         if (shouldWriteHeartbeat(userData, ahora)) {
             await userRef.update({
                 last_heartbeat: nowTimestamp(),
@@ -729,9 +809,6 @@ app.post('/admin/generar-pase-rapido', adminLimiter, verifyAdmin, async (req, re
 
         const esSocioVip = Boolean(email_manual);
 
-        // ==========================
-        // 💎 SOCIO VIP: email + clave
-        // ==========================
         if (esSocioVip) {
             const emailFinal = String(email_manual).trim().toLowerCase();
 
@@ -772,9 +849,6 @@ app.post('/admin/generar-pase-rapido', adminLimiter, verifyAdmin, async (req, re
             });
         }
 
-        // =====================================
-        // ⚽ PASE POR PARTIDO: código rápido
-        // =====================================
         let userRecord = null;
         let codigo = null;
         let codeHash = null;
@@ -787,8 +861,6 @@ app.post('/admin/generar-pase-rapido', adminLimiter, verifyAdmin, async (req, re
             codigo = generado.codigo;
             codeHash = generado.hash;
             emailFinal = `${codigo}@golazosp.net`;
-
-            // Contraseña interna. No se muestra al cliente.
             claveInterna = generarPasswordInternoSeguro();
 
             try {
@@ -801,7 +873,6 @@ app.post('/admin/generar-pase-rapido', adminLimiter, verifyAdmin, async (req, re
                 break;
 
             } catch (e) {
-                // Si justo existe ese correo interno, intentamos con otro código.
                 if (e.code === "auth/email-already-exists") {
                     continue;
                 }
@@ -880,6 +951,67 @@ app.post('/admin/revocar-sesion', adminLimiter, verifyAdmin, async (req, res) =>
         return res.status(500).json({
             success: false,
             message: "Error al revocar sesión"
+        });
+    }
+});
+
+// --- 15.1 PANEL ADMIN: VER CONFIG STREAM ---
+app.post('/admin/ver-config-stream', adminLimiter, verifyAdmin, async (req, res) => {
+    try {
+        const config = await getActiveStreamConfig();
+
+        return res.json({
+            success: true,
+            config,
+            cache_ttl_ms: STREAM_CONFIG_CACHE_TTL_MS
+        });
+
+    } catch (e) {
+        console.error("❌ Error viendo config stream:", e);
+
+        return res.status(500).json({
+            success: false,
+            message: "Error viendo config stream."
+        });
+    }
+});
+
+// --- 15.2 PANEL ADMIN: ACTUALIZAR CONFIG STREAM ---
+app.post('/admin/actualizar-config-stream', adminLimiter, verifyAdmin, async (req, res) => {
+    try {
+        const activeSource = normalizeStreamSource(req.body?.active_source);
+        const externalUrl = String(req.body?.external_url || EXTERNAL_STREAM_URL_DEFAULT).trim();
+
+        if (activeSource === "external" && !isValidHttpUrl(externalUrl)) {
+            return res.status(400).json({
+                success: false,
+                message: "external_url inválida."
+            });
+        }
+
+        const payload = {
+            active_source: activeSource,
+            external_url: externalUrl,
+            updated_at: nowTimestamp()
+        };
+
+        await db.collection("config").doc("stream").set(payload, { merge: true });
+
+        cachedStreamConfig = null;
+        cachedStreamConfigExpiresAt = 0;
+
+        return res.json({
+            success: true,
+            message: `Fuente de stream actualizada a: ${activeSource}`,
+            config: payload
+        });
+
+    } catch (e) {
+        console.error("❌ Error actualizando config stream:", e);
+
+        return res.status(500).json({
+            success: false,
+            message: "Error actualizando config stream."
         });
     }
 });
@@ -1001,5 +1133,5 @@ app.post('/admin/listar-usuarios', adminLimiter, verifyAdmin, async (req, res) =
 const PORT = process.env.PORT || 3000;
 
 app.listen(PORT, () => {
-    console.log(`🚀 GOLAZO SECURE STREAM READY (FASE 8: BACKEND OPTIMIZADO 400-500 USERS)`);
+    console.log(`🚀 GOLAZO SECURE STREAM READY (FASE 9: SELECTOR BUNNY / EXTERNAL)`);
 });
