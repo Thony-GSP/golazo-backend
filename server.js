@@ -184,6 +184,33 @@ function nowTimestamp() {
     return admin.firestore.Timestamp.now();
 }
 
+function normalizeClientId(value) {
+    const normalized = String(value || "").trim();
+
+    if (!/^[a-zA-Z0-9_-]{8,128}$/.test(normalized)) {
+        return "";
+    }
+
+    return normalized;
+}
+
+async function verifyUserRequest(req) {
+    const authHeader = req.headers.authorization || "";
+    const tokenFromHeader = authHeader.startsWith("Bearer ")
+        ? authHeader.replace("Bearer ", "").trim()
+        : "";
+    const tokenFromBody = String(req.body?.id_token || "").trim();
+    const idToken = tokenFromHeader || tokenFromBody;
+
+    if (!idToken) return null;
+
+    try {
+        return await auth.verifyIdToken(idToken);
+    } catch (_) {
+        return null;
+    }
+}
+
 function normalizeStreamSource(value) {
     const source = String(value || "").trim().toLowerCase();
 
@@ -512,7 +539,10 @@ app.get('/generate-stream', streamLimiter, async (req, res) => {
         }
 
         const uid = decodedToken.uid;
-        const requestedSessionId = req.query.session_id || null;
+        const requestedSessionId = normalizeClientId(req.query.session_id);
+        const deviceId = normalizeClientId(req.query.device_id);
+        const pageId = normalizeClientId(req.query.page_id);
+        const takeoverRequested = req.query.takeover === "1";
 
         const userRef = db.collection('usuarios').doc(uid);
         const userDoc = await userRef.get();
@@ -570,18 +600,23 @@ app.get('/generate-stream', streamLimiter, async (req, res) => {
             ahora - lastHeartbeatMillis < ACTIVE_SESSION_WINDOW_MS
         );
 
-        if (!requestedSessionId && sesionActivaReciente) {
+        const mismaSesion = Boolean(
+            requestedSessionId && requestedSessionId === userData.session_id
+        );
+
+        // Un session_id inventado o antiguo nunca debe saltarse el bloqueo.
+        if (sesionActivaReciente && !mismaSesion && !takeoverRequested) {
             return res.status(409).json({
                 success: false,
                 code: "SESSION_ALREADY_ACTIVE",
-                error: "Ya existe una sesión activa para este usuario."
+                error: "Ya existe una sesión activa para este usuario.",
+                can_takeover: true
             });
         }
 
         const { ip, userAgent } = getClientData(req);
 
         let sessionIdFinal = userData.session_id || "";
-        const mismaSesion = Boolean(requestedSessionId && requestedSessionId === userData.session_id);
 
         if (!mismaSesion) {
             sessionIdFinal = crypto.randomUUID();
@@ -592,16 +627,35 @@ app.get('/generate-stream', streamLimiter, async (req, res) => {
                 last_heartbeat: nowTimestamp(),
                 last_status: "stream_started",
                 last_ip: ip,
-                last_user_agent: userAgent
+                last_user_agent: userAgent,
+                active_device_id: deviceId,
+                active_page_id: pageId,
+                last_takeover_at: takeoverRequested ? nowTimestamp() : null
             });
 
         } else {
+            const sessionPatch = {};
+
+            // Actualizar page_id en cada carga evita que el cierre de una página
+            // anterior libere accidentalmente una sesión recién reanudada.
+            if (pageId && pageId !== userData.active_page_id) {
+                sessionPatch.active_page_id = pageId;
+            }
+
+            if (deviceId && deviceId !== userData.active_device_id) {
+                sessionPatch.active_device_id = deviceId;
+            }
+
             if (shouldWriteHeartbeat(userData, ahora)) {
+                sessionPatch.last_heartbeat = nowTimestamp();
+                sessionPatch.last_status = "stream_renewed";
+                sessionPatch.last_ip = ip;
+                sessionPatch.last_user_agent = userAgent;
+            }
+
+            if (Object.keys(sessionPatch).length) {
                 await userRef.update({
-                    last_heartbeat: nowTimestamp(),
-                    last_status: "stream_renewed",
-                    last_ip: ip,
-                    last_user_agent: userAgent
+                    ...sessionPatch
                 });
             }
         }
@@ -639,6 +693,7 @@ app.get('/generate-stream', streamLimiter, async (req, res) => {
             stream_source: streamSource,
             session_id: sessionIdFinal,
             reused_session: mismaSesion,
+            takeover: takeoverRequested && !mismaSesion,
             bunny_expires: bunnyExpires,
             pase_expira: expiraMillis
         });
@@ -650,6 +705,55 @@ app.get('/generate-stream', streamLimiter, async (req, res) => {
             success: false,
             code: "SERVER_ERROR"
         });
+    }
+});
+
+// Libera únicamente la página que creó el bloqueo. Acepta el ID token en el
+// body para que pagehide pueda usar navigator.sendBeacon en TVs y móviles.
+app.post('/release-session', streamLimiter, async (req, res) => {
+    try {
+        const decodedToken = await verifyUserRequest(req);
+
+        if (!decodedToken) {
+            return res.status(401).json({ success: false, code: "NO_AUTH" });
+        }
+
+        const sessionId = normalizeClientId(req.body?.session_id);
+        const pageId = normalizeClientId(req.body?.page_id);
+
+        if (!sessionId || !pageId) {
+            return res.status(400).json({ success: false, code: "INVALID_RELEASE" });
+        }
+
+        const userRef = db.collection('usuarios').doc(decodedToken.uid);
+        let released = false;
+
+        await db.runTransaction(async transaction => {
+            const snap = await transaction.get(userRef);
+            if (!snap.exists) return;
+
+            const data = snap.data();
+
+            if (data.session_id !== sessionId || data.active_page_id !== pageId) {
+                return;
+            }
+
+            transaction.update(userRef, {
+                session_id: "",
+                active_device_id: "",
+                active_page_id: "",
+                last_status: "released",
+                session_released_at: nowTimestamp()
+            });
+
+            released = true;
+        });
+
+        return res.json({ success: true, released });
+
+    } catch (error) {
+        console.error("Error en /release-session:", error);
+        return res.status(500).json({ success: false, code: "SERVER_ERROR" });
     }
 });
 
@@ -678,6 +782,7 @@ app.post('/check-session', async (req, res) => {
         }
 
         const { session_id } = req.body || {};
+        const pageId = normalizeClientId(req.body?.page_id);
 
         if (!session_id) {
             return res.status(400).json({
@@ -743,14 +848,10 @@ app.post('/check-session', async (req, res) => {
             });
         }
 
-        if (session_id !== userData.session_id) {
-            await userRef.update({
-                last_heartbeat: nowTimestamp(),
-                last_status: "replaced_session",
-                last_ip: ip,
-                last_user_agent: userAgent
-            });
-
+        if (
+            session_id !== userData.session_id ||
+            (userData.active_page_id && pageId && pageId !== userData.active_page_id)
+        ) {
             return res.json({
                 valid: false,
                 motivo: "pirateria"
