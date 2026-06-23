@@ -125,14 +125,16 @@ const EXTERNAL_STREAM_URL_DEFAULT = String(
     process.env.EXTERNAL_STREAM_URL || "https://live.site.pe/live/golazosp.m3u8"
 ).trim();
 const IFRAME_PLAYER_URL_DEFAULT = String(
-    process.env.IFRAME_PLAYER_URL ||
-    "https://player-latam-hd.site/index.php?prov=la14hd&stream=sv24je.html&v=5"
+    process.env.IFRAME_PLAYER_URL || ""
 ).trim();
+const IFRAME_ALLOWED_HOSTS = String(
+    process.env.IFRAME_ALLOWED_HOSTS || "player-latam-hd.site"
+).split(",").map((host) => host.trim().toLowerCase()).filter(Boolean);
 const STREAM_FALLBACK_ORDER_DEFAULT = ["iframe", "external", "bunny"];
 
 // Cache para no leer Firestore en cada /generate-stream.
 const STREAM_CONFIG_CACHE_TTL_MS = parseInt(
-    process.env.STREAM_CONFIG_CACHE_TTL_MS || "15000",
+    process.env.STREAM_CONFIG_CACHE_TTL_MS || "5000",
     10
 );
 
@@ -244,10 +246,40 @@ function normalizeFallbackOrder(value, primarySource = "iframe") {
     return normalized;
 }
 
+function createStreamConfigVersion(config) {
+    const stableConfig = {
+        active_source: String(config.active_source || ""),
+        external_url: String(config.external_url || ""),
+        iframe_url: String(config.iframe_url || ""),
+        fallback_order: Array.isArray(config.fallback_order)
+            ? config.fallback_order
+            : []
+    };
+
+    return crypto
+        .createHash("sha256")
+        .update(JSON.stringify(stableConfig))
+        .digest("hex")
+        .slice(0, 16);
+}
+
 function isValidHttpUrl(value) {
     try {
         const url = new URL(String(value || "").trim());
         return url.protocol === "http:" || url.protocol === "https:";
+    } catch (_) {
+        return false;
+    }
+}
+
+function isAllowedIframeUrl(value) {
+    try {
+        const url = new URL(String(value || "").trim());
+        if (url.protocol !== "https:") return false;
+        const hostname = url.hostname.toLowerCase();
+        return IFRAME_ALLOWED_HOSTS.some((allowedHost) =>
+            hostname === allowedHost || hostname.endsWith(`.${allowedHost}`)
+        );
     } catch (_) {
         return false;
     }
@@ -280,7 +312,8 @@ async function getActiveStreamConfig() {
         active_source: normalizeStreamSource(STREAM_MODE_DEFAULT),
         external_url: EXTERNAL_STREAM_URL_DEFAULT,
         iframe_url: IFRAME_PLAYER_URL_DEFAULT,
-        fallback_order: normalizeFallbackOrder(null, normalizeStreamSource(STREAM_MODE_DEFAULT))
+        fallback_order: normalizeFallbackOrder(null, normalizeStreamSource(STREAM_MODE_DEFAULT)),
+        updated_at_ms: 0
     };
 
     try {
@@ -296,7 +329,8 @@ async function getActiveStreamConfig() {
                 fallback_order: normalizeFallbackOrder(
                     data.fallback_order,
                     normalizeStreamSource(data.active_source || STREAM_MODE_DEFAULT)
-                )
+                ),
+                updated_at_ms: getTimestampMillis(data.updated_at)
             };
         }
 
@@ -306,16 +340,21 @@ async function getActiveStreamConfig() {
             if (config.active_source === "external") config.active_source = "bunny";
         }
 
-        if (!isValidHttpUrl(config.iframe_url)) {
-            console.warn("⚠️ iframe_url inválida. Se restauró el valor predeterminado.");
+        if (config.iframe_url && !isAllowedIframeUrl(config.iframe_url)) {
+            console.warn("⚠️ iframe_url inválida o no autorizada. Se restauró el valor predeterminado.");
             config.iframe_url = IFRAME_PLAYER_URL_DEFAULT;
             if (config.active_source === "iframe") config.active_source = "bunny";
+        }
+
+        if (config.active_source === "iframe" && !config.iframe_url) {
+            config.active_source = "bunny";
         }
 
         config.fallback_order = normalizeFallbackOrder(
             config.fallback_order,
             config.active_source
         );
+        config.version = createStreamConfigVersion(config);
 
         cachedStreamConfig = config;
         cachedStreamConfigExpiresAt = now + STREAM_CONFIG_CACHE_TTL_MS;
@@ -324,6 +363,12 @@ async function getActiveStreamConfig() {
 
     } catch (error) {
         console.error("❌ Error leyendo config stream desde Firestore:", error.message);
+
+        config.fallback_order = normalizeFallbackOrder(
+            config.fallback_order,
+            config.active_source
+        );
+        config.version = createStreamConfigVersion(config);
 
         cachedStreamConfig = config;
         cachedStreamConfigExpiresAt = now + STREAM_CONFIG_CACHE_TTL_MS;
@@ -746,6 +791,7 @@ app.get('/generate-stream', streamLimiter, async (req, res) => {
             primary_source: streamConfig.active_source,
             fallback_order: fallbackOrder,
             sources,
+            stream_config_version: streamConfig.version,
             session_id: sessionIdFinal,
             reused_session: mismaSesion,
             takeover: takeoverRequested && !mismaSesion,
@@ -922,10 +968,14 @@ app.post('/check-session', async (req, res) => {
             });
         }
 
+        const streamConfig = await getActiveStreamConfig();
+
         return res.json({
             valid: true,
             motivo: "ok",
-            pase_expira: expiraMillis
+            pase_expira: expiraMillis,
+            primary_source: streamConfig.active_source,
+            stream_config_version: streamConfig.version
         });
 
     } catch (e) {
@@ -1157,10 +1207,17 @@ app.post('/admin/actualizar-config-stream', adminLimiter, verifyAdmin, async (re
             });
         }
 
-        if (!isValidHttpUrl(iframeUrl)) {
+        if (iframeUrl && !isAllowedIframeUrl(iframeUrl)) {
             return res.status(400).json({
                 success: false,
-                message: "iframe_url inválida."
+                message: "iframe_url inválida o dominio no autorizado."
+            });
+        }
+
+        if (activeSource === "iframe" && !iframeUrl) {
+            return res.status(400).json({
+                success: false,
+                message: "Debes ingresar iframe_url para activar esa fuente."
             });
         }
 
