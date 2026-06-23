@@ -34,6 +34,13 @@
         .badge-warn { background: #92400e; color: white; }
         .badge-danger { background: #7f1d1d; color: white; }
         .ip-cell { font-family: 'Courier New', monospace; font-size: 12px; }
+        .stream-grid { display: grid; grid-template-columns: repeat(auto-fit, minmax(230px, 1fr)); gap: 12px; }
+        .field-label { display: block; margin-top: 8px; color: #cbd5e1; font-size: 12px; font-weight: 700; }
+        .stream-actions { display: flex; gap: 10px; flex-wrap: wrap; margin-top: 12px; }
+        .stream-actions button { width: auto; min-width: 170px; }
+        .config-status { margin-top: 10px; padding: 10px; border-radius: 8px; background: #020617; color: #cbd5e1; font-size: 13px; }
+        .config-status.ok { color: #22c55e; border: 1px solid #166534; }
+        .config-status.error { color: #fca5a5; border: 1px solid #991b1b; }
     </style>
 </head>
 <body>
@@ -75,6 +82,53 @@
                 <button class="btn-crear" style="background:#f59e0b" onclick="generarPase(true)">Activar VIP</button>
                 <div id="resSocio" class="res-box" style="color:#f59e0b; border-color:#f59e0b"></div>
             </div>
+        </div>
+
+        <div class="section">
+            <h2>CONTROL DE SEÑAL</h2>
+
+            <div class="stream-grid">
+                <div>
+                    <label class="field-label" for="streamPrimary">Señal principal</label>
+                    <select id="streamPrimary">
+                        <option value="iframe">Iframe</option>
+                        <option value="external">Servidor externo</option>
+                        <option value="bunny">Bunny CDN</option>
+                    </select>
+                </div>
+
+                <div>
+                    <label class="field-label" for="fallback1">Primera alternativa</label>
+                    <select id="fallback1">
+                        <option value="iframe">Iframe</option>
+                        <option value="external">Servidor externo</option>
+                        <option value="bunny">Bunny CDN</option>
+                    </select>
+                </div>
+
+                <div>
+                    <label class="field-label" for="fallback2">Segunda alternativa</label>
+                    <select id="fallback2">
+                        <option value="iframe">Iframe</option>
+                        <option value="external">Servidor externo</option>
+                        <option value="bunny">Bunny CDN</option>
+                    </select>
+                </div>
+            </div>
+
+            <label class="field-label" for="iframeUrl">URL completa del iframe</label>
+            <input type="url" id="iframeUrl" placeholder="https://player.example.com/index.php?..." autocomplete="off">
+
+            <label class="field-label" for="externalStreamUrl">URL HLS del servidor externo</label>
+            <input type="url" id="externalStreamUrl" placeholder="https://live.example.com/live/canal.m3u8" autocomplete="off">
+
+            <div class="stream-actions">
+                <button class="btn-crear" id="btnSaveStream" onclick="guardarConfigStream()">Guardar y aplicar</button>
+                <button class="secondary" onclick="probarIframe()">Probar iframe</button>
+                <button class="secondary" onclick="cargarConfigStream()">Recargar configuración</button>
+            </div>
+
+            <div id="streamConfigStatus" class="config-status">Configuración pendiente de cargar.</div>
         </div>
 
         <div class="section">
@@ -216,6 +270,7 @@
         document.getElementById('adminUserText').innerText = `Administrador: ${email}`;
 
         iniciarAutoRefresh();
+        cargarConfigStream();
     }
 
     async function getAdminToken() {
@@ -236,6 +291,117 @@
                 ...(options.headers || {})
             }
         });
+    }
+
+    function setStreamConfigStatus(message, type = "") {
+        const element = document.getElementById('streamConfigStatus');
+        element.textContent = message;
+        element.className = `config-status${type ? ` ${type}` : ""}`;
+    }
+
+    function isValidHttpsUrl(value) {
+        try {
+            return new URL(String(value || "").trim()).protocol === "https:";
+        } catch (_) {
+            return false;
+        }
+    }
+
+    function setFallbackSelectors(order, primary) {
+        const allSources = ["iframe", "external", "bunny"];
+        const normalized = [primary, ...(Array.isArray(order) ? order : []), ...allSources]
+            .filter((source, index, list) => allSources.includes(source) && list.indexOf(source) === index);
+
+        document.getElementById('streamPrimary').value = normalized[0] || "bunny";
+        document.getElementById('fallback1').value = normalized[1] || "external";
+        document.getElementById('fallback2').value = normalized[2] || "bunny";
+    }
+
+    async function cargarConfigStream() {
+        try {
+            setStreamConfigStatus("Cargando configuración...");
+            const res = await adminFetch('/admin/ver-config-stream', {
+                method: 'POST',
+                body: JSON.stringify({})
+            });
+            const data = await res.json();
+
+            if (!res.ok || !data.success) {
+                throw new Error(data.message || "No se pudo cargar la configuración.");
+            }
+
+            const config = data.config || {};
+            const primary = config.active_source || "bunny";
+            document.getElementById('iframeUrl').value = config.iframe_url || "";
+            document.getElementById('externalStreamUrl').value = config.external_url || "";
+            setFallbackSelectors(config.fallback_order, primary);
+            setStreamConfigStatus(`Activa: ${primary}. Configuración sincronizada.`, "ok");
+
+        } catch (error) {
+            console.error("Error cargando configuración de stream:", error);
+            setStreamConfigStatus(error.message || "Error cargando configuración.", "error");
+        }
+    }
+
+    async function guardarConfigStream() {
+        const primary = document.getElementById('streamPrimary').value;
+        const iframeUrl = document.getElementById('iframeUrl').value.trim();
+        const externalUrl = document.getElementById('externalStreamUrl').value.trim();
+        const order = [
+            primary,
+            document.getElementById('fallback1').value,
+            document.getElementById('fallback2').value
+        ];
+        const uniqueOrder = [...new Set(order)];
+        const saveButton = document.getElementById('btnSaveStream');
+
+        if (uniqueOrder.length !== 3) {
+            return setStreamConfigStatus("La señal principal y las dos alternativas deben ser diferentes.", "error");
+        }
+        if (primary === "iframe" && !isValidHttpsUrl(iframeUrl)) {
+            return setStreamConfigStatus("Ingresa una URL HTTPS válida para el iframe.", "error");
+        }
+        if (iframeUrl && !isValidHttpsUrl(iframeUrl)) {
+            return setStreamConfigStatus("La URL del iframe debe utilizar HTTPS.", "error");
+        }
+        if (!isValidHttpsUrl(externalUrl)) {
+            return setStreamConfigStatus("Ingresa una URL HTTPS válida para el servidor externo.", "error");
+        }
+
+        try {
+            saveButton.disabled = true;
+            setStreamConfigStatus("Guardando configuración...");
+            const res = await adminFetch('/admin/actualizar-config-stream', {
+                method: 'POST',
+                body: JSON.stringify({
+                    active_source: primary,
+                    iframe_url: iframeUrl,
+                    external_url: externalUrl,
+                    fallback_order: order
+                })
+            });
+            const data = await res.json();
+
+            if (!res.ok || !data.success) {
+                throw new Error(data.message || "No se pudo guardar la configuración.");
+            }
+
+            setStreamConfigStatus(`Aplicado: ${primary}. Los usuarios activos se sincronizarán automáticamente.`, "ok");
+
+        } catch (error) {
+            console.error("Error guardando configuración de stream:", error);
+            setStreamConfigStatus(error.message || "Error guardando configuración.", "error");
+        } finally {
+            saveButton.disabled = false;
+        }
+    }
+
+    function probarIframe() {
+        const iframeUrl = document.getElementById('iframeUrl').value.trim();
+        if (!isValidHttpsUrl(iframeUrl)) {
+            return setStreamConfigStatus("Ingresa primero una URL HTTPS válida para el iframe.", "error");
+        }
+        window.open(iframeUrl, '_blank', 'noopener,noreferrer');
     }
 
     function formatearFechaPeru(fecha) {
