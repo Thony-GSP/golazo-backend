@@ -1,1238 +1,724 @@
-const express = require('express');
-const admin = require('firebase-admin');
-const crypto = require('crypto');
-const cors = require('cors');
-const rateLimit = require('express-rate-limit');
+<!DOCTYPE html>
+<html lang="es">
+<head>
+    <meta charset="UTF-8">
 
-// --- 1. FIREBASE ---
-const serviceAccount = JSON.parse(process.env.FIREBASE_JSON);
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
 
-admin.initializeApp({
-    credential: admin.credential.cert(serviceAccount)
-});
+    <meta http-equiv="Cache-Control" content="no-store, no-cache, must-revalidate">
+    <meta http-equiv="Pragma" content="no-cache">
+    <meta http-equiv="Expires" content="0">
 
-const db = admin.firestore();
-const auth = admin.auth();
+    <title>GOLAZO SP - Modo TV</title>
 
-const app = express();
-app.set('trust proxy', 1);
+    <link rel="icon" href="https://i.ibb.co/r2KxcWgG/logo-golazo.png" type="image/png">
 
-// --- 2. CORS RESTRINGIDO FINAL ---
-const allowedOrigins = [
-    'https://golazosp.net',
-    'https://www.golazosp.net',
-    'https://zonagolazo.net',
-    'https://www.zonagolazo.net',
-    'https://thony-gsp.github.io'
-];
+    <script src="https://cdn.jsdelivr.net/npm/promise-polyfill@8/dist/polyfill.min.js"></script>
+    <script src="https://www.gstatic.com/firebasejs/9.17.1/firebase-app-compat.js"></script>
+    <script src="https://www.gstatic.com/firebasejs/9.17.1/firebase-auth-compat.js"></script>
 
-const corsOptions = {
-    origin: function (origin, callback) {
-        if (!origin) {
-            return callback(null, true);
+    <style>
+        * {
+            box-sizing: border-box;
         }
 
-        if (allowedOrigins.includes(origin)) {
-            return callback(null, true);
+        body {
+            margin: 0;
+            background: #000;
+            color: #fff;
+            font-family: Arial, sans-serif;
+            min-height: 100vh;
+            display: flex;
+            flex-direction: column;
+            align-items: center;
         }
 
-        console.warn(`❌ CORS bloqueado para origin: ${origin}`);
-        return callback(null, false);
-    },
-    methods: ['GET', 'POST', 'OPTIONS'],
-    allowedHeaders: ['Content-Type', 'Authorization'],
-    credentials: false,
-    optionsSuccessStatus: 204
-};
+        header {
+            width: 100%;
+            background: #111;
+            padding: 16px 0;
+            text-align: center;
+            border-bottom: 2px solid #e50914;
+        }
 
-app.use(cors(corsOptions));
-app.options(/.*/, cors(corsOptions));
-app.use(express.json());
+        header img {
+            height: 58px;
+        }
 
-// --- 3. RATE LIMITS CONFIGURABLES ---
-const GENERAL_RATE_LIMIT_MAX = parseInt(process.env.GENERAL_RATE_LIMIT_MAX || "120", 10);
-const STREAM_RATE_LIMIT_MAX = parseInt(process.env.STREAM_RATE_LIMIT_MAX || "30", 10);
-const ADMIN_RATE_LIMIT_MAX = parseInt(process.env.ADMIN_RATE_LIMIT_MAX || "20", 10);
-const QUICK_LOGIN_RATE_LIMIT_MAX = parseInt(process.env.QUICK_LOGIN_RATE_LIMIT_MAX || "12", 10);
+        .container {
+            width: 100%;
+            max-width: 1280px;
+            padding: 18px;
+            text-align: center;
+        }
 
-const generalLimiter = rateLimit({
-    windowMs: 60 * 1000,
-    max: GENERAL_RATE_LIMIT_MAX,
-    standardHeaders: true,
-    legacyHeaders: false,
-    skip: (req) => req.method === 'OPTIONS',
-    message: {
-        success: false,
-        code: "RATE_LIMIT",
-        error: "Demasiadas solicitudes."
-    }
-});
+        .tv-title {
+            margin: 12px 0 18px;
+            font-size: 22px;
+            font-weight: 800;
+            color: #fff;
+            text-transform: uppercase;
+        }
 
-const streamLimiter = rateLimit({
-    windowMs: 60 * 1000,
-    max: STREAM_RATE_LIMIT_MAX,
-    standardHeaders: true,
-    legacyHeaders: false,
-    skip: (req) => req.method === 'OPTIONS',
-    message: {
-        success: false,
-        code: "STREAM_RATE_LIMIT",
-        error: "Demasiadas solicitudes de stream."
-    }
-});
+        .video-wrap {
+            width: 100%;
+            background: #000;
+            border: 1px solid #222;
+            border-radius: 8px;
+            overflow: hidden;
+        }
 
-const adminLimiter = rateLimit({
-    windowMs: 60 * 1000,
-    max: ADMIN_RATE_LIMIT_MAX,
-    standardHeaders: true,
-    legacyHeaders: false,
-    skip: (req) => req.method === 'OPTIONS',
-    message: {
-        success: false,
-        code: "ADMIN_RATE_LIMIT",
-        error: "Demasiadas solicitudes administrativas."
-    }
-});
+        video {
+            width: 100%;
+            aspect-ratio: 16 / 9;
+            background: #000;
+            display: block;
+        }
 
-const quickLoginLimiter = rateLimit({
-    windowMs: 60 * 1000,
-    max: QUICK_LOGIN_RATE_LIMIT_MAX,
-    standardHeaders: true,
-    legacyHeaders: false,
-    skip: (req) => req.method === 'OPTIONS',
-    message: {
-        success: false,
-        code: "QUICK_LOGIN_RATE_LIMIT",
-        error: "Demasiados intentos de código. Intenta nuevamente en un momento."
-    }
-});
+        #status {
+            margin-top: 18px;
+            color: #25d366;
+            font-weight: bold;
+            text-transform: uppercase;
+            font-size: 18px;
+            padding: 14px;
+            background: rgba(255, 255, 255, 0.05);
+            border-radius: 8px;
+        }
 
-app.use(generalLimiter);
+        .help {
+            margin-top: 12px;
+            color: #aaa;
+            font-size: 15px;
+            line-height: 1.45;
+        }
 
-// --- 4. CONFIGURACIÓN ---
-const BUNNY_CDN_URL = 'https://stream.golazosp.net';
-const BUNNY_SECURITY_KEY = process.env.BUNNY_KEY.trim();
-const STREAM_PATH = '/stream/master.m3u8';
-const ADMIN_SECRET = process.env.ADMIN_SECRET;
+        .mode-switch {
+            margin-top: 16px;
+            display: flex;
+            gap: 10px;
+            justify-content: center;
+            flex-wrap: wrap;
+        }
 
-// ✅ NUEVO: selector de fuente de stream.
-// Valores permitidos:
-// bunny    = usa Bunny CDN con token firmado.
-// external = usa la señal directa de live.site.pe.
-const STREAM_MODE_DEFAULT = String(process.env.STREAM_MODE || "bunny").trim().toLowerCase();
-const EXTERNAL_STREAM_URL_DEFAULT = String(
-    process.env.EXTERNAL_STREAM_URL || "https://live.site.pe/live/golazosp.m3u8"
-).trim();
+        .mode-btn {
+            border: 1px solid #444;
+            background: #181818;
+            color: #ddd;
+            padding: 12px 15px;
+            border-radius: 999px;
+            font-size: 15px;
+            font-weight: bold;
+            cursor: pointer;
+        }
 
-// Cache para no leer Firestore en cada /generate-stream.
-const STREAM_CONFIG_CACHE_TTL_MS = parseInt(
-    process.env.STREAM_CONFIG_CACHE_TTL_MS || "15000",
-    10
-);
+        .mode-btn:hover {
+            background: #262626;
+            color: #fff;
+        }
 
-let cachedStreamConfig = null;
-let cachedStreamConfigExpiresAt = 0;
+        .mode-btn.active {
+            background: #e50914;
+            border-color: #e50914;
+            color: #fff;
+            cursor: default;
+        }
 
-// 🔐 Código rápido
-const QUICK_CODE_SECRET = (process.env.QUICK_CODE_SECRET || process.env.BUNNY_KEY || "").trim();
+        .actions {
+            margin-top: 18px;
+            display: flex;
+            gap: 12px;
+            justify-content: center;
+            flex-wrap: wrap;
+        }
 
-// 🌐 URL pública de la web para generar links rápidos
-const APP_BASE_URL = process.env.APP_BASE_URL || "https://golazosp.net";
+        button.action-btn {
+            background: #e50914;
+            color: #fff;
+            border: 0;
+            border-radius: 8px;
+            padding: 13px 18px;
+            font-size: 16px;
+            font-weight: 800;
+            cursor: pointer;
+        }
 
-// --- 4.1 OPTIMIZACIÓN DE ESCALA ---
-const HEARTBEAT_WRITE_MIN_INTERVAL_MS = parseInt(
-    process.env.HEARTBEAT_WRITE_MIN_INTERVAL_MS || "90000",
-    10
-);
+        button.secondary {
+            background: #222;
+            border: 1px solid #555;
+        }
 
-const ACTIVE_SESSION_WINDOW_MS = parseInt(
-    process.env.ACTIVE_SESSION_WINDOW_MS || "150000",
-    10
-);
+        @media (max-width: 700px) {
+            header img {
+                height: 48px;
+            }
 
-const BUNNY_TOKEN_DURATION_SECONDS = parseInt(
-    process.env.BUNNY_TOKEN_DURATION_SECONDS || "600",
-    10
-);
+            .container {
+                padding: 12px;
+            }
 
-// --- 5. HEALTH CHECK ---
-app.get('/', (req, res) => {
-    res.json({
-        success: true,
-        service: "Golazo Stream Backend",
-        status: "online",
-        version: "FASE 9 - selector Bunny / External Stream",
-        stream_mode_default: STREAM_MODE_DEFAULT
-    });
-});
+            #status {
+                font-size: 15px;
+            }
 
-// --- 6. HELPERS GENERALES ---
-function getTimestampMillis(value) {
-    return value && typeof value.toMillis === "function"
-        ? value.toMillis()
-        : 0;
-}
+            .tv-title {
+                font-size: 18px;
+            }
 
-function shouldWriteHeartbeat(userData, now, minIntervalMs = HEARTBEAT_WRITE_MIN_INTERVAL_MS) {
-    const lastHeartbeatMillis = getTimestampMillis(userData.last_heartbeat);
+            .mode-btn,
+            button.action-btn {
+                width: 100%;
+            }
+        }
+    </style>
+</head>
 
-    if (!lastHeartbeatMillis) return true;
-    return now - lastHeartbeatMillis >= minIntervalMs;
-}
+<body>
+    <header>
+        <img src="https://i.ibb.co/r2KxcWgG/logo-golazo.png" alt="GOLAZO SP">
+    </header>
 
-function nowTimestamp() {
-    return admin.firestore.Timestamp.now();
-}
+    <main class="container">
+        <div class="tv-title">Modo Smart TV</div>
 
-function normalizeClientId(value) {
-    const normalized = String(value || "").trim();
+        <div class="video-wrap">
+            <video
+                id="video"
+                controls
+                autoplay
+                playsinline
+                preload="auto"
+            ></video>
+        </div>
 
-    if (!/^[a-zA-Z0-9_-]{8,128}$/.test(normalized)) {
-        return "";
-    }
+        <div id="status">⌛ VERIFICANDO ACCESO...</div>
 
-    return normalized;
-}
+        <div class="mode-switch">
+            <button class="mode-btn active" type="button">
+                📺 Modo TV
+            </button>
 
-async function verifyUserRequest(req) {
-    const authHeader = req.headers.authorization || "";
-    const tokenFromHeader = authHeader.startsWith("Bearer ")
-        ? authHeader.replace("Bearer ", "").trim()
-        : "";
-    const tokenFromBody = String(req.body?.id_token || "").trim();
-    const idToken = tokenFromHeader || tokenFromBody;
+            <button class="mode-btn" type="button" onclick="window.location.href='/en-directo.html?force=normal'">
+                💻 Cel / Laptop / PC / Tablet
+            </button>
+        </div>
 
-    if (!idToken) return null;
+        <div class="help">
+            Este modo prioriza estabilidad para Smart TV. Si el video no inicia automáticamente,
+            presiona Play en el control remoto.
+        </div>
 
-    try {
-        return await auth.verifyIdToken(idToken);
-    } catch (_) {
-        return null;
-    }
-}
+        <div class="actions">
+            <button class="action-btn" id="btnTakeover" style="display:none" onclick="continuarEnEsteTelevisor()">CONTINUAR EN ESTA TV</button>
+            <button class="action-btn" onclick="intentarReproducir()">▶️ Reproducir</button>
+            <button class="action-btn secondary" onclick="location.reload()">🔄 Recargar</button>
+            <button class="action-btn secondary" onclick="cerrarSesion(true)">Salir</button>
+        </div>
+    </main>
 
-function normalizeStreamSource(value) {
-    const source = String(value || "").trim().toLowerCase();
+    <script src="https://cdn.jsdelivr.net/npm/hls.js@1.5.15"></script>
 
-    if (source === "external") return "external";
-    if (source === "bunny") return "bunny";
-
-    return "bunny";
-}
-
-function isValidHttpUrl(value) {
-    try {
-        const url = new URL(String(value || "").trim());
-        return url.protocol === "http:" || url.protocol === "https:";
-    } catch (_) {
-        return false;
-    }
-}
-
-// ✅ NUEVO: lee la fuente activa desde Firestore.
-// Ruta Firestore recomendada:
-// collection: config
-// document: stream
-//
-// Ejemplo external:
-// {
-//   active_source: "external",
-//   external_url: "https://live.site.pe/live/golazosp.m3u8"
-// }
-//
-// Ejemplo bunny:
-// {
-//   active_source: "bunny",
-//   external_url: "https://live.site.pe/live/golazosp.m3u8"
-// }
-async function getActiveStreamConfig() {
-    const now = Date.now();
-
-    if (cachedStreamConfig && now < cachedStreamConfigExpiresAt) {
-        return cachedStreamConfig;
-    }
-
-    let config = {
-        active_source: normalizeStreamSource(STREAM_MODE_DEFAULT),
-        external_url: EXTERNAL_STREAM_URL_DEFAULT
-    };
-
-    try {
-        const doc = await db.collection("config").doc("stream").get();
-
-        if (doc.exists) {
-            const data = doc.data() || {};
-
-            config = {
-                active_source: normalizeStreamSource(data.active_source || STREAM_MODE_DEFAULT),
-                external_url: String(data.external_url || EXTERNAL_STREAM_URL_DEFAULT).trim()
+<!-- Modo TV ES5: evita async/fetch/clases en navegadores antiguos. -->
+    <script>
+        (function () {
+            var firebaseConfig = {
+                apiKey: "AIzaSyCJ9fHy1ldvHFp6NdMexfoz4KR4d54j_Hw",
+                authDomain: "golazostreamperu-de4fd.firebaseapp.com",
+                projectId: "golazostreamperu-de4fd",
+                storageBucket: "golazostreamperu-de4fd.firebasestorage.app",
+                messagingSenderId: "940862641322",
+                appId: "1:940862641322:web:a2afefcc21a5e5245decd3"
             };
-        }
-
-        if (config.active_source === "external" && !isValidHttpUrl(config.external_url)) {
-            console.warn("⚠️ external_url inválida. Se usará Bunny como respaldo.");
-            config.active_source = "bunny";
-        }
-
-        cachedStreamConfig = config;
-        cachedStreamConfigExpiresAt = now + STREAM_CONFIG_CACHE_TTL_MS;
-
-        return config;
-
-    } catch (error) {
-        console.error("❌ Error leyendo config stream desde Firestore:", error.message);
-
-        cachedStreamConfig = config;
-        cachedStreamConfigExpiresAt = now + STREAM_CONFIG_CACHE_TTL_MS;
-
-        return config;
-    }
-}
-
-// --- 7. GENERADOR DE TOKEN BUNNY PARA DIRECTORIOS (BUNNY TOKEN V2 HMAC-SHA256) ---
-function base64Url(buffer) {
-    return buffer.toString("base64")
-        .replace(/\+/g, "-")
-        .replace(/\//g, "_")
-        .replace(/=/g, "")
-        .replace(/\n/g, "");
-}
-
-function generateBunnyTokenForStream(path, securityKey, duration = 120) {
-    const expires = Math.floor(Date.now() / 1000) + duration;
-
-    const tokenPath = "/stream/";
-    const signaturePath = tokenPath;
-    const signingData = `token_path=${tokenPath}`;
-    const userIp = "";
-
-    const message = `${signaturePath}${expires}${signingData}${userIp}`;
-
-    const token = "HS256-" + base64Url(
-        crypto.createHmac("sha256", securityKey)
-            .update(message)
-            .digest()
-    );
-
-    const encodedTokenPath = encodeURIComponent(tokenPath);
-
-    return {
-        token,
-        expires,
-        token_path: tokenPath,
-        url: `${BUNNY_CDN_URL}/bcdn_token=${token}&expires=${expires}&token_path=${encodedTokenPath}${path}`
-    };
-}
-
-// --- 8. MIDDLEWARE ADMIN ESTRICTO ---
-async function verifyAdmin(req, res, next) {
-    const authHeader = req.headers.authorization || "";
-
-    if (!authHeader.startsWith("Bearer ")) {
-        return res.status(401).json({
-            success: false,
-            message: "Falta token de administrador"
-        });
-    }
-
-    const idToken = authHeader.replace("Bearer ", "").trim();
-
-    try {
-        const decodedToken = await auth.verifyIdToken(idToken);
-
-        if (decodedToken.admin === true) {
-            return next();
-        }
-
-        return res.status(403).json({
-            success: false,
-            message: "Permisos denegados. No eres administrador."
-        });
-
-    } catch (error) {
-        console.error("❌ Token admin inválido:", error.message);
-
-        return res.status(401).json({
-            success: false,
-            message: "Token de administrador inválido o expirado"
-        });
-    }
-}
-
-// --- 9. EXTRAER IP y USER-AGENT ---
-function getClientData(req) {
-    const forwardedFor = req.headers['x-forwarded-for'];
-
-    const ip = forwardedFor
-        ? forwardedFor.split(',')[0].trim()
-        : (req.ip || req.connection.remoteAddress || 'Desconocida');
-
-    const userAgent = req.headers['user-agent'] || 'Desconocido';
-
-    return { ip, userAgent };
-}
-
-// --- 10. CÓDIGO RÁPIDO DE ACCESO ---
-function normalizarCodigoRapido(value) {
-    return String(value || "")
-        .replace(/\D/g, "")
-        .trim();
-}
-
-function hashQuickCode(code) {
-    if (!QUICK_CODE_SECRET) {
-        throw new Error("Falta QUICK_CODE_SECRET o BUNNY_KEY para firmar códigos rápidos.");
-    }
-
-    return crypto
-        .createHmac("sha256", QUICK_CODE_SECRET)
-        .update(String(code).trim())
-        .digest("hex");
-}
-
-function generarCodigoSeisDigitos() {
-    return crypto.randomInt(100000, 1000000).toString();
-}
-
-async function generarCodigoRapidoUnico(maxIntentos = 20) {
-    for (let i = 0; i < maxIntentos; i++) {
-        const codigo = generarCodigoSeisDigitos();
-        const hash = hashQuickCode(codigo);
-
-        const snap = await db.collection("usuarios")
-            .where("quick_code_hash", "==", hash)
-            .limit(1)
-            .get();
-
-        if (snap.empty) {
-            return { codigo, hash };
-        }
-    }
-
-    throw new Error("No se pudo generar un código rápido único.");
-}
-
-function generarPasswordInternoSeguro() {
-    return crypto.randomBytes(24).toString("base64url");
-}
-
-// --- 11. LOGIN RÁPIDO POR CÓDIGO ---
-app.post('/auth/quick-login', quickLoginLimiter, async (req, res) => {
-    try {
-        const codigo = normalizarCodigoRapido(req.body?.codigo);
-
-        if (!/^\d{6}$/.test(codigo)) {
-            return res.status(400).json({
-                success: false,
-                code: "INVALID_CODE",
-                error: "Código inválido."
-            });
-        }
-
-        const codeHash = hashQuickCode(codigo);
-
-        const snap = await db.collection("usuarios")
-            .where("quick_code_hash", "==", codeHash)
-            .limit(1)
-            .get();
-
-        if (snap.empty) {
-            return res.status(401).json({
-                success: false,
-                code: "CODE_NOT_FOUND",
-                error: "Código incorrecto."
-            });
-        }
-
-        const doc = snap.docs[0];
-        const uid = doc.id;
-        const userData = doc.data();
-
-        if (!userData.fecha_expiracion || typeof userData.fecha_expiracion.toMillis !== "function") {
-            return res.status(403).json({
-                success: false,
-                code: "NO_EXPIRATION",
-                error: "Pase sin expiración."
-            });
-        }
-
-        const expiraMillis = userData.fecha_expiracion.toMillis();
-        const ahora = Date.now();
-
-        if (expiraMillis <= ahora) {
-            await doc.ref.update({
-                last_status: "expired",
-                last_heartbeat: nowTimestamp()
-            });
-
-            return res.status(403).json({
-                success: false,
-                code: "PASS_EXPIRED",
-                error: "El pase ha caducado."
-            });
-        }
-
-        if (
-            userData.last_status === "revoked_by_admin" ||
-            String(userData.session_id || "").startsWith("revoked_")
-        ) {
-            return res.status(403).json({
-                success: false,
-                code: "SESSION_REVOKED",
-                error: "Pase revocado por administración."
-            });
-        }
-
-        const { ip, userAgent } = getClientData(req);
-
-        const customToken = await auth.createCustomToken(uid, {
-            login_mode: "quick_code",
-            tipo_acceso: "partido"
-        });
-
-        await doc.ref.update({
-            last_login_method: "quick_code",
-            last_quick_login_at: nowTimestamp(),
-            last_ip: ip,
-            last_user_agent: userAgent
-        });
-
-        return res.json({
-            success: true,
-            customToken,
-            expires_at: expiraMillis
-        });
-
-    } catch (error) {
-        console.error("❌ Error en /auth/quick-login:", error);
-
-        return res.status(500).json({
-            success: false,
-            code: "SERVER_ERROR",
-            error: "Error del servidor."
-        });
-    }
-});
-
-// --- 12. GENERATE STREAM OPTIMIZADO + SELECTOR BUNNY/EXTERNAL ---
-app.get('/generate-stream', streamLimiter, async (req, res) => {
-    try {
-        const authHeader = req.headers.authorization || "";
-
-        if (!authHeader.startsWith("Bearer ")) {
-            return res.status(401).json({
-                success: false,
-                code: "NO_AUTH"
-            });
-        }
-
-        const idToken = authHeader.replace("Bearer ", "").trim();
-
-        let decodedToken;
-        try {
-            decodedToken = await auth.verifyIdToken(idToken);
-        } catch (authError) {
-            return res.status(401).json({
-                success: false,
-                code: "INVALID_AUTH"
-            });
-        }
-
-        const uid = decodedToken.uid;
-        const requestedSessionId = normalizeClientId(req.query.session_id);
-        const deviceId = normalizeClientId(req.query.device_id);
-        const pageId = normalizeClientId(req.query.page_id);
-        const takeoverRequested = req.query.takeover === "1";
-
-        const userRef = db.collection('usuarios').doc(uid);
-        const userDoc = await userRef.get();
-
-        if (!userDoc.exists) {
-            return res.status(403).json({
-                success: false,
-                code: "PASS_INACTIVE"
-            });
-        }
-
-        const userData = userDoc.data();
-
-        if (!userData.fecha_expiracion) {
-            return res.status(403).json({
-                success: false,
-                code: "NO_EXPIRATION"
-            });
-        }
-
-        const ahora = Date.now();
-        const expiraMillis = userData.fecha_expiracion.toMillis();
-        const segundosRestantesPase = Math.floor((expiraMillis - ahora) / 1000);
-
-        if (segundosRestantesPase <= 0) {
-            return res.status(403).json({
-                success: false,
-                code: "PASS_EXPIRED",
-                error: "Pase expirado"
-            });
-        }
-
-        if (
-            requestedSessionId &&
-            (
-                userData.last_status === "revoked_by_admin" ||
-                String(userData.session_id || "").startsWith("revoked_")
-            )
-        ) {
-            return res.status(403).json({
-                success: false,
-                code: "SESSION_REVOKED",
-                error: "Sesión revocada por administración"
-            });
-        }
-
-        const lastHeartbeatMillis = getTimestampMillis(userData.last_heartbeat);
-
-        const sesionActivaReciente = Boolean(
-            userData.session_id &&
-            !String(userData.session_id).startsWith("revoked_") &&
-            userData.last_status !== "expired" &&
-            userData.last_status !== "revoked_by_admin" &&
-            lastHeartbeatMillis &&
-            ahora - lastHeartbeatMillis < ACTIVE_SESSION_WINDOW_MS
-        );
-
-        const mismaSesion = Boolean(
-            requestedSessionId && requestedSessionId === userData.session_id
-        );
-
-        // Un session_id inventado o antiguo nunca debe saltarse el bloqueo.
-        if (sesionActivaReciente && !mismaSesion && !takeoverRequested) {
-            return res.status(409).json({
-                success: false,
-                code: "SESSION_ALREADY_ACTIVE",
-                error: "Ya existe una sesión activa para este usuario.",
-                can_takeover: true
-            });
-        }
-
-        const { ip, userAgent } = getClientData(req);
-
-        let sessionIdFinal = userData.session_id || "";
-
-        if (!mismaSesion) {
-            sessionIdFinal = crypto.randomUUID();
-
-            await userRef.update({
-                session_id: sessionIdFinal,
-                session_started_at: nowTimestamp(),
-                last_heartbeat: nowTimestamp(),
-                last_status: "stream_started",
-                last_ip: ip,
-                last_user_agent: userAgent,
-                active_device_id: deviceId,
-                active_page_id: pageId,
-                last_takeover_at: takeoverRequested ? nowTimestamp() : null
-            });
-
-        } else {
-            const sessionPatch = {};
-
-            // Actualizar page_id en cada carga evita que el cierre de una página
-            // anterior libere accidentalmente una sesión recién reanudada.
-            if (pageId && pageId !== userData.active_page_id) {
-                sessionPatch.active_page_id = pageId;
+            var BACKEND_URL = "https://golazo-backend-ellz.onrender.com";
+            var HEARTBEAT_MS = 15000;
+            var RENEWAL_MS = 480000;
+            var DEVICE_ID_KEY = "golazo_device_id";
+            var SESSION_KEY_PREFIX = "golazo_stream_session_";
+            var pageId = "page_" + Date.now() + "_" + Math.random().toString(36).slice(2);
+            var deviceId = obtenerDeviceId();
+            var currentUid = "";
+            var currentSessionId = "";
+            var currentStreamUrl = "";
+            var currentStreamSource = "bunny";
+            var currentIdToken = "";
+            var hls = null;
+            var nativeMode = false;
+            var heartbeatTimer = null;
+            var renewalTimer = null;
+            var closing = false;
+            var hlsRecoveryInProgress = false;
+            var lastHlsRecoveryAt = 0;
+            var networkRecoveryAttempts = 0;
+            var mediaRecoveryAttempts = 0;
+            var video = document.getElementById("video");
+            var statusEl = document.getElementById("status");
+
+            function setStatus(text) {
+                statusEl.innerText = text;
             }
 
-            if (deviceId && deviceId !== userData.active_device_id) {
-                sessionPatch.active_device_id = deviceId;
+            function randomId(prefix) {
+                return prefix + "_" + Date.now() + "_" + Math.random().toString(36).slice(2) + "_" + Math.random().toString(36).slice(2);
             }
 
-            if (shouldWriteHeartbeat(userData, ahora)) {
-                sessionPatch.last_heartbeat = nowTimestamp();
-                sessionPatch.last_status = "stream_renewed";
-                sessionPatch.last_ip = ip;
-                sessionPatch.last_user_agent = userAgent;
+            function obtenerDeviceId() {
+                var value;
+                try {
+                    value = localStorage.getItem(DEVICE_ID_KEY);
+                    if (!value) {
+                        value = randomId("device");
+                        localStorage.setItem(DEVICE_ID_KEY, value);
+                    }
+                    return value;
+                } catch (_) {
+                    return randomId("device");
+                }
             }
 
-            if (Object.keys(sessionPatch).length) {
-                await userRef.update({
-                    ...sessionPatch
+            function leerSesion(uid) {
+                try {
+                    return localStorage.getItem(SESSION_KEY_PREFIX + uid) ||
+                        sessionStorage.getItem("golazo_current_session_id") || "";
+                } catch (_) {
+                    return "";
+                }
+            }
+
+            function guardarSesion(uid, sessionId) {
+                try {
+                    localStorage.setItem(SESSION_KEY_PREFIX + uid, sessionId);
+                    sessionStorage.setItem("golazo_current_session_id", sessionId);
+                } catch (_) {}
+            }
+
+            function borrarSesion() {
+                try {
+                    if (currentUid) localStorage.removeItem(SESSION_KEY_PREFIX + currentUid);
+                    sessionStorage.removeItem("golazo_current_session_id");
+                } catch (_) {}
+            }
+
+            function requestJson(method, url, token, body, callback) {
+                var xhr = new XMLHttpRequest();
+                xhr.open(method, url, true);
+                xhr.timeout = 20000;
+                if (token) xhr.setRequestHeader("Authorization", "Bearer " + token);
+                if (body) xhr.setRequestHeader("Content-Type", "application/json");
+                xhr.onreadystatechange = function () {
+                    var data;
+                    if (xhr.readyState !== 4) return;
+                    try {
+                        data = JSON.parse(xhr.responseText || "{}");
+                    } catch (_) {
+                        data = { code: "INVALID_RESPONSE" };
+                    }
+                    callback(null, xhr.status, data);
+                };
+                xhr.onerror = function () { callback(new Error("network"), 0, {}); };
+                xhr.ontimeout = function () { callback(new Error("timeout"), 0, {}); };
+                xhr.send(body ? JSON.stringify(body) : null);
+            }
+
+            function normalizarUrlTv(url) {
+                return String(url || "")
+                    .replace("/stream/720p/index.m3u8", "/stream/master.m3u8")
+                    .replace("/720p/index.m3u8", "/master.m3u8");
+            }
+
+            function aplicarTokenBunny(url) {
+                var current;
+                var target;
+                var streamIndex;
+                var currentStreamIndex;
+                var authPrefix;
+                try {
+                    current = document.createElement("a");
+                    current.href = currentStreamUrl;
+                    target = document.createElement("a");
+                    target.href = url;
+
+                    if (target.hostname !== current.hostname) return url;
+                    streamIndex = target.pathname.indexOf("/stream/");
+                    if (streamIndex < 0) return target.href;
+
+                    currentStreamIndex = current.pathname.indexOf("/stream/");
+                    authPrefix = currentStreamIndex > 0 ? current.pathname.slice(0, currentStreamIndex) : "";
+
+                    if (authPrefix && target.pathname.indexOf(authPrefix) !== 0) {
+                        return current.protocol + "//" + current.host + authPrefix +
+                            target.pathname.slice(streamIndex) + (target.search || "");
+                    }
+                    return target.href;
+                } catch (_) {
+                    return url;
+                }
+            }
+
+            function crearLoaderTv() {
+                var BaseLoader = Hls.DefaultConfig.loader;
+                return function TvLoader(config) {
+                    var loader = new BaseLoader(config);
+                    var originalLoad = loader.load;
+                    loader.load = function (context, loaderConfig, callbacks) {
+                        if (context.type === "manifest" && currentStreamUrl) {
+                            context.url = currentStreamUrl;
+                        } else if (context.url) {
+                            context.url = aplicarTokenBunny(context.url);
+                        }
+                        return originalLoad.call(loader, context, loaderConfig, callbacks);
+                    };
+                    return loader;
+                };
+            }
+
+            function destruirPlayer() {
+                if (hls) {
+                    try { hls.destroy(); } catch (_) {}
+                    hls = null;
+                }
+                try {
+                    video.pause();
+                    video.removeAttribute("src");
+                    video.load();
+                } catch (_) {}
+            }
+
+            window.intentarReproducir = function () {
+                var result;
+                try {
+                    fijarVelocidadNormal();
+                    result = video.play();
+                    if (result && result.catch) {
+                        result.catch(function () {
+                            setStatus("PRESIONA PLAY PARA INICIAR LA SEÑAL.");
+                        });
+                    }
+                } catch (_) {
+                    setStatus("PRESIONA PLAY PARA INICIAR LA SEÑAL.");
+                }
+            };
+
+            function fijarVelocidadNormal() {
+                try {
+                    video.defaultPlaybackRate = 1;
+                    if (video.playbackRate !== 1) video.playbackRate = 1;
+                    if ("preservesPitch" in video) video.preservesPitch = true;
+                    if ("webkitPreservesPitch" in video) video.webkitPreservesPitch = true;
+                } catch (_) {}
+            }
+
+            video.addEventListener("ratechange", function () {
+                if (video.playbackRate !== 1) fijarVelocidadNormal();
+            });
+
+            function liberarBloqueoRecuperacion(delay) {
+                setTimeout(function () {
+                    hlsRecoveryInProgress = false;
+                }, delay || 3000);
+            }
+
+            function manejarErrorHls(data) {
+                var now;
+                if (!data || !data.fatal || !hls) return;
+
+                now = Date.now();
+                if (hlsRecoveryInProgress || now - lastHlsRecoveryAt < 2500) return;
+
+                hlsRecoveryInProgress = true;
+                lastHlsRecoveryAt = now;
+                setStatus("RECUPERANDO SEÑAL TV...");
+
+                if (data.type === Hls.ErrorTypes.NETWORK_ERROR) {
+                    networkRecoveryAttempts += 1;
+
+                    if (networkRecoveryAttempts <= 1) {
+                        try { hls.startLoad(); } catch (_) {}
+                        liberarBloqueoRecuperacion(3000);
+                    } else {
+                        networkRecoveryAttempts = 0;
+                        renovarUrl(true);
+                        liberarBloqueoRecuperacion(5000);
+                    }
+                    return;
+                }
+
+                if (data.type === Hls.ErrorTypes.MEDIA_ERROR) {
+                    mediaRecoveryAttempts += 1;
+
+                    try {
+                        if (mediaRecoveryAttempts >= 2 && hls.swapAudioCodec) {
+                            hls.swapAudioCodec();
+                        }
+                        hls.recoverMediaError();
+                    } catch (_) {
+                        renovarUrl(true);
+                    }
+
+                    if (mediaRecoveryAttempts >= 3) mediaRecoveryAttempts = 0;
+                    liberarBloqueoRecuperacion(4000);
+                    return;
+                }
+
+                renovarUrl(true);
+                liberarBloqueoRecuperacion(5000);
+            }
+
+            function iniciarVideoNativo(url) {
+                nativeMode = true;
+                video.src = url;
+                video.onloadedmetadata = function () {
+                    try {
+                        if (video.seekable && video.seekable.length) {
+                            var end = video.seekable.end(video.seekable.length - 1);
+                            var start = video.seekable.start(0);
+                            video.currentTime = Math.max(start, end - 16);
+                        }
+                    } catch (_) {}
+                    fijarVelocidadNormal();
+                    setStatus("EN VIVO - MODO TV");
+                    window.intentarReproducir();
+                };
+                video.onerror = function () {
+                    setStatus("ERROR DE REPRODUCCIÓN. PRUEBA RECARGAR.");
+                };
+            }
+
+            function iniciarVideo(url) {
+                var nativeSupported;
+                destruirPlayer();
+                nativeMode = false;
+                setStatus("CARGANDO REPRODUCTOR TV...");
+                nativeSupported = video.canPlayType && video.canPlayType("application/vnd.apple.mpegurl");
+
+                if (window.Hls && Hls.isSupported()) {
+                    hls = new Hls({
+                        liveSyncDuration: 16,
+                        liveMaxLatencyDuration: 22,
+                        maxLiveSyncPlaybackRate: 1.0,
+                        maxBufferLength: 24,
+                        maxMaxBufferLength: 32,
+                        backBufferLength: 16,
+                        maxBufferHole: 1,
+                        nudgeOffset: 0.1,
+                        nudgeMaxRetry: 5,
+                        startFragPrefetch: true,
+                        fragLoadingTimeOut: 25000,
+                        fragLoadingMaxRetry: 10,
+                        manifestLoadingMaxRetry: 10,
+                        lowLatencyMode: false,
+                        loader: crearLoaderTv()
+                    });
+                    hls.loadSource(url);
+                    hls.attachMedia(video);
+                    hls.on(Hls.Events.MANIFEST_PARSED, function () {
+                        hlsRecoveryInProgress = false;
+                        networkRecoveryAttempts = 0;
+                        mediaRecoveryAttempts = 0;
+                        fijarVelocidadNormal();
+                        setStatus("EN VIVO - MODO TV");
+                        window.intentarReproducir();
+                    });
+
+                    hls.on(Hls.Events.FRAG_BUFFERED, function () {
+                        networkRecoveryAttempts = 0;
+                        mediaRecoveryAttempts = 0;
+                    });
+
+                    hls.on(Hls.Events.ERROR, function (event, data) {
+                        console.warn("HLS TV error:", data);
+                        manejarErrorHls(data);
+                    });
+                    return;
+                }
+
+                // Respaldo para TVs sin MediaSource/Hls.js.
+                if (nativeSupported) {
+                    iniciarVideoNativo(url);
+                    return;
+                }
+
+                setStatus("ESTA TV NO SOPORTA HLS EN EL NAVEGADOR.");
+            }
+
+            function mostrarSesionActiva() {
+                setStatus("ESTA CUENTA YA ESTÁ ABIERTA EN OTRO DISPOSITIVO.");
+                document.getElementById("btnTakeover").style.display = "inline-block";
+            }
+
+            function manejarError(data) {
+                var code = data.code || data.motivo || "ERROR";
+                if (code === "SESSION_ALREADY_ACTIVE") {
+                    mostrarSesionActiva();
+                } else if (code === "PASS_EXPIRED" || code === "expirado") {
+                    setStatus("TU PASE HA CADUCADO.");
+                    window.cerrarSesion(false);
+                } else if (code === "SESSION_REVOKED" || code === "revocado") {
+                    setStatus("TU SESIÓN FUE FINALIZADA POR ADMINISTRACIÓN.");
+                    window.cerrarSesion(false);
+                } else if (code === "pirateria") {
+                    setStatus("SESIÓN TRASLADADA A OTRO DISPOSITIVO.");
+                    window.cerrarSesion(false);
+                } else if (code === "NO_AUTH" || code === "INVALID_AUTH" || code === "missing_session") {
+                    window.cerrarSesion(true);
+                } else {
+                    setStatus("NO SE PUDO VALIDAR TU ACCESO.");
+                }
+            }
+
+            function iniciarTV(user, takeover) {
+                setStatus(takeover ? "TRASLADANDO SESIÓN A ESTA TV..." : "OBTENIENDO SEÑAL TV...");
+                user.getIdToken().then(function (idToken) {
+                    var saved = leerSesion(currentUid);
+                    var query = "device_id=" + encodeURIComponent(deviceId) +
+                        "&page_id=" + encodeURIComponent(pageId);
+                    currentIdToken = idToken;
+                    if (saved) query += "&session_id=" + encodeURIComponent(saved);
+                    if (takeover) query += "&takeover=1";
+
+                    requestJson("GET", BACKEND_URL + "/generate-stream?" + query, idToken, null,
+                        function (error, status, data) {
+                            if (error || status < 200 || status >= 300 || !data.stream_url) {
+                                manejarError(data || {});
+                                return;
+                            }
+
+                            currentSessionId = data.session_id;
+                            currentStreamUrl = normalizarUrlTv(data.stream_url);
+                            currentStreamSource = data.stream_source || "bunny";
+                            guardarSesion(currentUid, currentSessionId);
+                            document.getElementById("btnTakeover").style.display = "none";
+                            iniciarVideo(currentStreamUrl);
+                            programarHeartbeat();
+                            programarRenovacion();
+                        });
+                }).catch(function () {
+                    setStatus("NO SE PUDO VALIDAR LA SESIÓN EN ESTA TV.");
                 });
             }
-        }
 
-        const tokenDuration = Math.min(BUNNY_TOKEN_DURATION_SECONDS, segundosRestantesPase);
+            function verificarSesion() {
+                var user = firebase.auth().currentUser;
+                if (!user || !currentSessionId || closing) return;
+                user.getIdToken().then(function (token) {
+                    currentIdToken = token;
+                    requestJson("POST", BACKEND_URL + "/check-session", token, {
+                        session_id: currentSessionId,
+                        page_id: pageId
+                    }, function (error, status, data) {
+                        if (!error && data && data.valid === false) manejarError(data);
+                    });
+                });
+            }
 
-        // ✅ NUEVO: aquí se decide si se devuelve Bunny o live.site.pe.
-        const streamConfig = await getActiveStreamConfig();
+            function renovarUrl(restart) {
+                var user = firebase.auth().currentUser;
+                if (!user || !currentSessionId || closing) return;
+                user.getIdToken().then(function (token) {
+                    var url = BACKEND_URL + "/generate-stream?session_id=" + encodeURIComponent(currentSessionId) +
+                        "&device_id=" + encodeURIComponent(deviceId) + "&page_id=" + encodeURIComponent(pageId);
+                    currentIdToken = token;
+                    requestJson("GET", url, token, null, function (error, status, data) {
+                        if (error || !data || !data.stream_url) {
+                            if (data) manejarError(data);
+                            return;
+                        }
+                        currentStreamUrl = normalizarUrlTv(data.stream_url);
+                        currentStreamSource = data.stream_source || currentStreamSource;
+                        currentSessionId = data.session_id || currentSessionId;
+                        guardarSesion(currentUid, currentSessionId);
+                        if (restart || nativeMode) iniciarVideo(currentStreamUrl);
+                    });
+                });
+            }
 
-        let finalUrl = "";
-        let bunnyExpires = Math.floor(Date.now() / 1000) + tokenDuration;
-        let streamSource = streamConfig.active_source;
+            function programarHeartbeat() {
+                if (heartbeatTimer) clearTimeout(heartbeatTimer);
+                heartbeatTimer = setTimeout(function tick() {
+                    verificarSesion();
+                    if (!closing) heartbeatTimer = setTimeout(tick, HEARTBEAT_MS);
+                }, HEARTBEAT_MS);
+            }
 
-        if (streamConfig.active_source === "external") {
-            finalUrl = streamConfig.external_url;
-        } else {
-            const signed = generateBunnyTokenForStream(
-                STREAM_PATH,
-                BUNNY_SECURITY_KEY,
-                tokenDuration
-            );
+            function programarRenovacion() {
+                if (renewalTimer) clearTimeout(renewalTimer);
+                renewalTimer = setTimeout(function tick() {
+                    renovarUrl(nativeMode);
+                    if (!closing) renewalTimer = setTimeout(tick, RENEWAL_MS);
+                }, RENEWAL_MS);
+            }
 
-            finalUrl = signed.url;
-            bunnyExpires = signed.expires;
-            streamSource = "bunny";
-        }
+            function releaseSession(useBeacon, callback) {
+                var payload;
+                if (!currentSessionId || !currentIdToken) {
+                    if (callback) callback();
+                    return;
+                }
+                payload = {
+                    session_id: currentSessionId,
+                    page_id: pageId,
+                    id_token: currentIdToken
+                };
 
-        console.log(
-            `✅ Stream [${mismaSesion ? 'RENOVADO' : 'NUEVO'}] | uid=${uid} | source=${streamSource} | duration=${tokenDuration}s`
-        );
+                if (useBeacon && navigator.sendBeacon && window.Blob) {
+                    try {
+                        if (navigator.sendBeacon(BACKEND_URL + "/release-session",
+                            new Blob([JSON.stringify(payload)], { type: "application/json" }))) {
+                            if (callback) callback();
+                            return;
+                        }
+                    } catch (_) {}
+                }
 
-        return res.json({
-            success: true,
-            stream_url: finalUrl,
-            stream_source: streamSource,
-            session_id: sessionIdFinal,
-            reused_session: mismaSesion,
-            takeover: takeoverRequested && !mismaSesion,
-            bunny_expires: bunnyExpires,
-            pase_expira: expiraMillis
-        });
+                requestJson("POST", BACKEND_URL + "/release-session", currentIdToken, payload,
+                    function () { if (callback) callback(); });
+            }
 
-    } catch (error) {
-        console.error("❌ Error en /generate-stream:", error);
+            window.continuarEnEsteTelevisor = function () {
+                var user = firebase.auth().currentUser;
+                if (!user) {
+                    window.location.href = "/index.html?next=/tv.html";
+                    return;
+                }
+                document.getElementById("btnTakeover").style.display = "none";
+                iniciarTV(user, true);
+            };
 
-        return res.status(500).json({
-            success: false,
-            code: "SERVER_ERROR"
-        });
-    }
-});
+            window.cerrarSesion = function (redirect) {
+                closing = true;
+                if (heartbeatTimer) clearTimeout(heartbeatTimer);
+                if (renewalTimer) clearTimeout(renewalTimer);
+                destruirPlayer();
+                releaseSession(false, function () {
+                    borrarSesion();
+                    firebase.auth().signOut().then(function () {
+                        if (redirect !== false) window.location.href = "/index.html?next=/tv.html";
+                    });
+                });
+            };
 
-// Libera únicamente la página que creó el bloqueo. Acepta el ID token en el
-// body para que pagehide pueda usar navigator.sendBeacon en TVs y móviles.
-app.post('/release-session', streamLimiter, async (req, res) => {
-    try {
-        const decodedToken = await verifyUserRequest(req);
+            window.addEventListener("pagehide", function () {
+                releaseSession(true);
+            });
 
-        if (!decodedToken) {
-            return res.status(401).json({ success: false, code: "NO_AUTH" });
-        }
+            window.addEventListener("pageshow", function (event) {
+                if (event.persisted) window.location.reload();
+            });
 
-        const sessionId = normalizeClientId(req.body?.session_id);
-        const pageId = normalizeClientId(req.body?.page_id);
-
-        if (!sessionId || !pageId) {
-            return res.status(400).json({ success: false, code: "INVALID_RELEASE" });
-        }
-
-        const userRef = db.collection('usuarios').doc(decodedToken.uid);
-        let released = false;
-
-        await db.runTransaction(async transaction => {
-            const snap = await transaction.get(userRef);
-            if (!snap.exists) return;
-
-            const data = snap.data();
-
-            if (data.session_id !== sessionId || data.active_page_id !== pageId) {
+            if (!window.firebase) {
+                setStatus("NO SE PUDO CARGAR EL ACCESO EN ESTA TV.");
                 return;
             }
 
-            transaction.update(userRef, {
-                session_id: "",
-                active_device_id: "",
-                active_page_id: "",
-                last_status: "released",
-                session_released_at: nowTimestamp()
-            });
-
-            released = true;
-        });
-
-        return res.json({ success: true, released });
-
-    } catch (error) {
-        console.error("Error en /release-session:", error);
-        return res.status(500).json({ success: false, code: "SERVER_ERROR" });
-    }
-});
-
-// --- 13. CHECK SESSION OPTIMIZADO ---
-app.post('/check-session', async (req, res) => {
-    try {
-        const authHeader = req.headers.authorization || "";
-
-        if (!authHeader.startsWith("Bearer ")) {
-            return res.status(401).json({
-                valid: false,
-                motivo: "no_auth"
-            });
-        }
-
-        const idToken = authHeader.replace("Bearer ", "").trim();
-
-        let decodedToken;
-        try {
-            decodedToken = await auth.verifyIdToken(idToken);
-        } catch (e) {
-            return res.status(401).json({
-                valid: false,
-                motivo: "no_auth"
-            });
-        }
-
-        const { session_id } = req.body || {};
-        const pageId = normalizeClientId(req.body?.page_id);
-
-        if (!session_id) {
-            return res.status(400).json({
-                valid: false,
-                motivo: "missing_session"
-            });
-        }
-
-        const uid = decodedToken.uid;
-
-        const userRef = db.collection('usuarios').doc(uid);
-        const userDoc = await userRef.get();
-
-        if (!userDoc.exists) {
-            return res.status(403).json({
-                valid: false,
-                motivo: "pase_inactivo"
-            });
-        }
-
-        const userData = userDoc.data();
-
-        if (!userData.fecha_expiracion) {
-            return res.status(403).json({
-                valid: false,
-                motivo: "pase_sin_expiracion"
-            });
-        }
-
-        const expiraMillis = userData.fecha_expiracion.toMillis();
-        const ahora = Date.now();
-
-        const { ip, userAgent } = getClientData(req);
-
-        if (expiraMillis <= ahora) {
-            await userRef.update({
-                last_heartbeat: nowTimestamp(),
-                last_status: "expired",
-                last_ip: ip,
-                last_user_agent: userAgent
-            });
-
-            return res.json({
-                valid: false,
-                motivo: "expirado"
-            });
-        }
-
-        if (
-            userData.last_status === "revoked_by_admin" ||
-            String(userData.session_id || "").startsWith("revoked_")
-        ) {
-            await userRef.update({
-                last_heartbeat: nowTimestamp(),
-                last_status: "revoked_by_admin",
-                last_ip: ip,
-                last_user_agent: userAgent
-            });
-
-            return res.json({
-                valid: false,
-                motivo: "revocado"
-            });
-        }
-
-        if (
-            session_id !== userData.session_id ||
-            (userData.active_page_id && pageId && pageId !== userData.active_page_id)
-        ) {
-            return res.json({
-                valid: false,
-                motivo: "pirateria"
-            });
-        }
-
-        if (shouldWriteHeartbeat(userData, ahora)) {
-            await userRef.update({
-                last_heartbeat: nowTimestamp(),
-                last_status: "active",
-                last_ip: ip,
-                last_user_agent: userAgent
-            });
-        }
-
-        return res.json({
-            valid: true,
-            motivo: "ok",
-            pase_expira: expiraMillis
-        });
-
-    } catch (e) {
-        console.error("❌ Error en /check-session:", e);
-
-        return res.status(500).json({
-            valid: false,
-            motivo: "server_error"
-        });
-    }
-});
-
-// --- 14. PANEL ADMIN: GENERAR PASE ---
-app.post('/admin/generar-pase-rapido', adminLimiter, verifyAdmin, async (req, res) => {
-    const { partido, email_manual, pass_manual, fecha_corte } = req.body;
-
-    try {
-        if (!partido) {
-            return res.status(400).json({
-                success: false,
-                code: "MISSING_MATCH",
-                message: "Falta el partido o etiqueta del pase."
-            });
-        }
-
-        const exp = fecha_corte
-            ? new Date(fecha_corte)
-            : new Date(Date.now() + 24 * 60 * 60 * 1000);
-
-        if (Number.isNaN(exp.getTime())) {
-            return res.status(400).json({
-                success: false,
-                code: "INVALID_DATE",
-                message: "Fecha de corte inválida."
-            });
-        }
-
-        const esSocioVip = Boolean(email_manual);
-
-        if (esSocioVip) {
-            const emailFinal = String(email_manual).trim().toLowerCase();
-
-            if (!emailFinal.includes("@")) {
-                return res.status(400).json({
-                    success: false,
-                    code: "INVALID_EMAIL",
-                    message: "Email VIP inválido."
-                });
-            }
-
-            const claveFinal = pass_manual || Math.floor(100000 + Math.random() * 900000).toString();
-
-            const userRecord = await auth.createUser({
-                email: emailFinal,
-                password: claveFinal,
-                displayName: partido
-            });
-
-            await db.collection('usuarios').doc(userRecord.uid).set({
-                uid: userRecord.uid,
-                usuario_corto: emailFinal,
-                etiqueta: partido,
-                tipo_acceso: "vip",
-                login_mode: "email_password",
-                fecha_expiracion: admin.firestore.Timestamp.fromDate(exp),
-                creado_el: nowTimestamp(),
-                session_id: "",
-                password_stored: false,
-                last_status: "created"
-            });
-
-            return res.json({
-                success: true,
-                tipo_acceso: "vip",
-                usuario: emailFinal,
-                clave: claveFinal
-            });
-        }
-
-        let userRecord = null;
-        let codigo = null;
-        let codeHash = null;
-        let emailFinal = null;
-        let claveInterna = null;
-
-        for (let intento = 0; intento < 20; intento++) {
-            const generado = await generarCodigoRapidoUnico();
-
-            codigo = generado.codigo;
-            codeHash = generado.hash;
-            emailFinal = `${codigo}@golazosp.net`;
-            claveInterna = generarPasswordInternoSeguro();
-
-            try {
-                userRecord = await auth.createUser({
-                    email: emailFinal,
-                    password: claveInterna,
-                    displayName: partido
-                });
-
-                break;
-
-            } catch (e) {
-                if (e.code === "auth/email-already-exists") {
-                    continue;
+            firebase.initializeApp(firebaseConfig);
+            firebase.auth().onAuthStateChanged(function (user) {
+                if (!user) {
+                    window.location.href = "/index.html?next=/tv.html";
+                    return;
                 }
-
-                throw e;
-            }
-        }
-
-        if (!userRecord) {
-            throw new Error("No se pudo crear usuario para código rápido.");
-        }
-
-        const linkRapido = `${APP_BASE_URL}/?c=${encodeURIComponent(codigo)}`;
-
-        await db.collection('usuarios').doc(userRecord.uid).set({
-            uid: userRecord.uid,
-            usuario_corto: emailFinal,
-            etiqueta: partido,
-            tipo_acceso: "partido",
-            login_mode: "quick_code",
-            quick_code_hash: codeHash,
-            quick_code_created_at: nowTimestamp(),
-            fecha_expiracion: admin.firestore.Timestamp.fromDate(exp),
-            creado_el: nowTimestamp(),
-            session_id: "",
-            password_stored: false,
-            last_status: "created"
-        });
-
-        return res.json({
-            success: true,
-            tipo_acceso: "partido",
-            codigo,
-            link_rapido: linkRapido,
-            usuario: emailFinal,
-            clave: null
-        });
-
-    } catch (e) {
-        console.error("❌ Error creando pase:", e);
-
-        return res.status(500).json({
-            success: false,
-            code: "CREATE_PASS_ERROR",
-            message: e.message
-        });
-    }
-});
-
-// --- 15. PANEL ADMIN: REVOCAR SESIÓN MANUALMENTE ---
-app.post('/admin/revocar-sesion', adminLimiter, verifyAdmin, async (req, res) => {
-    const { uid } = req.body;
-
-    if (!uid) {
-        return res.status(400).json({
-            success: false,
-            message: "Falta UID"
-        });
-    }
-
-    try {
-        await db.collection('usuarios').doc(uid).update({
-            session_id: "revoked_" + Date.now(),
-            last_status: "revoked_by_admin",
-            last_heartbeat: nowTimestamp()
-        });
-
-        return res.json({
-            success: true,
-            message: "Sesión revocada exitosamente. El usuario será expulsado pronto."
-        });
-
-    } catch (e) {
-        console.error("❌ Error revocando sesión:", e);
-
-        return res.status(500).json({
-            success: false,
-            message: "Error al revocar sesión"
-        });
-    }
-});
-
-// --- 15.1 PANEL ADMIN: VER CONFIG STREAM ---
-app.post('/admin/ver-config-stream', adminLimiter, verifyAdmin, async (req, res) => {
-    try {
-        const config = await getActiveStreamConfig();
-
-        return res.json({
-            success: true,
-            config,
-            cache_ttl_ms: STREAM_CONFIG_CACHE_TTL_MS
-        });
-
-    } catch (e) {
-        console.error("❌ Error viendo config stream:", e);
-
-        return res.status(500).json({
-            success: false,
-            message: "Error viendo config stream."
-        });
-    }
-});
-
-// --- 15.2 PANEL ADMIN: ACTUALIZAR CONFIG STREAM ---
-app.post('/admin/actualizar-config-stream', adminLimiter, verifyAdmin, async (req, res) => {
-    try {
-        const activeSource = normalizeStreamSource(req.body?.active_source);
-        const externalUrl = String(req.body?.external_url || EXTERNAL_STREAM_URL_DEFAULT).trim();
-
-        if (activeSource === "external" && !isValidHttpUrl(externalUrl)) {
-            return res.status(400).json({
-                success: false,
-                message: "external_url inválida."
+                currentUid = user.uid;
+                iniciarTV(user, false);
             });
-        }
-
-        const payload = {
-            active_source: activeSource,
-            external_url: externalUrl,
-            updated_at: nowTimestamp()
-        };
-
-        await db.collection("config").doc("stream").set(payload, { merge: true });
-
-        cachedStreamConfig = null;
-        cachedStreamConfigExpiresAt = 0;
-
-        return res.json({
-            success: true,
-            message: `Fuente de stream actualizada a: ${activeSource}`,
-            config: payload
-        });
-
-    } catch (e) {
-        console.error("❌ Error actualizando config stream:", e);
-
-        return res.status(500).json({
-            success: false,
-            message: "Error actualizando config stream."
-        });
-    }
-});
-
-// --- 16. PANEL ADMIN: LIMPIAR CADUCADOS ---
-app.post('/admin/limpiar-caducados', adminLimiter, verifyAdmin, async (req, res) => {
-    try {
-        const ahora = nowTimestamp();
-
-        const vencidosSnap = await db.collection('usuarios')
-            .where('fecha_expiracion', '<', ahora)
-            .get();
-
-        if (vencidosSnap.empty) {
-            return res.json({
-                success: true,
-                mensaje: "✅ No hay usuarios vencidos."
-            });
-        }
-
-        let borrados = 0;
-
-        for (const doc of vencidosSnap.docs) {
-            try {
-                await auth.deleteUser(doc.id);
-                await doc.ref.delete();
-                borrados++;
-            } catch (err) {
-                console.error("❌ Error borrando usuario vencido:", doc.id, err.message);
-            }
-        }
-
-        return res.json({
-            success: true,
-            mensaje: `🧹 ${borrados} pases vencidos eliminados.`
-        });
-
-    } catch (e) {
-        console.error("❌ Error limpiando caducados:", e);
-
-        return res.status(500).json({
-            success: false,
-            mensaje: "Error al limpiar usuarios caducados."
-        });
-    }
-});
-
-// --- 17. PANEL ADMIN: LISTAR USUARIOS ---
-app.post('/admin/listar-usuarios', adminLimiter, verifyAdmin, async (req, res) => {
-    try {
-        const snap = await db.collection('usuarios')
-            .orderBy('creado_el', 'desc')
-            .get();
-
-        const usuariosFormateados = snap.docs.map(d => {
-            const data = d.data();
-            const expiraMillis = data.fecha_expiracion.toMillis();
-            const esActivo = expiraMillis > Date.now();
-
-            let ultimaConexion = "-";
-
-            if (data.last_heartbeat) {
-                ultimaConexion = new Date(data.last_heartbeat.toMillis()).toLocaleTimeString('es-PE', {
-                    timeZone: 'America/Lima'
-                });
-            }
-
-            return {
-                uid: data.uid || d.id,
-                usuario_corto: data.usuario_corto || "-",
-                etiqueta: data.etiqueta || "-",
-
-                tipo_acceso: data.tipo_acceso || (
-                    data.login_mode === "quick_code"
-                        ? "partido"
-                        : "manual"
-                ),
-
-                login_mode: data.login_mode || "-",
-                tiene_codigo_rapido: Boolean(data.quick_code_hash),
-
-                estado: esActivo ? 'ACTIVO' : 'VENCIDO',
-                esActivo: esActivo,
-
-                tiempo: new Date(expiraMillis).toLocaleString('es-PE', {
-                    timeZone: 'America/Lima',
-                    year: 'numeric',
-                    month: '2-digit',
-                    day: '2-digit',
-                    hour: '2-digit',
-                    minute: '2-digit',
-                    hour12: true
-                }),
-
-                ultima_conexion: ultimaConexion,
-                last_status: data.last_status || "-",
-                last_ip: data.last_ip || "Sin registro",
-                last_user_agent: data.last_user_agent || "Sin registro",
-                password_stored: data.password_stored === false ? false : true
-            };
-        });
-
-        return res.json({
-            success: true,
-            usuarios: usuariosFormateados
-        });
-
-    } catch (e) {
-        console.error("❌ Error listando usuarios:", e);
-
-        return res.status(500).json({
-            success: false,
-            message: "Error listando usuarios."
-        });
-    }
-});
-
-// --- 18. START SERVER ---
-const PORT = process.env.PORT || 3000;
-
-app.listen(PORT, () => {
-    console.log(`🚀 GOLAZO SECURE STREAM READY (FASE 9: SELECTOR BUNNY / EXTERNAL)`);
-});
+        }());
+    </script>
+</body>
+</html>
