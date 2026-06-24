@@ -49,6 +49,20 @@ app.use(cors(corsOptions));
 app.options(/.*/, cors(corsOptions));
 app.use(express.json());
 
+// Las respuestas contienen sesiones, URLs firmadas y configuración en vivo.
+// Ningún navegador, proxy o CDN debe reutilizarlas entre solicitudes.
+app.use((req, res, next) => {
+    res.set({
+        'Cache-Control': 'no-store, no-cache, must-revalidate, private',
+        'Pragma': 'no-cache',
+        'Expires': '0',
+        'Surrogate-Control': 'no-store'
+    });
+    res.vary('Origin');
+    res.vary('Authorization');
+    next();
+});
+
 // --- 3. RATE LIMITS CONFIGURABLES ---
 const GENERAL_RATE_LIMIT_MAX = parseInt(process.env.GENERAL_RATE_LIMIT_MAX || "120", 10);
 const STREAM_RATE_LIMIT_MAX = parseInt(process.env.STREAM_RATE_LIMIT_MAX || "30", 10);
@@ -125,11 +139,9 @@ const EXTERNAL_STREAM_URL_DEFAULT = String(
     process.env.EXTERNAL_STREAM_URL || "https://live.site.pe/live/golazosp.m3u8"
 ).trim();
 const IFRAME_PLAYER_URL_DEFAULT = String(
-    process.env.IFRAME_PLAYER_URL || ""
+    process.env.IFRAME_PLAYER_URL ||
+    "https://player-latam-hd.site/index.php?prov=la14hd&stream=sv24je.html&v=5"
 ).trim();
-const IFRAME_ALLOWED_HOSTS = String(
-    process.env.IFRAME_ALLOWED_HOSTS || "player-latam-hd.site"
-).split(",").map((host) => host.trim().toLowerCase()).filter(Boolean);
 const STREAM_FALLBACK_ORDER_DEFAULT = ["iframe", "external", "bunny"];
 
 // Cache para no leer Firestore en cada /generate-stream.
@@ -137,6 +149,9 @@ const STREAM_CONFIG_CACHE_TTL_MS = parseInt(
     process.env.STREAM_CONFIG_CACHE_TTL_MS || "5000",
     10
 );
+
+const MAX_TRANSMISSIONS = 10;
+const MAX_OPTIONS_PER_TRANSMISSION = 5;
 
 let cachedStreamConfig = null;
 let cachedStreamConfigExpiresAt = 0;
@@ -169,7 +184,7 @@ app.get('/', (req, res) => {
         success: true,
         service: "Golazo Stream Backend",
         status: "online",
-        version: "FASE 9 - selector Bunny / External Stream",
+        version: "FASE 10.1 - sincronización de catálogo sin caché",
         stream_mode_default: STREAM_MODE_DEFAULT
     });
 });
@@ -223,7 +238,7 @@ function normalizeStreamSource(value) {
     const source = String(value || "").trim().toLowerCase();
 
     if (source === "iframe") return "iframe";
-    if (source === "external") return "external";
+    if (source === "external" || source === "hls") return "external";
     if (source === "bunny") return "bunny";
 
     return "bunny";
@@ -246,23 +261,6 @@ function normalizeFallbackOrder(value, primarySource = "iframe") {
     return normalized;
 }
 
-function createStreamConfigVersion(config) {
-    const stableConfig = {
-        active_source: String(config.active_source || ""),
-        external_url: String(config.external_url || ""),
-        iframe_url: String(config.iframe_url || ""),
-        fallback_order: Array.isArray(config.fallback_order)
-            ? config.fallback_order
-            : []
-    };
-
-    return crypto
-        .createHash("sha256")
-        .update(JSON.stringify(stableConfig))
-        .digest("hex")
-        .slice(0, 16);
-}
-
 function isValidHttpUrl(value) {
     try {
         const url = new URL(String(value || "").trim());
@@ -272,17 +270,222 @@ function isValidHttpUrl(value) {
     }
 }
 
-function isAllowedIframeUrl(value) {
-    try {
-        const url = new URL(String(value || "").trim());
-        if (url.protocol !== "https:") return false;
-        const hostname = url.hostname.toLowerCase();
-        return IFRAME_ALLOWED_HOSTS.some((allowedHost) =>
-            hostname === allowedHost || hostname.endsWith(`.${allowedHost}`)
-        );
-    } catch (_) {
-        return false;
+function normalizeCatalogId(value, fallback = "") {
+    const normalized = String(value || "")
+        .trim()
+        .toLowerCase()
+        .replace(/[^a-z0-9_-]/g, "-")
+        .replace(/-+/g, "-")
+        .replace(/^-|-$/g, "")
+        .slice(0, 64);
+
+    return normalized || fallback;
+}
+
+function normalizeDisplayText(value, maxLength = 80) {
+    return String(value || "")
+        .replace(/\s+/g, " ")
+        .trim()
+        .slice(0, maxLength);
+}
+
+function createCatalogId(prefix) {
+    return `${prefix}-${crypto.randomBytes(6).toString("hex")}`;
+}
+
+function normalizeBunnyPath(value) {
+    let path = String(value || STREAM_PATH).trim();
+
+    if (isValidHttpUrl(path)) {
+        try {
+            path = new URL(path).pathname;
+        } catch (_) {
+            return "";
+        }
     }
+
+    if (!path.startsWith("/")) path = `/${path}`;
+    if (!path.startsWith("/stream/") || path.includes("..")) return "";
+    if (!/\.m3u8$/i.test(path)) return "";
+
+    return path;
+}
+
+function normalizeTransmissionCatalog(rawTransmissions, strict = false) {
+    const errors = [];
+    const transmissions = [];
+    const transmissionIds = new Set();
+    const input = Array.isArray(rawTransmissions)
+        ? rawTransmissions.slice(0, MAX_TRANSMISSIONS)
+        : [];
+
+    input.forEach((rawTransmission, transmissionIndex) => {
+        if (!rawTransmission || typeof rawTransmission !== "object") {
+            if (strict) errors.push(`Transmisión ${transmissionIndex + 1}: formato inválido.`);
+            return;
+        }
+
+        let transmissionId = normalizeCatalogId(
+            rawTransmission.id,
+            `transmision-${transmissionIndex + 1}`
+        );
+        if (transmissionIds.has(transmissionId)) {
+            transmissionId = strict
+                ? createCatalogId("transmision")
+                : `${transmissionId}-${transmissionIndex + 1}`;
+        }
+        transmissionIds.add(transmissionId);
+
+        const name = normalizeDisplayText(
+            rawTransmission.name || rawTransmission.title,
+            80
+        );
+        const channel = normalizeDisplayText(rawTransmission.channel, 80);
+        const visible = rawTransmission.visible !== false;
+        const options = [];
+        const optionIds = new Set();
+        const rawOptions = Array.isArray(rawTransmission.options)
+            ? rawTransmission.options.slice(0, MAX_OPTIONS_PER_TRANSMISSION)
+            : [];
+
+        if (!name && strict) {
+            errors.push(`Transmisión ${transmissionIndex + 1}: falta el nombre visible.`);
+        }
+        if (
+            Array.isArray(rawTransmission.options) &&
+            rawTransmission.options.length > MAX_OPTIONS_PER_TRANSMISSION
+        ) {
+            errors.push(
+                `${name || `Transmisión ${transmissionIndex + 1}`}: ` +
+                `solo se permiten ${MAX_OPTIONS_PER_TRANSMISSION} opciones.`
+            );
+        }
+
+        rawOptions.forEach((rawOption, optionIndex) => {
+            if (!rawOption || typeof rawOption !== "object") {
+                if (strict) errors.push(`${name || `Transmisión ${transmissionIndex + 1}`}: opción inválida.`);
+                return;
+            }
+
+            let optionId = normalizeCatalogId(
+                rawOption.id,
+                `opcion-${optionIndex + 1}`
+            );
+            if (optionIds.has(optionId)) {
+                optionId = strict
+                    ? createCatalogId("opcion")
+                    : `${optionId}-${optionIndex + 1}`;
+            }
+            optionIds.add(optionId);
+
+            const rawSourceType = String(
+                rawOption.source_type || rawOption.type || ""
+            ).trim().toLowerCase();
+            if (!["iframe", "external", "hls", "bunny"].includes(rawSourceType)) {
+                if (strict) errors.push(
+                    `${name || transmissionId} / Opción ${optionIndex + 1}: tipo de fuente inválido.`
+                );
+                return;
+            }
+            const sourceType = normalizeStreamSource(rawSourceType);
+            const label = normalizeDisplayText(
+                rawOption.label || `Opción ${optionIndex + 1}`,
+                40
+            );
+            const enabled = rawOption.enabled !== false && rawOption.visible !== false;
+            const option = {
+                id: optionId,
+                label,
+                source_type: sourceType,
+                enabled
+            };
+
+            if (sourceType === "bunny") {
+                option.path = normalizeBunnyPath(rawOption.path || rawOption.url);
+                if (!option.path) {
+                    if (strict) errors.push(`${name || transmissionId} / ${label}: ruta Bunny inválida.`);
+                    return;
+                }
+            } else {
+                option.url = String(rawOption.url || "").trim();
+                if (!isValidHttpUrl(option.url)) {
+                    if (strict) errors.push(`${name || transmissionId} / ${label}: URL inválida.`);
+                    return;
+                }
+            }
+
+            options.push(option);
+        });
+
+        if (!options.length && strict) {
+            errors.push(`${name || `Transmisión ${transmissionIndex + 1}`}: agrega al menos una opción válida.`);
+        }
+
+        const requestedDefaultOptionId = normalizeCatalogId(
+            rawTransmission.default_option_id
+        );
+        const firstEnabledOption = options.find(option => option.enabled) || options[0];
+        const defaultOption = options.find(
+            option => option.id === requestedDefaultOptionId && option.enabled
+        ) || firstEnabledOption;
+
+        if (name && options.length) {
+            transmissions.push({
+                id: transmissionId,
+                name,
+                channel,
+                visible,
+                default_option_id: defaultOption?.id || "",
+                options
+            });
+        }
+    });
+
+    if (Array.isArray(rawTransmissions) && rawTransmissions.length > MAX_TRANSMISSIONS) {
+        errors.push(`Solo se permiten ${MAX_TRANSMISSIONS} transmisiones.`);
+    }
+
+    return { transmissions, errors };
+}
+
+function createStreamConfigVersion(config) {
+    const stableConfig = {
+        default_transmission_id: String(config.default_transmission_id || ""),
+        transmissions: config.transmissions || [],
+        active_source: String(config.active_source || ""),
+        external_url: String(config.external_url || ""),
+        iframe_url: String(config.iframe_url || ""),
+        fallback_order: config.fallback_order || []
+    };
+
+    return crypto
+        .createHash("sha256")
+        .update(JSON.stringify(stableConfig))
+        .digest("hex")
+        .slice(0, 16);
+}
+
+function createLegacyTransmission(config) {
+    const activeSource = normalizeStreamSource(config.active_source);
+    const option = {
+        id: "opcion-1",
+        label: "Opción 1",
+        source_type: activeSource,
+        enabled: true
+    };
+
+    if (activeSource === "iframe") option.url = config.iframe_url;
+    if (activeSource === "external") option.url = config.external_url;
+    if (activeSource === "bunny") option.path = STREAM_PATH;
+
+    return {
+        id: "transmision-principal",
+        name: "Transmisión principal",
+        channel: "",
+        visible: true,
+        default_option_id: option.id,
+        options: [option]
+    };
 }
 
 // ✅ NUEVO: lee la fuente activa desde Firestore.
@@ -301,19 +504,21 @@ function isAllowedIframeUrl(value) {
 //   active_source: "bunny",
 //   external_url: "https://live.site.pe/live/golazosp.m3u8"
 // }
-async function getActiveStreamConfig() {
+async function getActiveStreamConfig(forceRefresh = false) {
     const now = Date.now();
 
-    if (cachedStreamConfig && now < cachedStreamConfigExpiresAt) {
+    if (!forceRefresh && cachedStreamConfig && now < cachedStreamConfigExpiresAt) {
         return cachedStreamConfig;
     }
 
     let config = {
+        schema_version: 1,
         active_source: normalizeStreamSource(STREAM_MODE_DEFAULT),
         external_url: EXTERNAL_STREAM_URL_DEFAULT,
         iframe_url: IFRAME_PLAYER_URL_DEFAULT,
         fallback_order: normalizeFallbackOrder(null, normalizeStreamSource(STREAM_MODE_DEFAULT)),
-        updated_at_ms: 0
+        default_transmission_id: "",
+        transmissions: []
     };
 
     try {
@@ -323,6 +528,7 @@ async function getActiveStreamConfig() {
             const data = doc.data() || {};
 
             config = {
+                schema_version: Number(data.schema_version || 1),
                 active_source: normalizeStreamSource(data.active_source || STREAM_MODE_DEFAULT),
                 external_url: String(data.external_url || EXTERNAL_STREAM_URL_DEFAULT).trim(),
                 iframe_url: String(data.iframe_url || IFRAME_PLAYER_URL_DEFAULT).trim(),
@@ -330,8 +536,17 @@ async function getActiveStreamConfig() {
                     data.fallback_order,
                     normalizeStreamSource(data.active_source || STREAM_MODE_DEFAULT)
                 ),
-                updated_at_ms: getTimestampMillis(data.updated_at)
+                default_transmission_id: normalizeCatalogId(data.default_transmission_id),
+                transmissions: []
             };
+
+            if (Array.isArray(data.transmissions)) {
+                config.schema_version = 2;
+                config.transmissions = normalizeTransmissionCatalog(
+                    data.transmissions,
+                    false
+                ).transmissions;
+            }
         }
 
         if (!isValidHttpUrl(config.external_url)) {
@@ -340,20 +555,31 @@ async function getActiveStreamConfig() {
             if (config.active_source === "external") config.active_source = "bunny";
         }
 
-        if (config.iframe_url && !isAllowedIframeUrl(config.iframe_url)) {
-            console.warn("⚠️ iframe_url inválida o no autorizada. Se restauró el valor predeterminado.");
+        if (!isValidHttpUrl(config.iframe_url)) {
+            console.warn("⚠️ iframe_url inválida. Se restauró el valor predeterminado.");
             config.iframe_url = IFRAME_PLAYER_URL_DEFAULT;
             if (config.active_source === "iframe") config.active_source = "bunny";
-        }
-
-        if (config.active_source === "iframe" && !config.iframe_url) {
-            config.active_source = "bunny";
         }
 
         config.fallback_order = normalizeFallbackOrder(
             config.fallback_order,
             config.active_source
         );
+
+        if (config.schema_version < 2) {
+            config.transmissions = [createLegacyTransmission(config)];
+            config.default_transmission_id = config.transmissions[0].id;
+        } else {
+            const visibleTransmissions = config.transmissions.filter(transmission =>
+                transmission.visible && transmission.options.some(option => option.enabled)
+            );
+            if (!visibleTransmissions.some(
+                transmission => transmission.id === config.default_transmission_id
+            )) {
+                config.default_transmission_id = visibleTransmissions[0]?.id || "";
+            }
+        }
+
         config.version = createStreamConfigVersion(config);
 
         cachedStreamConfig = config;
@@ -364,10 +590,8 @@ async function getActiveStreamConfig() {
     } catch (error) {
         console.error("❌ Error leyendo config stream desde Firestore:", error.message);
 
-        config.fallback_order = normalizeFallbackOrder(
-            config.fallback_order,
-            config.active_source
-        );
+        config.transmissions = [createLegacyTransmission(config)];
+        config.default_transmission_id = config.transmissions[0].id;
         config.version = createStreamConfigVersion(config);
 
         cachedStreamConfig = config;
@@ -409,6 +633,65 @@ function generateBunnyTokenForStream(path, securityKey, duration = 120) {
         expires,
         token_path: tokenPath,
         url: `${BUNNY_CDN_URL}/bcdn_token=${token}&expires=${expires}&token_path=${encodedTokenPath}${path}`
+    };
+}
+
+function materializeTransmissionCatalog(config, tokenDuration) {
+    const transmissions = (config.transmissions || [])
+        .filter(transmission => transmission.visible)
+        .map(transmission => {
+            const options = transmission.options
+                .filter(option => option.enabled)
+                .map(option => {
+                    if (option.source_type === "bunny") {
+                        const signed = generateBunnyTokenForStream(
+                            option.path,
+                            BUNNY_SECURITY_KEY,
+                            tokenDuration
+                        );
+
+                        return {
+                            id: option.id,
+                            label: option.label,
+                            source_type: "bunny",
+                            type: "hls",
+                            url: signed.url,
+                            expires: signed.expires
+                        };
+                    }
+
+                    return {
+                        id: option.id,
+                        label: option.label,
+                        source_type: option.source_type,
+                        type: option.source_type === "iframe" ? "iframe" : "hls",
+                        url: option.url
+                    };
+                });
+
+            if (!options.length) return null;
+
+            const defaultOption = options.find(
+                option => option.id === transmission.default_option_id
+            ) || options[0];
+
+            return {
+                id: transmission.id,
+                name: transmission.name,
+                channel: transmission.channel,
+                default_option_id: defaultOption.id,
+                options
+            };
+        })
+        .filter(Boolean);
+
+    const defaultTransmission = transmissions.find(
+        transmission => transmission.id === config.default_transmission_id
+    ) || transmissions[0] || null;
+
+    return {
+        transmissions,
+        default_transmission_id: defaultTransmission?.id || ""
     };
 }
 
@@ -750,9 +1033,14 @@ app.get('/generate-stream', streamLimiter, async (req, res) => {
 
         const tokenDuration = Math.min(BUNNY_TOKEN_DURATION_SECONDS, segundosRestantesPase);
 
-        // Se generan las tres alternativas. La URL legacy sigue siendo HLS para
-        // que las versiones anteriores de en-directo.html y tv.html no fallen.
-        const streamConfig = await getActiveStreamConfig();
+        // Catálogo dinámico para los clientes nuevos. También se mantienen los
+        // campos legacy hasta terminar la migración de en-directo.html y tv.html.
+        const forceConfigRefresh = req.query.refresh_config === "1";
+        const streamConfig = await getActiveStreamConfig(forceConfigRefresh);
+        const playbackCatalog = materializeTransmissionCatalog(
+            streamConfig,
+            tokenDuration
+        );
         const signed = generateBunnyTokenForStream(
             STREAM_PATH,
             BUNNY_SECURITY_KEY,
@@ -781,8 +1069,10 @@ app.get('/generate-stream', streamLimiter, async (req, res) => {
         const bunnyExpires = signed.expires;
 
         console.log(
-            `✅ Stream [${mismaSesion ? 'RENOVADO' : 'NUEVO'}] | uid=${uid} | primary=${streamConfig.active_source} | legacy=${legacyHlsSource} | duration=${tokenDuration}s`
+            `✅ Stream [${mismaSesion ? 'RENOVADO' : 'NUEVO'}] | uid=${uid} | transmisiones=${playbackCatalog.transmissions.length} | legacy=${legacyHlsSource} | duration=${tokenDuration}s`
         );
+
+        res.set('X-Stream-Config-Version', streamConfig.version);
 
         return res.json({
             success: true,
@@ -791,6 +1081,9 @@ app.get('/generate-stream', streamLimiter, async (req, res) => {
             primary_source: streamConfig.active_source,
             fallback_order: fallbackOrder,
             sources,
+            schema_version: 2,
+            transmissions: playbackCatalog.transmissions,
+            default_transmission_id: playbackCatalog.default_transmission_id,
             stream_config_version: streamConfig.version,
             session_id: sessionIdFinal,
             reused_session: mismaSesion,
@@ -970,11 +1263,13 @@ app.post('/check-session', async (req, res) => {
 
         const streamConfig = await getActiveStreamConfig();
 
+        res.set('X-Stream-Config-Version', streamConfig.version);
+
         return res.json({
             valid: true,
             motivo: "ok",
             pase_expira: expiraMillis,
-            primary_source: streamConfig.active_source,
+            default_transmission_id: streamConfig.default_transmission_id,
             stream_config_version: streamConfig.version
         });
 
@@ -1186,6 +1481,61 @@ app.post('/admin/ver-config-stream', adminLimiter, verifyAdmin, async (req, res)
 app.post('/admin/actualizar-config-stream', adminLimiter, verifyAdmin, async (req, res) => {
     try {
         const currentConfig = await getActiveStreamConfig();
+
+        if (Array.isArray(req.body?.transmissions)) {
+            const normalizedCatalog = normalizeTransmissionCatalog(
+                req.body.transmissions,
+                true
+            );
+
+            if (normalizedCatalog.errors.length) {
+                return res.status(400).json({
+                    success: false,
+                    code: "INVALID_TRANSMISSION_CATALOG",
+                    message: normalizedCatalog.errors[0],
+                    errors: normalizedCatalog.errors
+                });
+            }
+
+            const publicTransmissions = normalizedCatalog.transmissions.filter(
+                transmission =>
+                    transmission.visible &&
+                    transmission.options.some(option => option.enabled)
+            );
+            const requestedDefaultId = normalizeCatalogId(
+                req.body.default_transmission_id
+            );
+            const defaultTransmission = publicTransmissions.find(
+                transmission => transmission.id === requestedDefaultId
+            ) || publicTransmissions[0] || null;
+
+            const payload = {
+                schema_version: 2,
+                transmissions: normalizedCatalog.transmissions,
+                default_transmission_id: defaultTransmission?.id || "",
+                updated_at: nowTimestamp()
+            };
+
+            await db.collection("config").doc("stream").set(payload, { merge: true });
+
+            cachedStreamConfig = null;
+            cachedStreamConfigExpiresAt = 0;
+
+            const savedConfig = await getActiveStreamConfig(true);
+
+            console.log(
+                `✅ Catálogo actualizado | versión ${currentConfig.version || 'inicial'} -> ${savedConfig.version}`
+            );
+
+            return res.json({
+                success: true,
+                message: `${publicTransmissions.length} transmisión(es) activa(s).`,
+                previous_stream_config_version: currentConfig.version || "",
+                stream_config_version: savedConfig.version,
+                config: savedConfig
+            });
+        }
+
         const activeSource = normalizeStreamSource(
             req.body?.active_source || currentConfig.active_source
         );
@@ -1207,17 +1557,10 @@ app.post('/admin/actualizar-config-stream', adminLimiter, verifyAdmin, async (re
             });
         }
 
-        if (iframeUrl && !isAllowedIframeUrl(iframeUrl)) {
+        if (!isValidHttpUrl(iframeUrl)) {
             return res.status(400).json({
                 success: false,
-                message: "iframe_url inválida o dominio no autorizado."
-            });
-        }
-
-        if (activeSource === "iframe" && !iframeUrl) {
-            return res.status(400).json({
-                success: false,
-                message: "Debes ingresar iframe_url para activar esa fuente."
+                message: "iframe_url inválida."
             });
         }
 
@@ -1367,5 +1710,5 @@ app.post('/admin/listar-usuarios', adminLimiter, verifyAdmin, async (req, res) =
 const PORT = process.env.PORT || 3000;
 
 app.listen(PORT, () => {
-    console.log(`🚀 GOLAZO SECURE STREAM READY (FASE 9: SELECTOR BUNNY / EXTERNAL)`);
+    console.log(`🚀 GOLAZO SECURE STREAM READY (FASE 10.1: SINCRONIZACIÓN SIN CACHÉ)`);
 });
