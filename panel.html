@@ -34,13 +34,33 @@
         .badge-warn { background: #92400e; color: white; }
         .badge-danger { background: #7f1d1d; color: white; }
         .ip-cell { font-family: 'Courier New', monospace; font-size: 12px; }
-        .stream-grid { display: grid; grid-template-columns: repeat(auto-fit, minmax(230px, 1fr)); gap: 12px; }
         .field-label { display: block; margin-top: 8px; color: #cbd5e1; font-size: 12px; font-weight: 700; }
         .stream-actions { display: flex; gap: 10px; flex-wrap: wrap; margin-top: 12px; }
         .stream-actions button { width: auto; min-width: 170px; }
         .config-status { margin-top: 10px; padding: 10px; border-radius: 8px; background: #020617; color: #cbd5e1; font-size: 13px; }
         .config-status.ok { color: #22c55e; border: 1px solid #166534; }
         .config-status.error { color: #fca5a5; border: 1px solid #991b1b; }
+        .transmission-list { display: grid; gap: 14px; margin-top: 12px; }
+        .transmission-item { background: #111827; border: 1px solid #475569; border-radius: 8px; padding: 14px; }
+        .transmission-head { display: flex; justify-content: space-between; align-items: center; gap: 10px; margin-bottom: 10px; }
+        .transmission-head strong { font-size: 15px; }
+        .compact-actions { display: flex; gap: 6px; flex-wrap: wrap; }
+        .compact-actions button { width: auto; min-width: 0; padding: 7px 10px; margin: 0; font-size: 11px; }
+        .transmission-fields { display: grid; grid-template-columns: minmax(220px, 2fr) minmax(180px, 1fr); gap: 10px; }
+        .check-row { display: flex; align-items: center; gap: 8px; margin-top: 10px; color: #cbd5e1; font-size: 12px; font-weight: 700; }
+        .check-row input { width: auto; margin: 0; }
+        .option-list { display: grid; gap: 8px; margin-top: 12px; }
+        .option-row { display: grid; grid-template-columns: minmax(110px, .7fr) minmax(145px, .8fr) minmax(240px, 2fr) auto; gap: 8px; align-items: end; padding-top: 10px; border-top: 1px solid #334155; }
+        .option-row .field-label { margin-top: 0; }
+        .option-actions { display: flex; gap: 6px; padding-bottom: 5px; }
+        .option-actions button { width: auto; min-width: 0; padding: 9px 10px; margin: 0; font-size: 11px; }
+        .empty-streams { padding: 18px; text-align: center; color: #94a3b8; border: 1px dashed #475569; border-radius: 8px; }
+        .btn-neutral { background: #475569; color: white; }
+        @media (max-width: 760px) {
+            .transmission-fields, .option-row { grid-template-columns: 1fr; }
+            .option-actions { padding-bottom: 0; }
+            .transmission-head { align-items: flex-start; flex-direction: column; }
+        }
     </style>
 </head>
 <body>
@@ -85,47 +105,16 @@
         </div>
 
         <div class="section">
-            <h2>CONTROL DE SEÑAL</h2>
-
-            <div class="stream-grid">
-                <div>
-                    <label class="field-label" for="streamPrimary">Señal principal</label>
-                    <select id="streamPrimary">
-                        <option value="iframe">Iframe</option>
-                        <option value="external">Servidor externo</option>
-                        <option value="bunny">Bunny CDN</option>
-                    </select>
-                </div>
-
-                <div>
-                    <label class="field-label" for="fallback1">Primera alternativa</label>
-                    <select id="fallback1">
-                        <option value="iframe">Iframe</option>
-                        <option value="external">Servidor externo</option>
-                        <option value="bunny">Bunny CDN</option>
-                    </select>
-                </div>
-
-                <div>
-                    <label class="field-label" for="fallback2">Segunda alternativa</label>
-                    <select id="fallback2">
-                        <option value="iframe">Iframe</option>
-                        <option value="external">Servidor externo</option>
-                        <option value="bunny">Bunny CDN</option>
-                    </select>
-                </div>
+            <div style="display:flex; justify-content:space-between; align-items:center; gap:10px; flex-wrap:wrap;">
+                <h2>TRANSMISIONES</h2>
+                <button class="btn-crear" type="button" style="width:auto; padding:9px 14px;" onclick="agregarTransmision()">Agregar transmisión</button>
             </div>
 
-            <label class="field-label" for="iframeUrl">URL completa del iframe</label>
-            <input type="url" id="iframeUrl" placeholder="https://player.example.com/index.php?..." autocomplete="off">
-
-            <label class="field-label" for="externalStreamUrl">URL HLS del servidor externo</label>
-            <input type="url" id="externalStreamUrl" placeholder="https://live.example.com/live/canal.m3u8" autocomplete="off">
+            <div id="transmissionList" class="transmission-list"></div>
 
             <div class="stream-actions">
                 <button class="btn-crear" id="btnSaveStream" onclick="guardarConfigStream()">Guardar y aplicar</button>
-                <button class="secondary" onclick="probarIframe()">Probar iframe</button>
-                <button class="secondary" onclick="cargarConfigStream()">Recargar configuración</button>
+                <button class="btn-neutral" type="button" onclick="cargarConfigStream()">Recargar configuración</button>
             </div>
 
             <div id="streamConfigStatus" class="config-status">Configuración pendiente de cargar.</div>
@@ -181,6 +170,8 @@
 
     let autoRefreshInterval = null;
     let cargandoUsuarios = false;
+    let streamTransmissions = [];
+    let defaultTransmissionId = "";
 
     function iniciarAutoRefresh() {
         if (autoRefreshInterval) {
@@ -284,6 +275,7 @@
     async function adminFetch(path, options = {}) {
         const token = await getAdminToken();
         return fetch(`${BACKEND_URL}${path}`, {
+            cache: 'no-store',
             ...options,
             headers: {
                 'Content-Type': 'application/json',
@@ -307,15 +299,311 @@
         }
     }
 
-    function setFallbackSelectors(order, primary) {
-        const allSources = ["iframe", "external", "bunny"];
-        const normalized = [primary, ...(Array.isArray(order) ? order : []), ...allSources]
-            .filter((source, index, list) => allSources.includes(source) && list.indexOf(source) === index);
-
-        document.getElementById('streamPrimary').value = normalized[0] || "bunny";
-        document.getElementById('fallback1').value = normalized[1] || "external";
-        document.getElementById('fallback2').value = normalized[2] || "bunny";
+    function crearIdEditor(prefix) {
+        const randomPart = window.crypto?.randomUUID
+            ? window.crypto.randomUUID().replaceAll('-', '').slice(0, 12)
+            : `${Date.now()}${Math.random().toString(36).slice(2, 8)}`;
+        return `${prefix}-${randomPart}`.toLowerCase();
     }
+
+    function crearOpcion(sourceType = "iframe", index = 0) {
+        return {
+            id: crearIdEditor("opcion"),
+            label: `Opción ${index + 1}`,
+            source_type: sourceType,
+            enabled: true,
+            url: "",
+            path: sourceType === "bunny" ? "/stream/master.m3u8" : ""
+        };
+    }
+
+    function normalizarCatalogoEditor(config) {
+        if (Array.isArray(config?.transmissions)) {
+            streamTransmissions = config.transmissions.map((transmission, transmissionIndex) => {
+                const options = Array.isArray(transmission.options)
+                    ? transmission.options.map((option, optionIndex) => ({
+                        id: option.id || crearIdEditor("opcion"),
+                        label: option.label || `Opción ${optionIndex + 1}`,
+                        source_type: option.source_type || (option.type === "iframe" ? "iframe" : "external"),
+                        enabled: option.enabled !== false,
+                        url: option.url || "",
+                        path: option.path || "/stream/master.m3u8"
+                    }))
+                    : [];
+
+                return {
+                    id: transmission.id || crearIdEditor("transmision"),
+                    name: transmission.name || transmission.title || `Transmisión ${transmissionIndex + 1}`,
+                    channel: transmission.channel || "",
+                    visible: transmission.visible !== false,
+                    default_option_id: transmission.default_option_id || options[0]?.id || "",
+                    options
+                };
+            });
+            defaultTransmissionId = config.default_transmission_id || streamTransmissions[0]?.id || "";
+            return;
+        }
+
+        const primary = config?.active_source || "iframe";
+        const legacyOption = crearOpcion(primary, 0);
+        if (primary === "iframe") legacyOption.url = config?.iframe_url || "";
+        if (primary === "external") legacyOption.url = config?.external_url || "";
+        if (primary === "bunny") legacyOption.path = "/stream/master.m3u8";
+
+        const transmission = {
+            id: crearIdEditor("transmision"),
+            name: "Transmisión principal",
+            channel: "",
+            visible: true,
+            default_option_id: legacyOption.id,
+            options: [legacyOption]
+        };
+        streamTransmissions = [transmission];
+        defaultTransmissionId = transmission.id;
+    }
+
+    function sourceTypeOptions(selected) {
+        return [
+            ["iframe", "Iframe"],
+            ["external", "Servidor externo (OBS/HLS)"],
+            ["bunny", "Bunny CDN (OBS)"]
+        ].map(([value, label]) =>
+            `<option value="${value}"${selected === value ? " selected" : ""}>${label}</option>`
+        ).join("");
+    }
+
+    function sourceInputMeta(option) {
+        if (option.source_type === "bunny") {
+            return {
+                field: "path",
+                label: "Ruta Bunny",
+                value: option.path || "/stream/master.m3u8",
+                placeholder: "/stream/partido1/master.m3u8"
+            };
+        }
+        if (option.source_type === "external") {
+            return {
+                field: "url",
+                label: "URL HLS",
+                value: option.url || "",
+                placeholder: "https://live.example.com/live/partido.m3u8"
+            };
+        }
+        return {
+            field: "url",
+            label: "URL del iframe",
+            value: option.url || "",
+            placeholder: "https://player.example.com/index.php?..."
+        };
+    }
+
+    function renderTransmissions() {
+        const container = document.getElementById('transmissionList');
+
+        if (!streamTransmissions.length) {
+            container.innerHTML = '<div class="empty-streams">No hay transmisiones configuradas.</div>';
+            return;
+        }
+
+        container.innerHTML = streamTransmissions.map((transmission, transmissionIndex) => {
+            const optionRows = transmission.options.map((option, optionIndex) => {
+                const input = sourceInputMeta(option);
+                const isDefaultOption = transmission.default_option_id === option.id;
+
+                return `<div class="option-row" data-option-id="${escapeAttr(option.id)}">
+                    <div>
+                        <label class="field-label">Nombre de opción</label>
+                        <input type="text" data-field="option-label" value="${escapeAttr(option.label)}" placeholder="Opción ${optionIndex + 1}" maxlength="40">
+                        <label class="check-row">
+                            <input type="radio" name="default-option-${escapeAttr(transmission.id)}" data-field="default-option" ${isDefaultOption ? "checked" : ""}>
+                            Predeterminada
+                        </label>
+                    </div>
+                    <div>
+                        <label class="field-label">Tipo de fuente</label>
+                        <select data-field="source-type">${sourceTypeOptions(option.source_type)}</select>
+                        <label class="check-row">
+                            <input type="checkbox" data-field="option-enabled" ${option.enabled ? "checked" : ""}>
+                            Activa
+                        </label>
+                    </div>
+                    <div>
+                        <label class="field-label">${input.label}</label>
+                        <input type="text" data-field="${input.field}" value="${escapeAttr(input.value)}" placeholder="${escapeAttr(input.placeholder)}" autocomplete="off">
+                    </div>
+                    <div class="option-actions">
+                        <button type="button" class="btn-neutral" data-action="test-option">Probar</button>
+                        <button type="button" class="btn-danger" data-action="remove-option">Eliminar</button>
+                    </div>
+                </div>`;
+            }).join("");
+
+            return `<div class="transmission-item" data-transmission-id="${escapeAttr(transmission.id)}">
+                <div class="transmission-head">
+                    <strong>Transmisión ${transmissionIndex + 1}</strong>
+                    <div class="compact-actions">
+                        <button type="button" class="btn-neutral" data-action="move-up" ${transmissionIndex === 0 ? "disabled" : ""}>Subir</button>
+                        <button type="button" class="btn-neutral" data-action="move-down" ${transmissionIndex === streamTransmissions.length - 1 ? "disabled" : ""}>Bajar</button>
+                        <button type="button" class="btn-danger" data-action="remove-transmission">Eliminar</button>
+                    </div>
+                </div>
+                <div class="transmission-fields">
+                    <div>
+                        <label class="field-label">Nombre visible del partido o evento</label>
+                        <input type="text" data-field="transmission-name" value="${escapeAttr(transmission.name)}" placeholder="Ej: Argentina vs España" maxlength="80">
+                    </div>
+                    <div>
+                        <label class="field-label">Canal interno opcional</label>
+                        <input type="text" data-field="transmission-channel" value="${escapeAttr(transmission.channel)}" placeholder="Ej: DSports AR" maxlength="80">
+                    </div>
+                </div>
+                <div style="display:flex; gap:18px; flex-wrap:wrap;">
+                    <label class="check-row">
+                        <input type="checkbox" data-field="transmission-visible" ${transmission.visible ? "checked" : ""}>
+                        Visible en la web
+                    </label>
+                    <label class="check-row">
+                        <input type="radio" name="default-transmission" data-field="default-transmission" ${defaultTransmissionId === transmission.id ? "checked" : ""}>
+                        Transmisión predeterminada
+                    </label>
+                </div>
+                <div class="option-list">${optionRows}</div>
+                <button type="button" class="btn-neutral" style="width:auto; margin-top:12px;" data-action="add-option">Agregar opción</button>
+            </div>`;
+        }).join("");
+    }
+
+    function buscarTransmision(element) {
+        const transmissionElement = element.closest('[data-transmission-id]');
+        if (!transmissionElement) return null;
+        return streamTransmissions.find(
+            transmission => transmission.id === transmissionElement.dataset.transmissionId
+        ) || null;
+    }
+
+    function buscarOpcion(transmission, element) {
+        const optionElement = element.closest('[data-option-id]');
+        if (!transmission || !optionElement) return null;
+        return transmission.options.find(option => option.id === optionElement.dataset.optionId) || null;
+    }
+
+    function agregarTransmision() {
+        if (streamTransmissions.length >= 10) {
+            return setStreamConfigStatus("Solo se permiten 10 transmisiones.", "error");
+        }
+
+        const option = crearOpcion("iframe", 0);
+        const transmission = {
+            id: crearIdEditor("transmision"),
+            name: "",
+            channel: "",
+            visible: true,
+            default_option_id: option.id,
+            options: [option]
+        };
+        streamTransmissions.push(transmission);
+        if (!defaultTransmissionId) defaultTransmissionId = transmission.id;
+        renderTransmissions();
+        setStreamConfigStatus("Nueva transmisión pendiente de guardar.");
+    }
+
+    function handleTransmissionInput(event) {
+        const transmission = buscarTransmision(event.target);
+        if (!transmission) return;
+        const option = buscarOpcion(transmission, event.target);
+        const field = event.target.dataset.field;
+
+        if (field === "transmission-name") transmission.name = event.target.value;
+        if (field === "transmission-channel") transmission.channel = event.target.value;
+        if (field === "transmission-visible") transmission.visible = event.target.checked;
+        if (field === "default-transmission" && event.target.checked) {
+            defaultTransmissionId = transmission.id;
+        }
+        if (!option) return;
+
+        if (field === "option-label") option.label = event.target.value;
+        if (field === "option-enabled") option.enabled = event.target.checked;
+        if (field === "default-option" && event.target.checked) {
+            transmission.default_option_id = option.id;
+        }
+        if (field === "url") option.url = event.target.value;
+        if (field === "path") option.path = event.target.value;
+        if (field === "source-type") {
+            option.source_type = event.target.value;
+            if (option.source_type === "bunny" && !option.path) {
+                option.path = "/stream/master.m3u8";
+            }
+            renderTransmissions();
+        }
+    }
+
+    function handleTransmissionAction(event) {
+        const button = event.target.closest('[data-action]');
+        if (!button) return;
+        const transmission = buscarTransmision(button);
+        if (!transmission) return;
+        const option = buscarOpcion(transmission, button);
+        const action = button.dataset.action;
+        const transmissionIndex = streamTransmissions.indexOf(transmission);
+
+        if (action === "add-option") {
+            if (transmission.options.length >= 5) {
+                return setStreamConfigStatus("Solo se permiten 5 opciones por transmisión.", "error");
+            }
+            transmission.options.push(crearOpcion("iframe", transmission.options.length));
+            renderTransmissions();
+            return;
+        }
+
+        if (action === "remove-option" && option) {
+            if (!confirm(`¿Eliminar ${option.label || "esta opción"}?`)) return;
+            transmission.options = transmission.options.filter(item => item.id !== option.id);
+            if (transmission.default_option_id === option.id) {
+                transmission.default_option_id = transmission.options[0]?.id || "";
+            }
+            renderTransmissions();
+            return;
+        }
+
+        if (action === "test-option" && option) {
+            if (option.source_type === "bunny") {
+                return setStreamConfigStatus("Bunny se prueba desde la web porque necesita una URL firmada.");
+            }
+            if (!isValidHttpsUrl(option.url)) {
+                return setStreamConfigStatus("La opción necesita una URL HTTPS válida.", "error");
+            }
+            window.open(option.url, '_blank', 'noopener,noreferrer');
+            return;
+        }
+
+        if (action === "remove-transmission") {
+            if (!confirm(`¿Eliminar ${transmission.name || "esta transmisión"}?`)) return;
+            streamTransmissions = streamTransmissions.filter(item => item.id !== transmission.id);
+            if (defaultTransmissionId === transmission.id) {
+                defaultTransmissionId = streamTransmissions[0]?.id || "";
+            }
+            renderTransmissions();
+            return;
+        }
+
+        if (action === "move-up" && transmissionIndex > 0) {
+            [streamTransmissions[transmissionIndex - 1], streamTransmissions[transmissionIndex]] =
+                [streamTransmissions[transmissionIndex], streamTransmissions[transmissionIndex - 1]];
+            renderTransmissions();
+            return;
+        }
+
+        if (action === "move-down" && transmissionIndex < streamTransmissions.length - 1) {
+            [streamTransmissions[transmissionIndex + 1], streamTransmissions[transmissionIndex]] =
+                [streamTransmissions[transmissionIndex], streamTransmissions[transmissionIndex + 1]];
+            renderTransmissions();
+        }
+    }
+
+    const transmissionListElement = document.getElementById('transmissionList');
+    transmissionListElement.addEventListener('input', handleTransmissionInput);
+    transmissionListElement.addEventListener('change', handleTransmissionInput);
+    transmissionListElement.addEventListener('click', handleTransmissionAction);
 
     async function cargarConfigStream() {
         try {
@@ -331,11 +619,14 @@
             }
 
             const config = data.config || {};
-            const primary = config.active_source || "bunny";
-            document.getElementById('iframeUrl').value = config.iframe_url || "";
-            document.getElementById('externalStreamUrl').value = config.external_url || "";
-            setFallbackSelectors(config.fallback_order, primary);
-            setStreamConfigStatus(`Activa: ${primary}. Configuración sincronizada.`, "ok");
+            normalizarCatalogoEditor(config);
+            renderTransmissions();
+            const visibleCount = streamTransmissions.filter(transmission => transmission.visible).length;
+            const version = config.version ? ` Versión: ${config.version}.` : "";
+            setStreamConfigStatus(
+                `${visibleCount} transmisión(es) visible(s). Configuración sincronizada.${version}`,
+                "ok"
+            );
 
         } catch (error) {
             console.error("Error cargando configuración de stream:", error);
@@ -344,28 +635,44 @@
     }
 
     async function guardarConfigStream() {
-        const primary = document.getElementById('streamPrimary').value;
-        const iframeUrl = document.getElementById('iframeUrl').value.trim();
-        const externalUrl = document.getElementById('externalStreamUrl').value.trim();
-        const order = [
-            primary,
-            document.getElementById('fallback1').value,
-            document.getElementById('fallback2').value
-        ];
-        const uniqueOrder = [...new Set(order)];
         const saveButton = document.getElementById('btnSaveStream');
+        const errors = [];
 
-        if (uniqueOrder.length !== 3) {
-            return setStreamConfigStatus("La señal principal y las dos alternativas deben ser diferentes.", "error");
+        streamTransmissions.forEach((transmission, transmissionIndex) => {
+            const name = transmission.name.trim();
+            if (!name) errors.push(`Transmisión ${transmissionIndex + 1}: falta el nombre visible.`);
+            if (!transmission.options.length) errors.push(`${name || `Transmisión ${transmissionIndex + 1}`}: agrega una opción.`);
+
+            transmission.options.forEach((option, optionIndex) => {
+                option.label = option.label.trim() || `Opción ${optionIndex + 1}`;
+                if (option.source_type === "bunny") {
+                    const path = String(option.path || "").trim();
+                    if (!path.startsWith('/stream/') || !path.toLowerCase().endsWith('.m3u8') || path.includes('..')) {
+                        errors.push(`${name || `Transmisión ${transmissionIndex + 1}`} / ${option.label}: ruta Bunny inválida.`);
+                    }
+                } else if (!isValidHttpsUrl(option.url)) {
+                    errors.push(`${name || `Transmisión ${transmissionIndex + 1}`} / ${option.label}: URL HTTPS inválida.`);
+                }
+            });
+
+            const enabledOptions = transmission.options.filter(option => option.enabled);
+            if (transmission.visible && !enabledOptions.length) {
+                errors.push(`${name || `Transmisión ${transmissionIndex + 1}`}: activa al menos una opción.`);
+            }
+            if (!enabledOptions.some(option => option.id === transmission.default_option_id)) {
+                transmission.default_option_id = enabledOptions[0]?.id || transmission.options[0]?.id || "";
+            }
+        });
+
+        if (errors.length) {
+            return setStreamConfigStatus(errors[0], "error");
         }
-        if (primary === "iframe" && !isValidHttpsUrl(iframeUrl)) {
-            return setStreamConfigStatus("Ingresa una URL HTTPS válida para el iframe.", "error");
-        }
-        if (iframeUrl && !isValidHttpsUrl(iframeUrl)) {
-            return setStreamConfigStatus("La URL del iframe debe utilizar HTTPS.", "error");
-        }
-        if (!isValidHttpsUrl(externalUrl)) {
-            return setStreamConfigStatus("Ingresa una URL HTTPS válida para el servidor externo.", "error");
+
+        const publicTransmissions = streamTransmissions.filter(transmission =>
+            transmission.visible && transmission.options.some(option => option.enabled)
+        );
+        if (!publicTransmissions.some(transmission => transmission.id === defaultTransmissionId)) {
+            defaultTransmissionId = publicTransmissions[0]?.id || "";
         }
 
         try {
@@ -374,10 +681,8 @@
             const res = await adminFetch('/admin/actualizar-config-stream', {
                 method: 'POST',
                 body: JSON.stringify({
-                    active_source: primary,
-                    iframe_url: iframeUrl,
-                    external_url: externalUrl,
-                    fallback_order: order
+                    default_transmission_id: defaultTransmissionId,
+                    transmissions: streamTransmissions
                 })
             });
             const data = await res.json();
@@ -386,7 +691,17 @@
                 throw new Error(data.message || "No se pudo guardar la configuración.");
             }
 
-            setStreamConfigStatus(`Aplicado: ${primary}. Los usuarios activos se sincronizarán automáticamente.`, "ok");
+            normalizarCatalogoEditor(data.config || {
+                transmissions: streamTransmissions,
+                default_transmission_id: defaultTransmissionId
+            });
+            renderTransmissions();
+            const savedVersion = data.stream_config_version || data.config?.version || "";
+            setStreamConfigStatus(
+                `Aplicado: ${publicTransmissions.length} transmisión(es) visible(s).` +
+                (savedVersion ? ` Versión: ${savedVersion}.` : ""),
+                "ok"
+            );
 
         } catch (error) {
             console.error("Error guardando configuración de stream:", error);
@@ -394,14 +709,6 @@
         } finally {
             saveButton.disabled = false;
         }
-    }
-
-    function probarIframe() {
-        const iframeUrl = document.getElementById('iframeUrl').value.trim();
-        if (!isValidHttpsUrl(iframeUrl)) {
-            return setStreamConfigStatus("Ingresa primero una URL HTTPS válida para el iframe.", "error");
-        }
-        window.open(iframeUrl, '_blank', 'noopener,noreferrer');
     }
 
     function formatearFechaPeru(fecha) {
