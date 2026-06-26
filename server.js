@@ -129,7 +129,7 @@ const BUNNY_SECURITY_KEY = process.env.BUNNY_KEY.trim();
 const STREAM_PATH = '/stream/master.m3u8';
 const ADMIN_SECRET = process.env.ADMIN_SECRET;
 
-// ✅ NUEVO: selector de fuente de stream.
+// Selector de fuente de stream.
 // Valores permitidos:
 // iframe   = usa el reproductor aislado de player-latam-hd.site.
 // external = usa la señal HLS directa de live.site.pe.
@@ -156,10 +156,10 @@ const MAX_OPTIONS_PER_TRANSMISSION = 5;
 let cachedStreamConfig = null;
 let cachedStreamConfigExpiresAt = 0;
 
-// 🔐 Código rápido
+// Código rápido
 const QUICK_CODE_SECRET = (process.env.QUICK_CODE_SECRET || process.env.BUNNY_KEY || "").trim();
 
-// 🌐 URL pública de la web para generar links rápidos
+// URL pública de la web para generar links rápidos
 const APP_BASE_URL = process.env.APP_BASE_URL || "https://golazosp.net";
 
 // --- 4.1 OPTIMIZACIÓN DE ESCALA ---
@@ -184,7 +184,7 @@ app.get('/', (req, res) => {
         success: true,
         service: "Golazo Stream Backend",
         status: "online",
-        version: "FASE 10.1 - sincronización de catálogo sin caché",
+        version: "FASE 10.2 - sesiones idempotentes y anti-409",
         stream_mode_default: STREAM_MODE_DEFAULT
     });
 });
@@ -351,6 +351,7 @@ function normalizeTransmissionCatalog(rawTransmissions, strict = false) {
         if (!name && strict) {
             errors.push(`Transmisión ${transmissionIndex + 1}: falta el nombre visible.`);
         }
+
         if (
             Array.isArray(rawTransmission.options) &&
             rawTransmission.options.length > MAX_OPTIONS_PER_TRANSMISSION
@@ -381,12 +382,14 @@ function normalizeTransmissionCatalog(rawTransmissions, strict = false) {
             const rawSourceType = String(
                 rawOption.source_type || rawOption.type || ""
             ).trim().toLowerCase();
+
             if (!["iframe", "external", "hls", "bunny"].includes(rawSourceType)) {
                 if (strict) errors.push(
                     `${name || transmissionId} / Opción ${optionIndex + 1}: tipo de fuente inválido.`
                 );
                 return;
             }
+
             const sourceType = normalizeStreamSource(rawSourceType);
             const label = normalizeDisplayText(
                 rawOption.label || `Opción ${optionIndex + 1}`,
@@ -488,22 +491,10 @@ function createLegacyTransmission(config) {
     };
 }
 
-// ✅ NUEVO: lee la fuente activa desde Firestore.
+// Lee la fuente activa desde Firestore.
 // Ruta Firestore recomendada:
 // collection: config
 // document: stream
-//
-// Ejemplo external:
-// {
-//   active_source: "external",
-//   external_url: "https://live.site.pe/live/golazosp.m3u8"
-// }
-//
-// Ejemplo bunny:
-// {
-//   active_source: "bunny",
-//   external_url: "https://live.site.pe/live/golazosp.m3u8"
-// }
 async function getActiveStreamConfig(forceRefresh = false) {
     const now = Date.now();
 
@@ -573,6 +564,7 @@ async function getActiveStreamConfig(forceRefresh = false) {
             const visibleTransmissions = config.transmissions.filter(transmission =>
                 transmission.visible && transmission.options.some(option => option.enabled)
             );
+
             if (!visibleTransmissions.some(
                 transmission => transmission.id === config.default_transmission_id
             )) {
@@ -601,7 +593,7 @@ async function getActiveStreamConfig(forceRefresh = false) {
     }
 }
 
-// --- 7. GENERADOR DE TOKEN BUNNY PARA DIRECTORIOS (BUNNY TOKEN V2 HMAC-SHA256) ---
+// --- 7. GENERADOR DE TOKEN BUNNY PARA DIRECTORIOS ---
 function base64Url(buffer) {
     return buffer.toString("base64")
         .replace(/\+/g, "-")
@@ -914,128 +906,201 @@ app.get('/generate-stream', streamLimiter, async (req, res) => {
         const deviceId = normalizeClientId(req.query.device_id);
         const pageId = normalizeClientId(req.query.page_id);
         const takeoverRequested = req.query.takeover === "1";
+        const forceConfigRefresh = req.query.refresh_config === "1";
 
         const userRef = db.collection('usuarios').doc(uid);
-        const userDoc = await userRef.get();
-
-        if (!userDoc.exists) {
-            return res.status(403).json({
-                success: false,
-                code: "PASS_INACTIVE"
-            });
-        }
-
-        const userData = userDoc.data();
-
-        if (!userData.fecha_expiracion) {
-            return res.status(403).json({
-                success: false,
-                code: "NO_EXPIRATION"
-            });
-        }
-
         const ahora = Date.now();
-        const expiraMillis = userData.fecha_expiracion.toMillis();
-        const segundosRestantesPase = Math.floor((expiraMillis - ahora) / 1000);
-
-        if (segundosRestantesPase <= 0) {
-            return res.status(403).json({
-                success: false,
-                code: "PASS_EXPIRED",
-                error: "Pase expirado"
-            });
-        }
-
-        if (
-            requestedSessionId &&
-            (
-                userData.last_status === "revoked_by_admin" ||
-                String(userData.session_id || "").startsWith("revoked_")
-            )
-        ) {
-            return res.status(403).json({
-                success: false,
-                code: "SESSION_REVOKED",
-                error: "Sesión revocada por administración"
-            });
-        }
-
-        const lastHeartbeatMillis = getTimestampMillis(userData.last_heartbeat);
-
-        const sesionActivaReciente = Boolean(
-            userData.session_id &&
-            !String(userData.session_id).startsWith("revoked_") &&
-            userData.last_status !== "expired" &&
-            userData.last_status !== "revoked_by_admin" &&
-            lastHeartbeatMillis &&
-            ahora - lastHeartbeatMillis < ACTIVE_SESSION_WINDOW_MS
-        );
-
-        const mismaSesion = Boolean(
-            requestedSessionId && requestedSessionId === userData.session_id
-        );
-
-        // Un session_id inventado o antiguo nunca debe saltarse el bloqueo.
-        if (sesionActivaReciente && !mismaSesion && !takeoverRequested) {
-            return res.status(409).json({
-                success: false,
-                code: "SESSION_ALREADY_ACTIVE",
-                error: "Ya existe una sesión activa para este usuario.",
-                can_takeover: true
-            });
-        }
-
         const { ip, userAgent } = getClientData(req);
 
-        let sessionIdFinal = userData.session_id || "";
+        let decision;
 
-        if (!mismaSesion) {
-            sessionIdFinal = crypto.randomUUID();
+        await db.runTransaction(async transaction => {
+            const userDoc = await transaction.get(userRef);
 
-            await userRef.update({
-                session_id: sessionIdFinal,
-                session_started_at: nowTimestamp(),
-                last_heartbeat: nowTimestamp(),
-                last_status: "stream_started",
-                last_ip: ip,
-                last_user_agent: userAgent,
-                active_device_id: deviceId,
-                active_page_id: pageId,
-                last_takeover_at: takeoverRequested ? nowTimestamp() : null
-            });
-
-        } else {
-            const sessionPatch = {};
-
-            // Actualizar page_id en cada carga evita que el cierre de una página
-            // anterior libere accidentalmente una sesión recién reanudada.
-            if (pageId && pageId !== userData.active_page_id) {
-                sessionPatch.active_page_id = pageId;
+            if (!userDoc.exists) {
+                decision = {
+                    ok: false,
+                    status: 403,
+                    body: {
+                        success: false,
+                        code: "PASS_INACTIVE"
+                    }
+                };
+                return;
             }
 
-            if (deviceId && deviceId !== userData.active_device_id) {
-                sessionPatch.active_device_id = deviceId;
+            const userData = userDoc.data() || {};
+
+            if (!userData.fecha_expiracion || typeof userData.fecha_expiracion.toMillis !== "function") {
+                decision = {
+                    ok: false,
+                    status: 403,
+                    body: {
+                        success: false,
+                        code: "NO_EXPIRATION"
+                    }
+                };
+                return;
             }
 
-            if (shouldWriteHeartbeat(userData, ahora)) {
-                sessionPatch.last_heartbeat = nowTimestamp();
-                sessionPatch.last_status = "stream_renewed";
-                sessionPatch.last_ip = ip;
-                sessionPatch.last_user_agent = userAgent;
-            }
+            const expiraMillis = userData.fecha_expiracion.toMillis();
+            const segundosRestantesPase = Math.floor((expiraMillis - ahora) / 1000);
 
-            if (Object.keys(sessionPatch).length) {
-                await userRef.update({
-                    ...sessionPatch
+            if (segundosRestantesPase <= 0) {
+                transaction.update(userRef, {
+                    last_status: "expired",
+                    last_heartbeat: nowTimestamp(),
+                    last_ip: ip,
+                    last_user_agent: userAgent
                 });
+
+                decision = {
+                    ok: false,
+                    status: 403,
+                    body: {
+                        success: false,
+                        code: "PASS_EXPIRED",
+                        error: "Pase expirado"
+                    }
+                };
+                return;
             }
+
+            if (
+                userData.last_status === "revoked_by_admin" ||
+                String(userData.session_id || "").startsWith("revoked_")
+            ) {
+                decision = {
+                    ok: false,
+                    status: 403,
+                    body: {
+                        success: false,
+                        code: "SESSION_REVOKED",
+                        error: "Sesión revocada por administración"
+                    }
+                };
+                return;
+            }
+
+            const lastHeartbeatMillis = getTimestampMillis(userData.last_heartbeat);
+            const sesionActivaReciente = Boolean(
+                userData.session_id &&
+                !String(userData.session_id).startsWith("revoked_") &&
+                userData.last_status !== "expired" &&
+                userData.last_status !== "revoked_by_admin" &&
+                lastHeartbeatMillis &&
+                ahora - lastHeartbeatMillis < ACTIVE_SESSION_WINDOW_MS
+            );
+
+            const mismaSesion = Boolean(
+                requestedSessionId && requestedSessionId === userData.session_id
+            );
+
+            // Caso clave anti-409:
+            // Si el navegador dispara dos generate-stream casi juntos, el segundo
+            // puede llegar sin session_id porque el frontend aún no alcanzó a guardarlo.
+            // Si viene del mismo device_id y el mismo page_id activos, se trata como
+            // la misma página y se devuelve la sesión existente, no un 409.
+            const mismaPaginaActiva = Boolean(
+                !requestedSessionId &&
+                sesionActivaReciente &&
+                deviceId &&
+                pageId &&
+                userData.active_device_id === deviceId &&
+                userData.active_page_id === pageId
+            );
+
+            const sesionReutilizable = mismaSesion || mismaPaginaActiva;
+
+            // Un session_id inventado, antiguo o una página distinta no debe saltarse
+            // el bloqueo, salvo que el usuario pulse CONTINUAR AQUÍ / takeover=1.
+            if (sesionActivaReciente && !sesionReutilizable && !takeoverRequested) {
+                decision = {
+                    ok: false,
+                    status: 409,
+                    body: {
+                        success: false,
+                        code: "SESSION_ALREADY_ACTIVE",
+                        error: "Ya existe una sesión activa para este usuario.",
+                        can_takeover: true
+                    }
+                };
+                return;
+            }
+
+            let sessionIdFinal = userData.session_id || "";
+            let createdNewSession = false;
+
+            if (!sesionReutilizable) {
+                sessionIdFinal = crypto.randomUUID();
+                createdNewSession = true;
+
+                transaction.update(userRef, {
+                    session_id: sessionIdFinal,
+                    session_started_at: nowTimestamp(),
+                    last_heartbeat: nowTimestamp(),
+                    last_status: takeoverRequested ? "stream_takeover" : "stream_started",
+                    last_ip: ip,
+                    last_user_agent: userAgent,
+                    active_device_id: deviceId,
+                    active_page_id: pageId,
+                    last_takeover_at: takeoverRequested ? nowTimestamp() : null
+                });
+            } else {
+                const sessionPatch = {};
+
+                // Actualizar page_id en cada carga evita que el cierre de una página
+                // anterior libere accidentalmente una sesión recién reanudada.
+                if (pageId && pageId !== userData.active_page_id) {
+                    sessionPatch.active_page_id = pageId;
+                }
+
+                if (deviceId && deviceId !== userData.active_device_id) {
+                    sessionPatch.active_device_id = deviceId;
+                }
+
+                if (shouldWriteHeartbeat(userData, ahora)) {
+                    sessionPatch.last_heartbeat = nowTimestamp();
+                    sessionPatch.last_status = mismaPaginaActiva
+                        ? "stream_reattached"
+                        : "stream_renewed";
+                    sessionPatch.last_ip = ip;
+                    sessionPatch.last_user_agent = userAgent;
+                }
+
+                if (Object.keys(sessionPatch).length) {
+                    transaction.update(userRef, sessionPatch);
+                }
+            }
+
+            decision = {
+                ok: true,
+                sessionIdFinal,
+                expiraMillis,
+                segundosRestantesPase,
+                reusedSession: sesionReutilizable,
+                reattachedSamePage: mismaPaginaActiva,
+                takeoverApplied: takeoverRequested && createdNewSession,
+                createdNewSession
+            };
+        });
+
+        if (!decision || !decision.ok) {
+            const status = decision?.status || 500;
+            const body = decision?.body || {
+                success: false,
+                code: "SERVER_ERROR"
+            };
+            return res.status(status).json(body);
         }
 
-        const tokenDuration = Math.min(BUNNY_TOKEN_DURATION_SECONDS, segundosRestantesPase);
+        const tokenDuration = Math.min(
+            BUNNY_TOKEN_DURATION_SECONDS,
+            decision.segundosRestantesPase
+        );
 
         // Catálogo dinámico para los clientes nuevos. También se mantienen los
         // campos legacy hasta terminar la migración de en-directo.html y tv.html.
-        const forceConfigRefresh = req.query.refresh_config === "1";
         const streamConfig = await getActiveStreamConfig(forceConfigRefresh);
         const playbackCatalog = materializeTransmissionCatalog(
             streamConfig,
@@ -1069,7 +1134,7 @@ app.get('/generate-stream', streamLimiter, async (req, res) => {
         const bunnyExpires = signed.expires;
 
         console.log(
-            `✅ Stream [${mismaSesion ? 'RENOVADO' : 'NUEVO'}] | uid=${uid} | transmisiones=${playbackCatalog.transmissions.length} | legacy=${legacyHlsSource} | duration=${tokenDuration}s`
+            `✅ Stream [${decision.reusedSession ? 'RENOVADO' : 'NUEVO'}] | uid=${uid} | transmisiones=${playbackCatalog.transmissions.length} | legacy=${legacyHlsSource} | duration=${tokenDuration}s | reattach=${decision.reattachedSamePage ? '1' : '0'} | takeover=${decision.takeoverApplied ? '1' : '0'}`
         );
 
         res.set('X-Stream-Config-Version', streamConfig.version);
@@ -1085,11 +1150,12 @@ app.get('/generate-stream', streamLimiter, async (req, res) => {
             transmissions: playbackCatalog.transmissions,
             default_transmission_id: playbackCatalog.default_transmission_id,
             stream_config_version: streamConfig.version,
-            session_id: sessionIdFinal,
-            reused_session: mismaSesion,
-            takeover: takeoverRequested && !mismaSesion,
+            session_id: decision.sessionIdFinal,
+            reused_session: decision.reusedSession,
+            reattached_same_page: decision.reattachedSamePage,
+            takeover: decision.takeoverApplied,
             bunny_expires: bunnyExpires,
-            pase_expira: expiraMillis
+            pase_expira: decision.expiraMillis
         });
 
     } catch (error) {
@@ -1175,10 +1241,10 @@ app.post('/check-session', async (req, res) => {
             });
         }
 
-        const { session_id } = req.body || {};
+        const sessionId = normalizeClientId(req.body?.session_id);
         const pageId = normalizeClientId(req.body?.page_id);
 
-        if (!session_id) {
+        if (!sessionId) {
             return res.status(400).json({
                 valid: false,
                 motivo: "missing_session"
@@ -1243,7 +1309,7 @@ app.post('/check-session', async (req, res) => {
         }
 
         if (
-            session_id !== userData.session_id ||
+            sessionId !== userData.session_id ||
             (userData.active_page_id && pageId && pageId !== userData.active_page_id)
         ) {
             return res.json({
@@ -1710,5 +1776,5 @@ app.post('/admin/listar-usuarios', adminLimiter, verifyAdmin, async (req, res) =
 const PORT = process.env.PORT || 3000;
 
 app.listen(PORT, () => {
-    console.log(`🚀 GOLAZO SECURE STREAM READY (FASE 10.1: SINCRONIZACIÓN SIN CACHÉ)`);
+    console.log(`🚀 GOLAZO SECURE STREAM READY (FASE 10.2: SESIONES IDEMPOTENTES Y ANTI-409)`);
 });
