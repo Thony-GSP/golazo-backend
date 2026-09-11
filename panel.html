@@ -11,7 +11,7 @@
     <style>
         :root { --primary: #ef4444; --bg: #0f172a; --card: #1e293b; --text: #f8fafc; }
         body { font-family: 'Segoe UI', sans-serif; background: var(--bg); color: var(--text); padding: 10px; margin: 0; }
-        .dashboard { max-width: 1100px; margin: auto; background: var(--card); padding: 20px; border-radius: 16px; border-top: 5px solid var(--primary); }
+        .dashboard { max-width: 1450px; margin: auto; background: var(--card); padding: 20px; border-radius: 16px; border-top: 5px solid var(--primary); }
         h1 { text-align: center; color: var(--primary); font-size: 20px; margin-bottom: 20px; }
         .section { background: var(--bg); padding: 15px; border-radius: 12px; margin-bottom: 15px; border: 1px solid #334155; }
         input, textarea, select { width: 100%; padding: 10px; margin: 5px 0; border-radius: 8px; background: var(--card); color: white; border: 1px solid #475569; box-sizing: border-box; }
@@ -56,8 +56,48 @@
         .option-actions button { width: auto; min-width: 0; padding: 9px 10px; margin: 0; font-size: 11px; }
         .empty-streams { padding: 18px; text-align: center; color: #94a3b8; border: 1px dashed #475569; border-radius: 8px; }
         .btn-neutral { background: #475569; color: white; }
+        .stats-grid { display:grid; grid-template-columns:repeat(auto-fit,minmax(145px,1fr)); gap:10px; margin:14px 0; }
+        .stat-card { background:#111827; border:1px solid #334155; border-radius:10px; padding:12px; }
+        .stat-label { color:#94a3b8; font-size:11px; font-weight:700; text-transform:uppercase; }
+        .stat-value { font-size:24px; font-weight:800; margin-top:4px; }
+        .stat-sub { color:#94a3b8; font-size:10px; margin-top:3px; }
+        .filters-panel, .bulk-panel, .events-panel { background:#111827; border:1px solid #334155; border-radius:10px; padding:12px; margin:12px 0; }
+        .filters-grid { display:grid; grid-template-columns:minmax(220px,2fr) repeat(3,minmax(145px,1fr)); gap:8px; }
+        .bulk-grid { display:grid; grid-template-columns:minmax(160px,1fr) minmax(130px,.7fr) minmax(130px,.7fr) minmax(190px,1.2fr) minmax(220px,1.5fr) auto; gap:8px; align-items:end; }
+        .bulk-grid button { margin:5px 0; width:auto; white-space:nowrap; }
+        .bulk-actions { display:flex; gap:8px; flex-wrap:wrap; margin-top:8px; align-items:center; }
+        .device-chips { display:flex; gap:7px; flex-wrap:wrap; margin:8px 0 4px; }
+        .device-chip { background:#1e293b; border:1px solid #475569; border-radius:999px; padding:5px 9px; font-size:11px; }
+        .event-table { min-width:650px; }
+        .event-table td, .event-table th { padding:8px; }
+        .live-dot { display:inline-block; width:7px; height:7px; border-radius:50%; background:#ef4444; margin-right:5px; }
+        .badge-live { background:#991b1b; color:white; }
+        .badge-offline { background:#334155; color:#e2e8f0; }
+        .badge-never { background:#78350f; color:#fef3c7; }
+        .row-live { background:rgba(127,29,29,.10); }
+        .selection-info { color:#cbd5e1; font-size:12px; font-weight:700; }
+        .action-stack { display:flex; gap:5px; flex-wrap:wrap; min-width:185px; }
+        .btn-extend { background:#2563eb; color:white; }
+        .btn-history { background:#7c3aed; color:white; }
+        .audit-table { min-width:1320px; }
+        .audit-checkbox { width:auto; margin:0; }
+        .modal-overlay { position:fixed; inset:0; z-index:9999; background:rgba(2,6,23,.82); display:none; align-items:center; justify-content:center; padding:16px; }
+        .modal-card { width:min(680px,100%); max-height:88vh; overflow:auto; background:#111827; border:1px solid #475569; border-radius:14px; padding:18px; box-shadow:0 20px 60px rgba(0,0,0,.45); }
+        .modal-head { display:flex; justify-content:space-between; gap:10px; align-items:center; margin-bottom:12px; }
+        .modal-head h3 { margin:0; }
+        .modal-close { width:auto; background:#475569; padding:7px 10px; margin:0; }
+        .modal-actions { display:flex; gap:8px; justify-content:flex-end; flex-wrap:wrap; margin-top:12px; }
+        .modal-actions button { width:auto; }
+        .history-item { border-left:3px solid #475569; padding:8px 10px; margin:8px 0; background:#0f172a; border-radius:0 8px 8px 0; }
+        .history-item strong { display:block; margin-bottom:3px; }
+        .help-text { color:#94a3b8; font-size:11px; line-height:1.45; }
+        .toolbar-buttons { display:flex; gap:8px; flex-wrap:wrap; }
+        .toolbar-buttons button { width:auto; padding:8px 12px; }
+        @media (max-width: 1050px) {
+            .filters-grid, .bulk-grid { grid-template-columns:1fr 1fr; }
+        }
         @media (max-width: 760px) {
-            .transmission-fields, .option-row { grid-template-columns: 1fr; }
+            .transmission-fields, .option-row, .filters-grid, .bulk-grid { grid-template-columns: 1fr; }
             .option-actions { padding-bottom: 0; }
             .transmission-head { align-items: flex-start; flex-direction: column; }
         }
@@ -121,32 +161,200 @@
         </div>
 
         <div class="section">
-            <div style="display: flex; justify-content: space-between; align-items: center;">
-                <h2>📊 AUDITORÍA Y CONTROL</h2>
-                <div style="display: flex; gap: 10px;">
-                    <button onclick="cargarUsuarios()" style="width:auto; padding:8px 15px;">🔄 Refrescar</button>
-                    <button onclick="limpiarCaducados()" style="width:auto; background:#475569; padding:8px 15px;">🧹 Limpiar</button>
+            <div style="display:flex; justify-content:space-between; align-items:center; gap:10px; flex-wrap:wrap;">
+                <div>
+                    <h2 style="margin-bottom:4px;">📊 AUDITORÍA Y CONTROL EN VIVO</h2>
+                    <div class="muted">Los contadores se actualizan cada 30 segundos.</div>
+                </div>
+                <div class="toolbar-buttons">
+                    <button onclick="cargarUsuarios()">🔄 Refrescar</button>
+                    <button class="btn-history" onclick="mostrarHistorialArchivado()">📚 Historial</button>
+                    <button class="btn-neutral" onclick="limpiarCaducados()">🧹 Limpiar vencidos</button>
                 </div>
             </div>
+
+            <div class="stats-grid">
+                <div class="stat-card"><div class="stat-label">Cuentas actuales</div><div class="stat-value" id="statTotal">0</div><div class="stat-sub">En Firestore ahora</div></div>
+                <div class="stat-card"><div class="stat-label">Viendo ahora</div><div class="stat-value" id="statWatching">0</div><div class="stat-sub">Heartbeat reciente</div></div>
+                <div class="stat-card"><div class="stat-label">Pases vigentes</div><div class="stat-value" id="statActive">0</div><div class="stat-sub">Con acceso válido</div></div>
+                <div class="stat-card"><div class="stat-label">Sin conexión</div><div class="stat-value" id="statOffline">0</div><div class="stat-sub">Vigentes, no viendo</div></div>
+                <div class="stat-card"><div class="stat-label">Nunca ingresaron</div><div class="stat-value" id="statNever">0</div><div class="stat-sub">Pase creado sin uso</div></div>
+                <div class="stat-card"><div class="stat-label">Vencidos</div><div class="stat-value" id="statExpired">0</div><div class="stat-sub">Pendientes de limpiar</div></div>
+                <div class="stat-card"><div class="stat-label">Revocados</div><div class="stat-value" id="statRevoked">0</div><div class="stat-sub">Bloqueados por admin</div></div>
+                <div class="stat-card"><div class="stat-label">VIP</div><div class="stat-value" id="statVip">0</div><div class="stat-sub">Socios actuales</div></div>
+            </div>
+
+            <div id="deviceSummary" class="device-chips"></div>
+
+            <div class="events-panel">
+                <div style="display:flex; justify-content:space-between; align-items:center; gap:10px; flex-wrap:wrap;">
+                    <strong>⚽ Resumen por partido</strong>
+                    <span class="help-text">El pico simultáneo se registra mientras el panel está abierto y actualizándose.</span>
+                </div>
+                <div class="table-wrap">
+                    <table class="event-table">
+                        <thead><tr><th>PARTIDO</th><th>PASES</th><th>VIGENTES</th><th>EN VIVO</th><th>SIN INGRESAR</th><th>PICO</th></tr></thead>
+                        <tbody id="eventSummaryBody"><tr><td colspan="6" class="muted">Sin datos todavía.</td></tr></tbody>
+                    </table>
+                </div>
+            </div>
+
+            <div class="filters-panel">
+                <strong>🔎 Buscar y filtrar</strong>
+                <div class="filters-grid" style="margin-top:8px;">
+                    <input id="buscarUsuario" type="search" placeholder="Código, usuario, partido, IP, UID..." oninput="renderUsuarios()">
+                    <select id="filtroPartido" onchange="renderUsuarios()"><option value="">Todos los partidos</option></select>
+                    <select id="filtroEstado" onchange="renderUsuarios()">
+                        <option value="">Todos los estados</option>
+                        <option value="activo">Vigentes</option>
+                        <option value="vencido">Vencidos</option>
+                        <option value="revocado">Revocados</option>
+                    </select>
+                    <select id="filtroConexion" onchange="renderUsuarios()">
+                        <option value="">Toda conexión</option>
+                        <option value="viendo">Viendo ahora</option>
+                        <option value="desconectado">Vigente sin conexión</option>
+                        <option value="nunca">Nunca ingresó</option>
+                    </select>
+                </div>
+                <div style="display:grid; grid-template-columns:minmax(180px,1fr) minmax(180px,1fr); gap:8px; margin-top:4px;">
+                    <select id="filtroTipo" onchange="renderUsuarios()">
+                        <option value="">Todos los tipos</option>
+                        <option value="partido">Pase rápido</option>
+                        <option value="vip">Socio VIP</option>
+                    </select>
+                    <div class="selection-info" style="padding:12px 4px;">Mostrando <span id="visibleCount">0</span> · Seleccionados <span id="selectedCount">0</span></div>
+                </div>
+            </div>
+
+            <div class="bulk-panel">
+                <strong>⏱️ Extensión masiva / partidos con suplementarios</strong>
+                <div class="bulk-grid" style="margin-top:8px;">
+                    <div>
+                        <label class="field-label">Aplicar a</label>
+                        <select id="bulkScope">
+                            <option value="selected">Usuarios seleccionados</option>
+                            <option value="filtered">Resultado filtrado</option>
+                            <option value="active">Todos los pases rápidos vigentes</option>
+                            <option value="event">Partido filtrado (vigentes)</option>
+                        </select>
+                    </div>
+                    <div>
+                        <label class="field-label">Modo</label>
+                        <select id="bulkMode" onchange="actualizarCamposExtension('bulk')">
+                            <option value="add">Sumar tiempo</option>
+                            <option value="set">Fijar hora</option>
+                        </select>
+                    </div>
+                    <div id="bulkMinutesWrap">
+                        <label class="field-label">Tiempo</label>
+                        <select id="bulkMinutes">
+                            <option value="15">+15 min</option>
+                            <option value="30" selected>+30 min</option>
+                            <option value="45">+45 min</option>
+                            <option value="60">+60 min</option>
+                            <option value="90">+90 min</option>
+                            <option value="120">+2 horas</option>
+                            <option value="180">+3 horas</option>
+                        </select>
+                    </div>
+                    <div id="bulkDateWrap" style="display:none;">
+                        <label class="field-label">Nueva expiración</label>
+                        <input type="datetime-local" id="bulkCustomDate">
+                    </div>
+                    <div>
+                        <label class="field-label">Nuevo partido (opcional)</label>
+                        <input id="bulkNewLabel" type="text" placeholder="Ej: Partido siguiente">
+                    </div>
+                    <button class="btn-extend" onclick="aplicarExtensionMasiva()">Extender</button>
+                </div>
+                <div class="bulk-actions">
+                    <button class="btn-danger btn-small" onclick="revocarSeleccionados()">Revocar seleccionados</button>
+                    <button class="btn-neutral btn-small" onclick="limpiarSeleccion()">Limpiar selección</button>
+                    <span class="help-text">“Sumar tiempo” agrega desde el vencimiento actual; si ya venció, agrega desde ahora.</span>
+                </div>
+            </div>
+
             <div class="table-wrap">
                 <table class="audit-table">
                     <thead>
                         <tr>
+                            <th><input class="audit-checkbox" id="selectAllVisible" type="checkbox" title="Seleccionar visibles"></th>
                             <th>USUARIO</th>
-                            <th>TIPO/PARTIDO</th>
+                            <th>PARTIDO / TIPO</th>
+                            <th>CONEXIÓN</th>
                             <th>ESTADO</th>
                             <th>EXPIRA</th>
                             <th>ÚLTIMA ACTIVIDAD</th>
                             <th>IP</th>
-                            <th>SESIÓN</th>
-                            <th>CLAVE</th>
-                            <th>ACCIÓN</th>
+                            <th>EXTENSIONES</th>
+                            <th>ACCIONES</th>
                         </tr>
                     </thead>
                     <tbody id="tablaUsuarios"></tbody>
                 </table>
             </div>
         </div>
+    </div>
+</div>
+
+<div id="extensionModal" class="modal-overlay">
+    <div class="modal-card">
+        <div class="modal-head">
+            <h3>⏱️ Extender acceso</h3>
+            <button class="modal-close" onclick="cerrarModal('extensionModal')">Cerrar</button>
+        </div>
+        <div id="extensionTarget" class="muted" style="margin-bottom:8px;"></div>
+        <input type="hidden" id="extensionUid">
+        <label class="field-label">Modo</label>
+        <select id="individualMode" onchange="actualizarCamposExtension('individual')">
+            <option value="add">Sumar tiempo al vencimiento</option>
+            <option value="set">Fijar nueva fecha/hora</option>
+        </select>
+        <div id="individualMinutesWrap">
+            <label class="field-label">Tiempo adicional</label>
+            <select id="individualMinutes">
+                <option value="15">+15 min</option>
+                <option value="30" selected>+30 min</option>
+                <option value="45">+45 min</option>
+                <option value="60">+60 min</option>
+                <option value="90">+90 min</option>
+                <option value="120">+2 horas</option>
+                <option value="180">+3 horas</option>
+            </select>
+        </div>
+        <div id="individualDateWrap" style="display:none;">
+            <label class="field-label">Nueva expiración</label>
+            <input type="datetime-local" id="individualCustomDate">
+        </div>
+        <label class="field-label">Cambiar a otro partido (opcional)</label>
+        <input id="individualNewLabel" type="text" placeholder="Déjalo vacío para conservar el partido actual">
+        <div class="help-text">Si el cliente compra el partido siguiente, puedes extender su mismo usuario y cambiar aquí la etiqueta del partido.</div>
+        <div class="modal-actions">
+            <button class="btn-neutral" onclick="cerrarModal('extensionModal')">Cancelar</button>
+            <button class="btn-extend" onclick="confirmarExtensionIndividual()">Aplicar extensión</button>
+        </div>
+    </div>
+</div>
+
+<div id="historyModal" class="modal-overlay">
+    <div class="modal-card">
+        <div class="modal-head">
+            <h3 id="historyTitle">📜 Historial</h3>
+            <button class="modal-close" onclick="cerrarModal('historyModal')">Cerrar</button>
+        </div>
+        <div id="historyContent"></div>
+    </div>
+</div>
+
+<div id="archiveModal" class="modal-overlay">
+    <div class="modal-card" style="width:min(900px,100%);">
+        <div class="modal-head">
+            <h3>📚 Historial de accesos archivados</h3>
+            <button class="modal-close" onclick="cerrarModal('archiveModal')">Cerrar</button>
+        </div>
+        <div class="help-text">Al limpiar vencidos, se elimina la cuenta de Firebase Auth pero se conserva aquí su registro operativo.</div>
+        <div id="archiveContent" style="margin-top:10px;"></div>
     </div>
 </div>
 
@@ -172,6 +380,10 @@
     let cargandoUsuarios = false;
     let streamTransmissions = [];
     let defaultTransmissionId = "";
+    let usuariosCache = [];
+    let eventosCache = [];
+    let resumenCache = {};
+    const usuariosSeleccionados = new Set();
 
     function iniciarAutoRefresh() {
         if (autoRefreshInterval) {
@@ -933,9 +1145,206 @@ Este acceso es válido para 1 dispositivo.
         }
     }
 
+    function formatDateTimeMs(ms) {
+        if (!ms) return "-";
+        return new Date(ms).toLocaleString('es-PE', {
+            timeZone: 'America/Lima',
+            day: '2-digit',
+            month: '2-digit',
+            year: 'numeric',
+            hour: '2-digit',
+            minute: '2-digit',
+            hour12: true
+        });
+    }
+
+    function renderDashboard() {
+        const r = resumenCache || {};
+        document.getElementById('statTotal').textContent = r.total || 0;
+        document.getElementById('statWatching').textContent = r.viendo_ahora || 0;
+        document.getElementById('statActive').textContent = r.vigentes || 0;
+        document.getElementById('statOffline').textContent = r.desconectados || 0;
+        document.getElementById('statNever').textContent = r.nunca_ingresaron || 0;
+        document.getElementById('statExpired').textContent = r.vencidos || 0;
+        document.getElementById('statRevoked').textContent = r.revocados || 0;
+        document.getElementById('statVip').textContent = r.vip || 0;
+
+        const dispositivos = Object.entries(r.dispositivos || {})
+            .sort((a, b) => b[1] - a[1]);
+        document.getElementById('deviceSummary').innerHTML = dispositivos.length
+            ? dispositivos.map(([nombre, cantidad]) => `<span class="device-chip">${escapeHtml(nombre)}: <b>${cantidad}</b></span>`).join('')
+            : '<span class="muted">Sin usuarios conectados en este momento.</span>';
+
+        document.getElementById('eventSummaryBody').innerHTML = eventosCache.length
+            ? eventosCache.map(e => `<tr>
+                <td><b>${escapeHtml(e.etiqueta || '-')}</b></td>
+                <td>${e.total || 0}</td>
+                <td>${e.vigentes || 0}</td>
+                <td><span class="live-dot"></span><b>${e.viendo_ahora || 0}</b></td>
+                <td>${e.nunca_ingresaron || 0}</td>
+                <td><b>${e.peak_concurrent || 0}</b></td>
+            </tr>`).join('')
+            : '<tr><td colspan="6" class="muted">No hay pases de partido para resumir.</td></tr>';
+    }
+
+    function actualizarFiltroPartidos() {
+        const select = document.getElementById('filtroPartido');
+        const previo = select.value;
+        const opciones = [...eventosCache]
+            .sort((a, b) => String(a.etiqueta || '').localeCompare(String(b.etiqueta || ''), 'es'));
+
+        select.innerHTML = '<option value="">Todos los partidos</option>' + opciones
+            .map(e => `<option value="${escapeAttr(e.event_id)}">${escapeHtml(e.etiqueta || '-')}</option>`)
+            .join('');
+
+        if ([...select.options].some(o => o.value === previo)) select.value = previo;
+    }
+
+    function getFilteredUsers() {
+        const query = document.getElementById('buscarUsuario').value.trim().toLowerCase();
+        const eventId = document.getElementById('filtroPartido').value;
+        const estado = document.getElementById('filtroEstado').value;
+        const conexion = document.getElementById('filtroConexion').value;
+        const tipo = document.getElementById('filtroTipo').value;
+
+        return usuariosCache.filter(u => {
+            const haystack = [
+                u.usuario_corto,
+                u.codigo,
+                u.etiqueta,
+                u.uid,
+                u.last_ip,
+                u.dispositivo
+            ].join(' ').toLowerCase();
+
+            if (query && !haystack.includes(query)) return false;
+            if (eventId && u.event_id !== eventId) return false;
+            if (tipo && u.tipo_acceso !== tipo) return false;
+
+            if (estado === 'activo' && !u.esActivo) return false;
+            if (estado === 'vencido' && u.fecha_vigente) return false;
+            if (estado === 'revocado' && !u.revocado) return false;
+
+            if (conexion === 'viendo' && !u.viendo_ahora) return false;
+            if (conexion === 'desconectado' && !(u.esActivo && !u.viendo_ahora)) return false;
+            if (conexion === 'nunca' && !u.nunca_ingreso) return false;
+
+            return true;
+        });
+    }
+
+    function connectionBadge(u) {
+        if (u.viendo_ahora) return '<span class="badge badge-live"><span class="live-dot"></span>EN VIVO</span>';
+        if (u.nunca_ingreso) return '<span class="badge badge-never">SIN INGRESO</span>';
+        return '<span class="badge badge-offline">DESCONECTADO</span>';
+    }
+
+    function estadoBadge(u) {
+        if (u.revocado) return '<span class="badge badge-danger">REVOCADO</span>';
+        if (!u.fecha_vigente) return '<span class="badge badge-danger">VENCIDO</span>';
+        if (u.viendo_ahora) return '<span class="badge badge-ok">ACTIVO</span>';
+        return '<span class="badge badge-session">VIGENTE</span>';
+    }
+
+    function renderUsuarios() {
+        const usuarios = getFilteredUsers();
+        document.getElementById('visibleCount').textContent = usuarios.length;
+        document.getElementById('selectedCount').textContent = usuariosSeleccionados.size;
+
+        const rows = usuarios.map(u => {
+            const uid = escapeAttr(u.uid || "");
+            const usuario = escapeHtml(u.usuario_corto || "-");
+            const etiqueta = escapeHtml(u.etiqueta || "-");
+            const tipoAcceso = escapeHtml(formatearTipoAcceso(u));
+            const ultimaConexion = escapeHtml(u.ultima_conexion || "-");
+            const ip = escapeHtml(u.last_ip || "Sin registro");
+            const userAgent = escapeAttr(u.last_user_agent || "Sin registro");
+            const navegador = escapeHtml(u.dispositivo || resumirUserAgent(u.last_user_agent || ""));
+            const checked = usuariosSeleccionados.has(u.uid) ? 'checked' : '';
+            const puedeRevocar = u.esActivo && !u.revocado;
+
+            const extText = u.extension_count
+                ? `<b>${u.extension_count}</b><div class="muted">${u.last_extension_ms ? formatDateTimeMs(u.last_extension_ms) : ''}</div>`
+                : '<span class="muted">0</span>';
+
+            return `<tr class="${u.viendo_ahora ? 'row-live' : ''}">
+                <td><input class="audit-checkbox row-select" type="checkbox" data-uid="${uid}" ${checked}></td>
+                <td>
+                    <b>${usuario}</b>
+                    <div class="muted">Código: ${escapeHtml(u.codigo || '-')} · ${navegador}</div>
+                </td>
+                <td>
+                    <b>${etiqueta}</b>
+                    <div class="muted">${tipoAcceso}</div>
+                </td>
+                <td>${connectionBadge(u)}</td>
+                <td>${estadoBadge(u)}</td>
+                <td>${escapeHtml(u.tiempo || '-')}</td>
+                <td>${ultimaConexion}</td>
+                <td class="ip-cell" title="${userAgent}">${ip}</td>
+                <td>${extText}</td>
+                <td>
+                    <div class="action-stack">
+                        <button class="btn-small btn-extend btn-extender" data-uid="${uid}">Extender</button>
+                        <button class="btn-small btn-history btn-historial" data-uid="${uid}">Historial</button>
+                        <button class="btn-small btn-danger btn-revocar" data-uid="${uid}" data-user="${escapeAttr(u.usuario_corto || '-') }" ${puedeRevocar ? '' : 'disabled'}>Revocar</button>
+                    </div>
+                </td>
+            </tr>`;
+        }).join('');
+
+        document.getElementById('tablaUsuarios').innerHTML = rows || `
+            <tr><td colspan="10" style="text-align:center; color:#94a3b8; padding:22px;">No hay usuarios que coincidan con los filtros.</td></tr>`;
+
+        document.querySelectorAll('.row-select').forEach(cb => {
+            cb.addEventListener('change', () => {
+                if (cb.checked) usuariosSeleccionados.add(cb.dataset.uid);
+                else usuariosSeleccionados.delete(cb.dataset.uid);
+                actualizarContadorSeleccion();
+            });
+        });
+
+        document.querySelectorAll('.btn-extender').forEach(btn => {
+            btn.addEventListener('click', () => abrirExtensionIndividual(btn.dataset.uid));
+        });
+
+        document.querySelectorAll('.btn-historial').forEach(btn => {
+            btn.addEventListener('click', () => mostrarHistorialUsuario(btn.dataset.uid));
+        });
+
+        document.querySelectorAll('.btn-revocar').forEach(btn => {
+            btn.addEventListener('click', () => revocarSesion(btn.dataset.uid, btn.dataset.user));
+        });
+
+        const selectAll = document.getElementById('selectAllVisible');
+        if (selectAll) {
+            const visiblesIds = usuarios.map(u => u.uid);
+            selectAll.checked = visiblesIds.length > 0 && visiblesIds.every(uid => usuariosSeleccionados.has(uid));
+            selectAll.indeterminate = !selectAll.checked && visiblesIds.some(uid => usuariosSeleccionados.has(uid));
+        }
+    }
+
+    function actualizarContadorSeleccion() {
+        document.getElementById('selectedCount').textContent = usuariosSeleccionados.size;
+        renderUsuarios();
+    }
+
+    function limpiarSeleccion() {
+        usuariosSeleccionados.clear();
+        renderUsuarios();
+    }
+
+    document.getElementById('selectAllVisible').addEventListener('change', (event) => {
+        const visibles = getFilteredUsers();
+        visibles.forEach(u => {
+            if (event.target.checked) usuariosSeleccionados.add(u.uid);
+            else usuariosSeleccionados.delete(u.uid);
+        });
+        renderUsuarios();
+    });
+
     async function cargarUsuarios() {
         if (cargandoUsuarios) return;
-
         cargandoUsuarios = true;
 
         try {
@@ -945,8 +1354,8 @@ Este acceso es válido para 1 dispositivo.
             });
 
             const rawText = await res.text();
-
             let d = {};
+
             try {
                 d = JSON.parse(rawText);
             } catch (e) {
@@ -960,71 +1369,19 @@ Este acceso es válido para 1 dispositivo.
                 return;
             }
 
-            const rows = d.usuarios.map(u => {
-                const uid = escapeAttr(u.uid || "");
-                const usuario = escapeHtml(u.usuario_corto || "-");
-                const usuarioAttr = escapeAttr(u.usuario_corto || "-");
-                const etiqueta = escapeHtml(u.etiqueta || "-");
-                const tipoAcceso = escapeHtml(formatearTipoAcceso(u));
-                const estado = escapeHtml(u.estado || "-");
-                const tiempo = escapeHtml(u.tiempo || "-");
-                const ultimaConexion = escapeHtml(u.ultima_conexion || "-");
-                const ip = escapeHtml(u.last_ip || "Sin registro");
-                const status = u.last_status || "-";
-                const statusTexto = escapeHtml(formatearSesion(status));
-                const sessionClass = claseSesion(status);
-                const userAgent = escapeAttr(u.last_user_agent || "Sin registro");
-                const navegador = escapeHtml(resumirUserAgent(u.last_user_agent || ""));
+            usuariosCache = Array.isArray(d.usuarios) ? d.usuarios : [];
+            eventosCache = Array.isArray(d.eventos) ? d.eventos : [];
+            resumenCache = d.resumen || {};
 
-                const puedeRevocar = u.esActivo && status !== "revoked_by_admin";
-
-                return `<tr>
-                    <td>
-                        <b>${usuario}</b>
-                        <div class="muted">${navegador}</div>
-                    </td>
-                    <td>
-                        <b>${etiqueta}</b>
-                        <div class="muted">${tipoAcceso}</div>
-                    </td>
-                    <td>
-                        <span class="badge" style="background:${u.esActivo ? '#065f46' : '#7f1d1d'}">${estado}</span>
-                    </td>
-                    <td>${tiempo}</td>
-                    <td>${ultimaConexion}</td>
-                    <td class="ip-cell" title="${userAgent}">${ip}</td>
-                    <td>
-                        <span class="badge ${sessionClass}">${statusTexto}</span>
-                    </td>
-                    <td>${formatearClave(u.password_stored)}</td>
-                    <td>
-                        <button 
-                            class="btn-small btn-danger btn-revocar"
-                            data-uid="${uid}"
-                            data-user="${usuarioAttr}"
-                            ${puedeRevocar ? "" : "disabled"}
-                        >
-                            Revocar
-                        </button>
-                    </td>
-                </tr>`;
-            }).join('');
-
-            document.getElementById('tablaUsuarios').innerHTML = rows || `
-                <tr>
-                    <td colspan="9" style="text-align:center; color:#94a3b8;">
-                        No hay usuarios para mostrar.
-                    </td>
-                </tr>
-            `;
-
-            document.querySelectorAll('.btn-revocar').forEach(btn => {
-                btn.addEventListener('click', () => {
-                    const uid = btn.dataset.uid;
-                    const usuario = btn.dataset.user;
-                    revocarSesion(uid, usuario);
-                });
+            // Elimina selecciones que ya no existen porque fueron limpiadas.
+            const existentes = new Set(usuariosCache.map(u => u.uid));
+            [...usuariosSeleccionados].forEach(uid => {
+                if (!existentes.has(uid)) usuariosSeleccionados.delete(uid);
             });
+
+            renderDashboard();
+            actualizarFiltroPartidos();
+            renderUsuarios();
 
         } catch(e) {
             console.error("Error cargando usuarios:", e);
@@ -1034,13 +1391,109 @@ Este acceso es válido para 1 dispositivo.
         }
     }
 
-    async function revocarSesion(uid, usuario) {
-        if (!uid) {
-            return alert("UID inválido.");
+    function actualizarCamposExtension(scope) {
+        const mode = document.getElementById(`${scope}Mode`).value;
+        document.getElementById(`${scope}MinutesWrap`).style.display = mode === 'add' ? 'block' : 'none';
+        document.getElementById(`${scope}DateWrap`).style.display = mode === 'set' ? 'block' : 'none';
+    }
+
+    function abrirExtensionIndividual(uid) {
+        const user = usuariosCache.find(u => u.uid === uid);
+        if (!user) return alert("Usuario no encontrado en la lista actual.");
+
+        document.getElementById('extensionUid').value = uid;
+        document.getElementById('extensionTarget').textContent = `${user.usuario_corto} · ${user.etiqueta} · vence ${user.tiempo}`;
+        document.getElementById('individualMode').value = 'add';
+        document.getElementById('individualMinutes').value = '30';
+        document.getElementById('individualCustomDate').value = '';
+        document.getElementById('individualNewLabel').value = '';
+        actualizarCamposExtension('individual');
+        abrirModal('extensionModal');
+    }
+
+    function obtenerUidsAlcance() {
+        const scope = document.getElementById('bulkScope').value;
+
+        if (scope === 'selected') return [...usuariosSeleccionados];
+        if (scope === 'filtered') return getFilteredUsers().map(u => u.uid);
+        if (scope === 'active') return usuariosCache.filter(u => u.esActivo && u.tipo_acceso === 'partido').map(u => u.uid);
+
+        if (scope === 'event') {
+            const eventId = document.getElementById('filtroPartido').value;
+            if (!eventId) {
+                alert("Selecciona primero un partido en el filtro 'Todos los partidos'.");
+                return [];
+            }
+            return usuariosCache.filter(u => u.event_id === eventId && u.esActivo).map(u => u.uid);
         }
 
-        const ok = confirm(`¿Revocar la sesión activa de ${usuario}?\n\nEl usuario será expulsado de la transmisión en breve.`);
+        return [];
+    }
 
+    async function aplicarExtension(uids, mode, minutes, customDateValue, newLabel) {
+        if (!uids.length) return alert("No hay usuarios para aplicar la extensión.");
+        if (uids.length > 300) return alert("Máximo 300 usuarios por operación.");
+
+        const payload = { uids, mode, new_label: newLabel || '' };
+
+        if (mode === 'add') {
+            payload.minutes = Number(minutes);
+        } else {
+            if (!customDateValue) return alert("Selecciona la nueva fecha y hora de expiración.");
+            const date = new Date(customDateValue);
+            if (Number.isNaN(date.getTime())) return alert("Fecha inválida.");
+            payload.new_expiration = date.toISOString();
+        }
+
+        const descripcion = mode === 'add' ? `+${payload.minutes} minutos` : formatDateTimeMs(new Date(payload.new_expiration).getTime());
+        const cambioPartido = newLabel ? `\nNuevo partido: ${newLabel}` : '';
+
+        if (!confirm(`¿Aplicar ${descripcion} a ${uids.length} usuario(s)?${cambioPartido}`)) return;
+
+        try {
+            const res = await adminFetch('/admin/extender-accesos', {
+                method: 'POST',
+                body: JSON.stringify(payload)
+            });
+            const d = await res.json();
+
+            if (!res.ok || !d.success) {
+                return alert(d.message || "❌ No se pudo extender el acceso.");
+            }
+
+            alert(d.message || `✅ ${d.updated || 0} acceso(s) extendido(s).`);
+            cerrarModal('extensionModal');
+            await cargarUsuarios();
+        } catch (e) {
+            console.error("Error extendiendo accesos:", e);
+            alert("❌ Error de servidor al extender accesos.");
+        }
+    }
+
+    function confirmarExtensionIndividual() {
+        const uid = document.getElementById('extensionUid').value;
+        const mode = document.getElementById('individualMode').value;
+        const minutes = document.getElementById('individualMinutes').value;
+        const date = document.getElementById('individualCustomDate').value;
+        const label = document.getElementById('individualNewLabel').value.trim();
+        aplicarExtension([uid], mode, minutes, date, label);
+    }
+
+    function aplicarExtensionMasiva() {
+        const uids = obtenerUidsAlcance();
+        if (!uids.length) return;
+
+        const mode = document.getElementById('bulkMode').value;
+        const minutes = document.getElementById('bulkMinutes').value;
+        const date = document.getElementById('bulkCustomDate').value;
+        const label = document.getElementById('bulkNewLabel').value.trim();
+        aplicarExtension(uids, mode, minutes, date, label);
+    }
+
+    async function revocarSesion(uid, usuario) {
+        if (!uid) return alert("UID inválido.");
+
+        const ok = confirm(`¿Revocar la sesión activa de ${usuario}?\n\nEl usuario será expulsado de la transmisión en breve.`);
         if (!ok) return;
 
         try {
@@ -1048,36 +1501,134 @@ Este acceso es válido para 1 dispositivo.
                 method: 'POST',
                 body: JSON.stringify({ uid })
             });
-
             const d = await res.json();
 
             if (d.success) {
                 alert(d.message || "✅ Sesión revocada.");
-                cargarUsuarios();
+                await cargarUsuarios();
                 return;
             }
 
             alert(d.message || "❌ No se pudo revocar la sesión.");
-
         } catch (e) {
             console.error("Error revocando sesión:", e);
             alert("❌ Error de servidor al revocar sesión.");
         }
     }
 
+    async function revocarSeleccionados() {
+        const uids = [...usuariosSeleccionados];
+        if (!uids.length) return alert("Selecciona al menos un usuario.");
+        if (!confirm(`¿Revocar ${uids.length} usuario(s) seleccionado(s)?`)) return;
+
+        try {
+            const res = await adminFetch('/admin/revocar-multiples', {
+                method: 'POST',
+                body: JSON.stringify({ uids })
+            });
+            const d = await res.json();
+            if (!res.ok || !d.success) return alert(d.message || "❌ No se pudieron revocar.");
+
+            alert(d.message || "✅ Sesiones revocadas.");
+            usuariosSeleccionados.clear();
+            await cargarUsuarios();
+        } catch (e) {
+            console.error(e);
+            alert("❌ Error revocando seleccionados.");
+        }
+    }
+
+    async function mostrarHistorialUsuario(uid) {
+        abrirModal('historyModal');
+        document.getElementById('historyTitle').textContent = '📜 Historial de extensiones';
+        document.getElementById('historyContent').innerHTML = '<div class="muted">Cargando...</div>';
+
+        try {
+            const res = await adminFetch('/admin/historial-usuario', {
+                method: 'POST',
+                body: JSON.stringify({ uid })
+            });
+            const d = await res.json();
+            if (!res.ok || !d.success) throw new Error(d.message || 'No se pudo cargar.');
+
+            const u = d.usuario;
+            const items = [...(u.extension_history || [])].reverse();
+            document.getElementById('historyTitle').textContent = `📜 ${u.usuario_corto}`;
+
+            document.getElementById('historyContent').innerHTML = `
+                <div class="section" style="margin-bottom:10px;">
+                    <b>${escapeHtml(u.etiqueta || '-')}</b>
+                    <div class="muted">Expira: ${formatDateTimeMs(u.expira_ms)} · Extensiones: ${u.extension_count || 0}${d.archived ? ' · ARCHIVADO' : ''}</div>
+                </div>
+                ${items.length ? items.map(item => {
+                    const action = item.mode === 'add' ? `+${item.minutes || 0} min` : 'Hora fijada';
+                    const labelChange = item.old_label && item.new_label && item.old_label !== item.new_label
+                        ? `<div class="muted">Partido: ${escapeHtml(item.old_label)} → ${escapeHtml(item.new_label)}</div>` : '';
+                    return `<div class="history-item">
+                        <strong>${action} · ${formatDateTimeMs(item.at_ms)}</strong>
+                        <div>${formatDateTimeMs(item.old_expiration_ms)} → <b>${formatDateTimeMs(item.new_expiration_ms)}</b></div>
+                        ${labelChange}
+                    </div>`;
+                }).join('') : '<div class="muted">Este usuario todavía no tiene extensiones registradas.</div>'}
+            `;
+        } catch (e) {
+            document.getElementById('historyContent').innerHTML = `<div class="config-status error">${escapeHtml(e.message)}</div>`;
+        }
+    }
+
+    async function mostrarHistorialArchivado() {
+        abrirModal('archiveModal');
+        document.getElementById('archiveContent').innerHTML = '<div class="muted">Cargando...</div>';
+
+        try {
+            const res = await adminFetch('/admin/listar-historial', {
+                method: 'POST',
+                body: JSON.stringify({})
+            });
+            const d = await res.json();
+            if (!res.ok || !d.success) throw new Error(d.message || 'No se pudo cargar.');
+
+            document.getElementById('archiveContent').innerHTML = d.items.length
+                ? `<div class="table-wrap"><table><thead><tr><th>USUARIO</th><th>PARTIDO</th><th>EXPIRÓ</th><th>ARCHIVADO</th><th>EXT.</th><th></th></tr></thead><tbody>${d.items.map(item => `
+                    <tr>
+                        <td><b>${escapeHtml(item.usuario_corto)}</b></td>
+                        <td>${escapeHtml(item.etiqueta)}</td>
+                        <td>${formatDateTimeMs(item.expira_ms)}</td>
+                        <td>${formatDateTimeMs(item.archivado_ms)}</td>
+                        <td>${item.extension_count || 0}</td>
+                        <td><button class="btn-small btn-history" onclick="mostrarHistorialUsuario('${escapeAttr(item.uid)}')">Ver</button></td>
+                    </tr>`).join('')}</tbody></table></div>`
+                : '<div class="muted">Todavía no hay accesos archivados.</div>';
+        } catch (e) {
+            document.getElementById('archiveContent').innerHTML = `<div class="config-status error">${escapeHtml(e.message)}</div>`;
+        }
+    }
+
+    function abrirModal(id) {
+        document.getElementById(id).style.display = 'flex';
+    }
+
+    function cerrarModal(id) {
+        document.getElementById(id).style.display = 'none';
+    }
+
+    document.querySelectorAll('.modal-overlay').forEach(modal => {
+        modal.addEventListener('click', event => {
+            if (event.target === modal) cerrarModal(modal.id);
+        });
+    });
+
     async function limpiarCaducados() {
-        if (!confirm("¿Limpiar usuarios vencidos?\n\nRecomendación: úsalo solo después de terminar la transmisión o cuando ya no necesites revisar esos accesos en auditoría.")) return;
+        if (!confirm("¿Limpiar usuarios vencidos?\n\nPrimero se archivará su información operativa y luego se eliminará la cuenta de Firebase Authentication y el documento activo.")) return;
 
         try {
             const res = await adminFetch('/admin/limpiar-caducados', {
                 method: 'POST',
                 body: JSON.stringify({})
             });
-
             const d = await res.json();
             alert(d.mensaje || "Proceso finalizado.");
-            cargarUsuarios();
-
+            await cargarUsuarios();
         } catch(e) {
             alert("❌ Error de servidor");
         }
