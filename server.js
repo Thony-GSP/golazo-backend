@@ -67,6 +67,7 @@ app.use((req, res, next) => {
 const GENERAL_RATE_LIMIT_MAX = parseInt(process.env.GENERAL_RATE_LIMIT_MAX || "120", 10);
 const STREAM_RATE_LIMIT_MAX = parseInt(process.env.STREAM_RATE_LIMIT_MAX || "30", 10);
 const ADMIN_RATE_LIMIT_MAX = parseInt(process.env.ADMIN_RATE_LIMIT_MAX || "20", 10);
+const CREATE_PASS_RATE_LIMIT_MAX = parseInt(process.env.CREATE_PASS_RATE_LIMIT_MAX || "100", 10);
 const QUICK_LOGIN_RATE_LIMIT_MAX = parseInt(process.env.QUICK_LOGIN_RATE_LIMIT_MAX || "12", 10);
 
 const generalLimiter = rateLimit({
@@ -105,6 +106,19 @@ const adminLimiter = rateLimit({
         success: false,
         code: "ADMIN_RATE_LIMIT",
         error: "Demasiadas solicitudes administrativas."
+    }
+});
+
+const createPassLimiter = rateLimit({
+    windowMs: 60 * 1000,
+    max: CREATE_PASS_RATE_LIMIT_MAX,
+    standardHeaders: true,
+    legacyHeaders: false,
+    skip: (req) => req.method === 'OPTIONS',
+    message: {
+        success: false,
+        code: "CREATE_PASS_RATE_LIMIT",
+        error: "Demasiadas solicitudes de creación de pases."
     }
 });
 
@@ -184,7 +198,7 @@ app.get('/', (req, res) => {
         success: true,
         service: "Golazo Stream Backend",
         status: "online",
-        version: "FASE 10.2 - sesiones idempotentes y anti-409",
+        version: "FASE 10.3 - rate limit de pases separado",
         stream_mode_default: STREAM_MODE_DEFAULT
     });
 });
@@ -1350,7 +1364,7 @@ app.post('/check-session', async (req, res) => {
 });
 
 // --- 14. PANEL ADMIN: GENERAR PASE ---
-app.post('/admin/generar-pase-rapido', adminLimiter, verifyAdmin, async (req, res) => {
+app.post('/admin/generar-pase-rapido', createPassLimiter, verifyAdmin, async (req, res) => {
     const { partido, email_manual, pass_manual, fecha_corte } = req.body;
 
     try {
@@ -1776,5 +1790,5 @@ app.post('/admin/listar-usuarios', adminLimiter, verifyAdmin, async (req, res) =
 const PORT = process.env.PORT || 3000;
 
 app.listen(PORT, () => {
-    console.log(`🚀 GOLAZO SECURE STREAM READY (FASE 10.2: SESIONES IDEMPOTENTES Y ANTI-409)`);
+    console.log(`🚀 GOLAZO SECURE STREAM READY (FASE 10.3: RATE LIMIT DE PASES SEPARADO)`);
 });
