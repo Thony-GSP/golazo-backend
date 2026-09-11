@@ -920,7 +920,8 @@ Este acceso es válido para 1 dispositivo.
                 await navigator.clipboard.writeText(msg);
                 alert("🚀 ¡Mensaje copiado al portapapeles!");
 
-                cargarUsuarios();
+                // La auditoría se actualiza automáticamente cada 30 segundos.
+                // Evitamos releer todos los usuarios después de cada pase creado.
 
             } else {
                 alert(`❌ Error creando pase: ${d.message || d.error || d.code || "No autorizado o sesión vencida"}`);
