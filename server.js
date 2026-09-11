@@ -198,7 +198,7 @@ app.get('/', (req, res) => {
         success: true,
         service: "Golazo Stream Backend",
         status: "online",
-        version: "FASE 10.3 - rate limit de pases separado",
+        version: "FASE 10.4 - gestion de accesos y analitica",
         stream_mode_default: STREAM_MODE_DEFAULT
     });
 });
@@ -747,6 +747,130 @@ function getClientData(req) {
     const userAgent = req.headers['user-agent'] || 'Desconocido';
 
     return { ip, userAgent };
+}
+
+
+// --- 9.1 GESTIÓN DE ACCESOS Y ANALÍTICA ---
+function formatPeruDateKey(value) {
+    const date = value instanceof Date ? value : new Date(value);
+    if (Number.isNaN(date.getTime())) return "sin-fecha";
+
+    return new Intl.DateTimeFormat('en-CA', {
+        timeZone: 'America/Lima',
+        year: 'numeric',
+        month: '2-digit',
+        day: '2-digit'
+    }).format(date);
+}
+
+function buildEventId(label, dateValue) {
+    const normalizedLabel = normalizeDisplayText(label || "Sin etiqueta", 80).toLowerCase();
+    const dateKey = formatPeruDateKey(dateValue);
+
+    return crypto
+        .createHash('sha256')
+        .update(`${normalizedLabel}|${dateKey}`)
+        .digest('hex')
+        .slice(0, 16);
+}
+
+function getUserEventId(data) {
+    if (data?.event_id) return String(data.event_id);
+
+    const label = normalizeDisplayText(data?.etiqueta || "Sin etiqueta", 80).toLowerCase();
+    return `legacy-${crypto.createHash('sha256').update(label).digest('hex').slice(0, 12)}`;
+}
+
+function summarizeUserAgent(userAgent) {
+    if (!userAgent || userAgent === "Sin registro") return "Sin registro";
+
+    const ua = String(userAgent).toLowerCase();
+
+    if (ua.includes("tizen")) return "Samsung TV";
+    if (ua.includes("webos")) return "LG Smart TV";
+    if (ua.includes("android tv")) return "Android TV";
+    if (ua.includes("aft") || ua.includes("fire tv")) return "Fire TV";
+    if (ua.includes("roku")) return "Roku TV";
+    if (ua.includes("smart-tv") || ua.includes("smarttv") || ua.includes("hbbtv")) return "Smart TV";
+    if (ua.includes("iphone")) return "iPhone";
+    if (ua.includes("ipad")) return "iPad";
+    if (ua.includes("android")) return "Android";
+    if (ua.includes("windows")) return "Windows";
+    if (ua.includes("mac os")) return "Mac";
+    if (ua.includes("edg")) return "Edge";
+    if (ua.includes("chrome")) return "Chrome";
+    if (ua.includes("firefox")) return "Firefox";
+    if (ua.includes("safari") && !ua.includes("chrome")) return "Safari";
+
+    return "Navegador";
+}
+
+function isRevokedUser(data) {
+    return data?.last_status === "revoked_by_admin" ||
+        String(data?.session_id || "").startsWith("revoked_");
+}
+
+function isUserWatchingNow(data, now = Date.now()) {
+    const expiraMillis = getTimestampMillis(data?.fecha_expiracion);
+    const lastHeartbeatMillis = getTimestampMillis(data?.last_heartbeat);
+    const sessionId = String(data?.session_id || "");
+    const status = String(data?.last_status || "");
+
+    if (!expiraMillis || expiraMillis <= now) return false;
+    if (!lastHeartbeatMillis || now - lastHeartbeatMillis >= ACTIVE_SESSION_WINDOW_MS) return false;
+    if (!sessionId || sessionId.startsWith("revoked_")) return false;
+    if (["expired", "revoked_by_admin", "released"].includes(status)) return false;
+
+    return true;
+}
+
+function userNeverEntered(data) {
+    return !data?.last_quick_login_at &&
+        !data?.last_heartbeat &&
+        !data?.session_started_at;
+}
+
+function serializeExtensionHistory(history) {
+    if (!Array.isArray(history)) return [];
+
+    return history.map(item => ({
+        at_ms: getTimestampMillis(item?.at),
+        mode: item?.mode || "add",
+        minutes: Number.isFinite(Number(item?.minutes)) ? Number(item.minutes) : null,
+        old_expiration_ms: getTimestampMillis(item?.old_expiration),
+        new_expiration_ms: getTimestampMillis(item?.new_expiration),
+        old_label: item?.old_label || "",
+        new_label: item?.new_label || ""
+    }));
+}
+
+async function syncEventPeaks(eventSummaries) {
+    if (!eventSummaries.length) return eventSummaries;
+
+    const refs = eventSummaries.map(item => db.collection('event_stats').doc(item.event_id));
+    const snaps = await db.getAll(...refs);
+    const batch = db.batch();
+    let needsCommit = false;
+
+    snaps.forEach((snap, index) => {
+        const summary = eventSummaries[index];
+        const storedPeak = snap.exists ? Number(snap.data()?.peak_concurrent || 0) : 0;
+        const finalPeak = Math.max(storedPeak, summary.viendo_ahora);
+        summary.peak_concurrent = finalPeak;
+
+        if (!snap.exists || finalPeak > storedPeak) {
+            batch.set(refs[index], {
+                event_id: summary.event_id,
+                etiqueta: summary.etiqueta,
+                peak_concurrent: finalPeak,
+                updated_at: nowTimestamp()
+            }, { merge: true });
+            needsCommit = true;
+        }
+    });
+
+    if (needsCommit) await batch.commit();
+    return eventSummaries;
 }
 
 // --- 10. CÓDIGO RÁPIDO DE ACCESO ---
@@ -1415,9 +1539,13 @@ app.post('/admin/generar-pase-rapido', createPassLimiter, verifyAdmin, async (re
                 etiqueta: partido,
                 tipo_acceso: "vip",
                 login_mode: "email_password",
+                event_id: null,
+                event_name: partido,
                 fecha_expiracion: admin.firestore.Timestamp.fromDate(exp),
                 creado_el: nowTimestamp(),
                 session_id: "",
+                extension_count: 0,
+                extension_history: [],
                 password_stored: false,
                 last_status: "created"
             });
@@ -1467,6 +1595,8 @@ app.post('/admin/generar-pase-rapido', createPassLimiter, verifyAdmin, async (re
         }
 
         const linkRapido = `${APP_BASE_URL}/?c=${encodeURIComponent(codigo)}`;
+        const eventId = buildEventId(partido, exp);
+        const eventDateKey = formatPeruDateKey(exp);
 
         await db.collection('usuarios').doc(userRecord.uid).set({
             uid: userRecord.uid,
@@ -1474,11 +1604,16 @@ app.post('/admin/generar-pase-rapido', createPassLimiter, verifyAdmin, async (re
             etiqueta: partido,
             tipo_acceso: "partido",
             login_mode: "quick_code",
+            event_id: eventId,
+            event_name: partido,
+            event_date_key: eventDateKey,
             quick_code_hash: codeHash,
             quick_code_created_at: nowTimestamp(),
             fecha_expiracion: admin.firestore.Timestamp.fromDate(exp),
             creado_el: nowTimestamp(),
             session_id: "",
+            extension_count: 0,
+            extension_history: [],
             password_stored: false,
             last_status: "created"
         });
@@ -1673,7 +1808,7 @@ app.post('/admin/actualizar-config-stream', adminLimiter, verifyAdmin, async (re
     }
 });
 
-// --- 16. PANEL ADMIN: LIMPIAR CADUCADOS ---
+// --- 16. PANEL ADMIN: LIMPIAR CADUCADOS + ARCHIVO HISTÓRICO ---
 app.post('/admin/limpiar-caducados', adminLimiter, verifyAdmin, async (req, res) => {
     try {
         const ahora = nowTimestamp();
@@ -1690,20 +1825,61 @@ app.post('/admin/limpiar-caducados', adminLimiter, verifyAdmin, async (req, res)
         }
 
         let borrados = 0;
+        let archivados = 0;
+        let errores = 0;
 
         for (const doc of vencidosSnap.docs) {
             try {
-                await auth.deleteUser(doc.id);
+                const data = doc.data() || {};
+
+                // Se conserva solo información operativa útil. No se archivan
+                // códigos hash, session_id, IP ni user-agent completo.
+                await db.collection('historial_accesos').doc(doc.id).set({
+                    uid: data.uid || doc.id,
+                    usuario_corto: data.usuario_corto || "-",
+                    etiqueta: data.etiqueta || "-",
+                    tipo_acceso: data.tipo_acceso || "manual",
+                    login_mode: data.login_mode || "-",
+                    event_id: data.event_id || getUserEventId(data),
+                    event_name: data.event_name || data.etiqueta || "-",
+                    event_date_key: data.event_date_key || null,
+                    fecha_expiracion: data.fecha_expiracion || null,
+                    creado_el: data.creado_el || null,
+                    last_status: data.last_status || "-",
+                    last_connection_at: data.last_heartbeat || null,
+                    tuvo_ingreso: !userNeverEntered(data),
+                    dispositivo: summarizeUserAgent(data.last_user_agent || "Sin registro"),
+                    extension_count: Number(data.extension_count || 0),
+                    extension_history: Array.isArray(data.extension_history) ? data.extension_history.slice(-20) : [],
+                    last_extension_at: data.last_extension_at || null,
+                    last_extension_minutes: Number.isFinite(Number(data.last_extension_minutes))
+                        ? Number(data.last_extension_minutes)
+                        : null,
+                    archivado_el: nowTimestamp(),
+                    archive_reason: "expired_cleanup"
+                }, { merge: true });
+                archivados++;
+
+                try {
+                    await auth.deleteUser(doc.id);
+                } catch (authError) {
+                    if (authError.code !== 'auth/user-not-found') throw authError;
+                }
+
                 await doc.ref.delete();
                 borrados++;
             } catch (err) {
-                console.error("❌ Error borrando usuario vencido:", doc.id, err.message);
+                errores++;
+                console.error("❌ Error archivando/borrando usuario vencido:", doc.id, err.message);
             }
         }
 
         return res.json({
             success: true,
-            mensaje: `🧹 ${borrados} pases vencidos eliminados.`
+            mensaje: `🧹 ${borrados} pases eliminados · ${archivados} archivados${errores ? ` · ${errores} con error` : ''}.`,
+            borrados,
+            archivados,
+            errores
         });
 
     } catch (e) {
@@ -1716,44 +1892,344 @@ app.post('/admin/limpiar-caducados', adminLimiter, verifyAdmin, async (req, res)
     }
 });
 
-// --- 17. PANEL ADMIN: LISTAR USUARIOS ---
+// --- 17. GESTIÓN ADMINISTRATIVA DE ACCESOS ---
+app.post('/admin/extender-accesos', adminLimiter, verifyAdmin, async (req, res) => {
+    try {
+        const rawUids = Array.isArray(req.body?.uids) ? req.body.uids : [];
+        const uids = [...new Set(rawUids.map(uid => String(uid || '').trim()).filter(Boolean))];
+        const mode = req.body?.mode === 'set' ? 'set' : 'add';
+        const minutes = Number(req.body?.minutes);
+        const newLabel = normalizeDisplayText(req.body?.new_label || '', 80);
+        const requestedExpiration = req.body?.new_expiration ? new Date(req.body.new_expiration) : null;
+
+        if (!uids.length || uids.length > 300) {
+            return res.status(400).json({
+                success: false,
+                message: "Selecciona entre 1 y 300 usuarios."
+            });
+        }
+
+        if (mode === 'add' && (!Number.isFinite(minutes) || minutes < 1 || minutes > 10080)) {
+            return res.status(400).json({
+                success: false,
+                message: "Los minutos deben estar entre 1 y 10080."
+            });
+        }
+
+        if (mode === 'set' && (!requestedExpiration || Number.isNaN(requestedExpiration.getTime()) || requestedExpiration.getTime() <= Date.now())) {
+            return res.status(400).json({
+                success: false,
+                message: "La nueva fecha de expiración debe ser futura y válida."
+            });
+        }
+
+        const refs = uids.map(uid => db.collection('usuarios').doc(uid));
+        const snaps = await db.getAll(...refs);
+        const batch = db.batch();
+        const nowMillis = Date.now();
+        const extensionAt = nowTimestamp();
+        const results = [];
+        let updated = 0;
+
+        snaps.forEach((snap, index) => {
+            if (!snap.exists) {
+                results.push({ uid: uids[index], success: false, reason: 'not_found' });
+                return;
+            }
+
+            const data = snap.data() || {};
+            const currentExpirationMillis = getTimestampMillis(data.fecha_expiracion);
+            const targetMillis = mode === 'set'
+                ? requestedExpiration.getTime()
+                : Math.max(currentExpirationMillis || 0, nowMillis) + Math.round(minutes * 60 * 1000);
+
+            const targetExpiration = admin.firestore.Timestamp.fromMillis(targetMillis);
+            const previousLabel = normalizeDisplayText(data.etiqueta || "Sin etiqueta", 80);
+            const targetLabel = newLabel || previousLabel;
+            const labelChanged = Boolean(newLabel && newLabel !== previousLabel);
+            const targetEventId = labelChanged
+                ? buildEventId(targetLabel, new Date(targetMillis))
+                : (data.event_id || getUserEventId(data));
+
+            const history = Array.isArray(data.extension_history)
+                ? data.extension_history.slice(-19)
+                : [];
+
+            history.push({
+                at: extensionAt,
+                mode,
+                minutes: mode === 'add' ? Math.round(minutes) : null,
+                old_expiration: currentExpirationMillis
+                    ? admin.firestore.Timestamp.fromMillis(currentExpirationMillis)
+                    : null,
+                new_expiration: targetExpiration,
+                old_label: previousLabel,
+                new_label: targetLabel
+            });
+
+            const patch = {
+                fecha_expiracion: targetExpiration,
+                etiqueta: targetLabel,
+                event_name: targetLabel,
+                event_id: targetEventId,
+                event_date_key: formatPeruDateKey(new Date(targetMillis)),
+                extension_count: Number(data.extension_count || 0) + 1,
+                extension_history: history,
+                last_extension_at: extensionAt,
+                last_extension_minutes: mode === 'add' ? Math.round(minutes) : null
+            };
+
+            if (data.last_status === 'expired') {
+                patch.last_status = 'extended';
+                patch.session_id = '';
+                patch.active_device_id = '';
+                patch.active_page_id = '';
+            }
+
+            batch.update(refs[index], patch);
+            updated++;
+            results.push({
+                uid: uids[index],
+                success: true,
+                new_expiration_ms: targetMillis,
+                etiqueta: targetLabel
+            });
+        });
+
+        if (updated) await batch.commit();
+
+        return res.json({
+            success: true,
+            updated,
+            requested: uids.length,
+            results,
+            message: `✅ ${updated} acceso(s) extendido(s).`
+        });
+
+    } catch (e) {
+        console.error("❌ Error extendiendo accesos:", e);
+        return res.status(500).json({
+            success: false,
+            message: "Error extendiendo accesos."
+        });
+    }
+});
+
+app.post('/admin/revocar-multiples', adminLimiter, verifyAdmin, async (req, res) => {
+    try {
+        const rawUids = Array.isArray(req.body?.uids) ? req.body.uids : [];
+        const uids = [...new Set(rawUids.map(uid => String(uid || '').trim()).filter(Boolean))];
+
+        if (!uids.length || uids.length > 300) {
+            return res.status(400).json({
+                success: false,
+                message: "Selecciona entre 1 y 300 usuarios."
+            });
+        }
+
+        const refs = uids.map(uid => db.collection('usuarios').doc(uid));
+        const snaps = await db.getAll(...refs);
+        const batch = db.batch();
+        let updated = 0;
+        const revokedAt = nowTimestamp();
+
+        snaps.forEach((snap, index) => {
+            if (!snap.exists) return;
+            batch.update(refs[index], {
+                session_id: "revoked_" + Date.now() + "_" + index,
+                last_status: "revoked_by_admin",
+                last_heartbeat: revokedAt
+            });
+            updated++;
+        });
+
+        if (updated) await batch.commit();
+
+        return res.json({
+            success: true,
+            updated,
+            message: `✅ ${updated} sesión(es) revocada(s).`
+        });
+    } catch (e) {
+        console.error("❌ Error revocando múltiples sesiones:", e);
+        return res.status(500).json({
+            success: false,
+            message: "Error revocando sesiones."
+        });
+    }
+});
+
+app.post('/admin/historial-usuario', adminLimiter, verifyAdmin, async (req, res) => {
+    try {
+        const uid = String(req.body?.uid || '').trim();
+        if (!uid) {
+            return res.status(400).json({ success: false, message: "Falta UID." });
+        }
+
+        let snap = await db.collection('usuarios').doc(uid).get();
+        let archived = false;
+
+        if (!snap.exists) {
+            snap = await db.collection('historial_accesos').doc(uid).get();
+            archived = true;
+        }
+
+        if (!snap.exists) {
+            return res.status(404).json({ success: false, message: "Usuario no encontrado." });
+        }
+
+        const data = snap.data() || {};
+        return res.json({
+            success: true,
+            archived,
+            usuario: {
+                uid: data.uid || uid,
+                usuario_corto: data.usuario_corto || "-",
+                etiqueta: data.etiqueta || "-",
+                tipo_acceso: data.tipo_acceso || "manual",
+                creado_ms: getTimestampMillis(data.creado_el),
+                expira_ms: getTimestampMillis(data.fecha_expiracion),
+                extension_count: Number(data.extension_count || 0),
+                extension_history: serializeExtensionHistory(data.extension_history)
+            }
+        });
+    } catch (e) {
+        console.error("❌ Error consultando historial de usuario:", e);
+        return res.status(500).json({ success: false, message: "Error consultando historial." });
+    }
+});
+
+app.post('/admin/listar-historial', adminLimiter, verifyAdmin, async (req, res) => {
+    try {
+        const snap = await db.collection('historial_accesos')
+            .orderBy('archivado_el', 'desc')
+            .limit(100)
+            .get();
+
+        const items = snap.docs.map(doc => {
+            const data = doc.data() || {};
+            return {
+                uid: data.uid || doc.id,
+                usuario_corto: data.usuario_corto || "-",
+                etiqueta: data.etiqueta || "-",
+                tipo_acceso: data.tipo_acceso || "manual",
+                creado_ms: getTimestampMillis(data.creado_el),
+                expira_ms: getTimestampMillis(data.fecha_expiracion),
+                archivado_ms: getTimestampMillis(data.archivado_el),
+                extension_count: Number(data.extension_count || 0),
+                last_status: data.last_status || "-"
+            };
+        });
+
+        return res.json({ success: true, items });
+    } catch (e) {
+        console.error("❌ Error listando historial archivado:", e);
+        return res.status(500).json({ success: false, message: "Error cargando historial archivado." });
+    }
+});
+
+// --- 17.1 PANEL ADMIN: LISTAR USUARIOS + DASHBOARD EN VIVO ---
 app.post('/admin/listar-usuarios', adminLimiter, verifyAdmin, async (req, res) => {
     try {
         const snap = await db.collection('usuarios')
             .orderBy('creado_el', 'desc')
             .get();
 
+        const now = Date.now();
+        const resumen = {
+            total: 0,
+            vigentes: 0,
+            viendo_ahora: 0,
+            desconectados: 0,
+            vencidos: 0,
+            revocados: 0,
+            nunca_ingresaron: 0,
+            pases_rapidos: 0,
+            vip: 0,
+            dispositivos: {}
+        };
+
+        const eventMap = new Map();
+
         const usuariosFormateados = snap.docs.map(d => {
-            const data = d.data();
-            const expiraMillis = data.fecha_expiracion.toMillis();
-            const esActivo = expiraMillis > Date.now();
+            const data = d.data() || {};
+            const expiraMillis = getTimestampMillis(data.fecha_expiracion);
+            const fechaVigente = Boolean(expiraMillis && expiraMillis > now);
+            const revocado = isRevokedUser(data);
+            const esActivo = fechaVigente && !revocado;
+            const viendoAhora = isUserWatchingNow(data, now);
+            const nuncaIngreso = userNeverEntered(data);
+            const tipoAcceso = data.tipo_acceso || (data.login_mode === "quick_code" ? "partido" : "manual");
+            const dispositivo = summarizeUserAgent(data.last_user_agent || "Sin registro");
+            const eventId = getUserEventId(data);
+
+            resumen.total++;
+            if (esActivo) resumen.vigentes++;
+            if (!fechaVigente) resumen.vencidos++;
+            if (revocado) resumen.revocados++;
+            if (viendoAhora) resumen.viendo_ahora++;
+            if (esActivo && !viendoAhora) resumen.desconectados++;
+            if (nuncaIngreso) resumen.nunca_ingresaron++;
+            if (tipoAcceso === 'partido' || data.login_mode === 'quick_code') resumen.pases_rapidos++;
+            if (tipoAcceso === 'vip' || data.login_mode === 'email_password') resumen.vip++;
+
+            if (viendoAhora) {
+                resumen.dispositivos[dispositivo] = (resumen.dispositivos[dispositivo] || 0) + 1;
+            }
+
+            if (tipoAcceso === 'partido' || data.login_mode === 'quick_code') {
+                if (!eventMap.has(eventId)) {
+                    eventMap.set(eventId, {
+                        event_id: eventId,
+                        etiqueta: data.etiqueta || "Sin etiqueta",
+                        total: 0,
+                        vigentes: 0,
+                        viendo_ahora: 0,
+                        nunca_ingresaron: 0,
+                        revocados: 0,
+                        peak_concurrent: 0
+                    });
+                }
+
+                const eventSummary = eventMap.get(eventId);
+                eventSummary.total++;
+                if (esActivo) eventSummary.vigentes++;
+                if (viendoAhora) eventSummary.viendo_ahora++;
+                if (nuncaIngreso) eventSummary.nunca_ingresaron++;
+                if (revocado) eventSummary.revocados++;
+            }
 
             let ultimaConexion = "-";
-
             if (data.last_heartbeat) {
                 ultimaConexion = new Date(data.last_heartbeat.toMillis()).toLocaleTimeString('es-PE', {
                     timeZone: 'America/Lima'
                 });
             }
 
+            let estado = 'VENCIDO';
+            if (revocado) estado = 'REVOCADO';
+            else if (esActivo) estado = viendoAhora ? 'EN VIVO' : 'ACTIVO';
+
             return {
                 uid: data.uid || d.id,
                 usuario_corto: data.usuario_corto || "-",
+                codigo: String(data.usuario_corto || '').split('@')[0] || "-",
                 etiqueta: data.etiqueta || "-",
-
-                tipo_acceso: data.tipo_acceso || (
-                    data.login_mode === "quick_code"
-                        ? "partido"
-                        : "manual"
-                ),
-
+                event_id: eventId,
+                tipo_acceso: tipoAcceso,
                 login_mode: data.login_mode || "-",
                 tiene_codigo_rapido: Boolean(data.quick_code_hash),
-
-                estado: esActivo ? 'ACTIVO' : 'VENCIDO',
-                esActivo: esActivo,
-
-                tiempo: new Date(expiraMillis).toLocaleString('es-PE', {
+                estado,
+                esActivo,
+                fecha_vigente: fechaVigente,
+                revocado,
+                viendo_ahora: viendoAhora,
+                nunca_ingreso: nuncaIngreso,
+                dispositivo,
+                expira_ms: expiraMillis,
+                creado_ms: getTimestampMillis(data.creado_el),
+                last_heartbeat_ms: getTimestampMillis(data.last_heartbeat),
+                tiempo: expiraMillis ? new Date(expiraMillis).toLocaleString('es-PE', {
                     timeZone: 'America/Lima',
                     year: 'numeric',
                     month: '2-digit',
@@ -1761,19 +2237,30 @@ app.post('/admin/listar-usuarios', adminLimiter, verifyAdmin, async (req, res) =
                     hour: '2-digit',
                     minute: '2-digit',
                     hour12: true
-                }),
-
+                }) : "-",
                 ultima_conexion: ultimaConexion,
                 last_status: data.last_status || "-",
                 last_ip: data.last_ip || "Sin registro",
                 last_user_agent: data.last_user_agent || "Sin registro",
-                password_stored: data.password_stored === false ? false : true
+                password_stored: data.password_stored === false ? false : true,
+                extension_count: Number(data.extension_count || 0),
+                last_extension_ms: getTimestampMillis(data.last_extension_at),
+                last_extension_minutes: Number.isFinite(Number(data.last_extension_minutes))
+                    ? Number(data.last_extension_minutes)
+                    : null
             };
         });
 
+        const eventos = await syncEventPeaks([...eventMap.values()]);
+        eventos.sort((a, b) => b.vigentes - a.vigentes || b.total - a.total);
+
         return res.json({
             success: true,
-            usuarios: usuariosFormateados
+            usuarios: usuariosFormateados,
+            resumen,
+            eventos,
+            active_session_window_ms: ACTIVE_SESSION_WINDOW_MS,
+            generated_at: now
         });
 
     } catch (e) {
@@ -1790,5 +2277,5 @@ app.post('/admin/listar-usuarios', adminLimiter, verifyAdmin, async (req, res) =
 const PORT = process.env.PORT || 3000;
 
 app.listen(PORT, () => {
-    console.log(`🚀 GOLAZO SECURE STREAM READY (FASE 10.3: RATE LIMIT DE PASES SEPARADO)`);
+    console.log(`🚀 GOLAZO SECURE STREAM READY (FASE 10.4: GESTION DE ACCESOS Y ANALITICA)`);
 });
