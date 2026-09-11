@@ -1097,33 +1097,31 @@ Este acceso es válido para 1 dispositivo.
                     const codigo = d.codigo || "NO_GENERADO";
                     const linkRapido = d.link_rapido || `https://golazosp.net/?c=${encodeURIComponent(codigo)}`;
 
-                    // 🔥 AJUSTE: Mensaje perfeccionado de Pase Rápido
+                    // FASE 10.4.1: mensaje compacto con instrucciones claras para celular/PC y TV.
                     msg = `✅ ¡ACCESO GOLAZO SP LISTO! ⚽
 ━━━━━━━━━━━━━━
 ⚽ PARTIDO:
 ${nombre}
 
-🔗 INGRESA AQUÍ:
+📱💻 CELULAR / LAPTOP / PC / TABLET
+🔗 INGRESA DESDE AQUÍ:
 ${linkRapido}
 
-🔐 CÓDIGO DE ACCESO:
+🔐 CÓDIGO:
 ${codigo}
 
-🌐 WEB:
-www.golazosp.net
+📺 ¿LO VERÁS EN TV?
 
-📲 ¿CÓMO INGRESAR?
-1️⃣ Toca el link rápido.
-2️⃣ Verifica que el código aparezca cargado.
-3️⃣ Presiona "EMPEZAR A VER".
+Desde Smart TV:
+Entra a golazosp.net e ingresa tu código.
 
-⏳ VÁLIDO HASTA:
-${expiraTexto}
+Desde tu celular:
+Abre el partido y pulsa “Chromecast” para enviarlo a tu TV.
 
 ⚠️ IMPORTANTE:
-Este acceso es válido para 1 dispositivo.
+Acceso válido para 1 dispositivo a la vez.
 
-¡Disfruta el partido! 🫡`;
+⚽ ¡Disfruta el partido!`;
                 }
 
                 box.innerText = msg;
