@@ -192,13 +192,18 @@ const BUNNY_TOKEN_DURATION_SECONDS = parseInt(
     10
 );
 
+const BUNNY_CAST_TOKEN_DURATION_SECONDS = parseInt(
+    process.env.BUNNY_CAST_TOKEN_DURATION_SECONDS || "14400",
+    10
+);
+
 // --- 5. HEALTH CHECK ---
 app.get('/', (req, res) => {
     res.json({
         success: true,
         service: "Golazo Stream Backend",
         status: "online",
-        version: "FASE 10.4 - gestion de accesos y analitica",
+        version: "FASE 10.5 - token largo para Cast/AirPlay (P0-A)",
         stream_mode_default: STREAM_MODE_DEFAULT
     });
 });
@@ -1045,6 +1050,7 @@ app.get('/generate-stream', streamLimiter, async (req, res) => {
         const pageId = normalizeClientId(req.query.page_id);
         const takeoverRequested = req.query.takeover === "1";
         const forceConfigRefresh = req.query.refresh_config === "1";
+        const castRequested = req.query.cast === "1";
 
         const userRef = db.collection('usuarios').doc(uid);
         const ahora = Date.now();
@@ -1233,7 +1239,9 @@ app.get('/generate-stream', streamLimiter, async (req, res) => {
         }
 
         const tokenDuration = Math.min(
-            BUNNY_TOKEN_DURATION_SECONDS,
+            castRequested
+                ? BUNNY_CAST_TOKEN_DURATION_SECONDS
+                : BUNNY_TOKEN_DURATION_SECONDS,
             decision.segundosRestantesPase
         );
 
@@ -1272,7 +1280,7 @@ app.get('/generate-stream', streamLimiter, async (req, res) => {
         const bunnyExpires = signed.expires;
 
         console.log(
-            `✅ Stream [${decision.reusedSession ? 'RENOVADO' : 'NUEVO'}] | uid=${uid} | transmisiones=${playbackCatalog.transmissions.length} | legacy=${legacyHlsSource} | duration=${tokenDuration}s | reattach=${decision.reattachedSamePage ? '1' : '0'} | takeover=${decision.takeoverApplied ? '1' : '0'}`
+            `✅ Stream [${decision.reusedSession ? 'RENOVADO' : 'NUEVO'}] | uid=${uid} | transmisiones=${playbackCatalog.transmissions.length} | legacy=${legacyHlsSource} | duration=${tokenDuration}s | cast=${castRequested ? '1' : '0'} | reattach=${decision.reattachedSamePage ? '1' : '0'} | takeover=${decision.takeoverApplied ? '1' : '0'}`
         );
 
         res.set('X-Stream-Config-Version', streamConfig.version);
@@ -1293,6 +1301,7 @@ app.get('/generate-stream', streamLimiter, async (req, res) => {
             reattached_same_page: decision.reattachedSamePage,
             takeover: decision.takeoverApplied,
             bunny_expires: bunnyExpires,
+            cast_token: castRequested,
             pase_expira: decision.expiraMillis
         });
 
