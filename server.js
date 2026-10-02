@@ -5,9 +5,13 @@ const cors = require('cors');
 const rateLimit = require('express-rate-limit');
 const fs = require('fs');
 const net = require('net');
+const https = require('https');
+const http = require('http');
+const dns = require('dns');
+const { monitorEventLoopDelay } = require('perf_hooks');
 
 // Versión visible en GET / y en el registro de arranque (identifica el despliegue).
-const VERSION_BACKEND = "FASE 10.13 - B8 integrado";
+const VERSION_BACKEND = "FASE 10.18 - B13 integrado";
 
 // --- 1. FIREBASE ---
 const serviceAccount = JSON.parse(process.env.FIREBASE_JSON);
@@ -167,7 +171,9 @@ function crearMetricas() {
     return {
         latidos: 0, sesiones: new Set(), pirateria: 0, expirado: 0, revocado: 0,
         generate: 0, nuevas: 0, reanudadas: 0, tomas: 0, conflictos: 0,
-        liberadas: 0, ingresos: 0, ingresosFallidos: 0, r429: 0, r5xx: 0, total: 0
+        liberadas: 0, ingresos: 0, ingresosFallidos: 0, r429: 0, r5xx: 0, total: 0,
+        // B10: resúmenes de experiencia (/qoe) recibidos en el minuto.
+        qoe: { n: 0, arranques: [], rebuffers: 0, rebufferMs: 0, errores: 0, minutos: 0 }
     };
 }
 
@@ -219,9 +225,65 @@ app.use((req, res, next) => {
     next();
 });
 
+// Historial de los últimos 60 minutos para el tablero del panel (B10). Solo en memoria: se reinicia
+// con cada despliegue o reinicio del servicio.
+const HISTORIAL_METRICAS_MAX = 60;
+const historialMetricas = [];
+let inicioMinutoMetricas = Date.now();
+
+// Retardo del bucle de eventos: si sube, el servidor está saturado (responde tarde a todos).
+const retardoBucle = typeof monitorEventLoopDelay === 'function' ? monitorEventLoopDelay({ resolution: 20 }) : null;
+if (retardoBucle) retardoBucle.enable();
+let retardoUltimoMinuto = null;
+
+function medianaDe(valores) {
+    if (!valores.length) return null;
+    const orden = [...valores].sort((a, b) => a - b);
+    const mitad = Math.floor(orden.length / 2);
+    return orden.length % 2 ? orden[mitad] : Math.round((orden[mitad - 1] + orden[mitad]) / 2);
+}
+
+function resumirQoe(q) {
+    return {
+        reportes: q.n,
+        arranque_mediana_ms: medianaDe(q.arranques),
+        rebuffers: q.rebuffers,
+        rebuffer_s: Math.round(q.rebufferMs / 1000),
+        errores: q.errores,
+        minutos: Math.round(q.minutos * 10) / 10
+    };
+}
+
+function resumirMetricas(m, inicio) {
+    return {
+        inicio_ms: inicio,
+        espectadores: m.sesiones.size, latidos: m.latidos, pirateria: m.pirateria, expirado: m.expirado,
+        revocado: m.revocado, generate: m.generate, nuevas: m.nuevas, reanudadas: m.reanudadas, tomas: m.tomas,
+        conflictos: m.conflictos, liberadas: m.liberadas, ingresos: m.ingresos, ingresos_fallidos: m.ingresosFallidos,
+        r429: m.r429, r5xx: m.r5xx, total: m.total, qoe: resumirQoe(m.qoe)
+    };
+}
+
 const temporizadorMetricas = setInterval(() => {
     const m = metricasMinuto;
+    const inicio = inicioMinutoMetricas;
     metricasMinuto = crearMetricas();
+    inicioMinutoMetricas = Date.now();
+    const resumen = resumirMetricas(m, inicio);
+    if (retardoBucle) {
+        // El monitor mide el intervalo completo (20 ms de muestreo incluidos): se informa solo la demora.
+        const demora = (ns) => Math.max(0, Math.round((ns - 20e6) / 1e5) / 10);
+        retardoUltimoMinuto = {
+            p50_ms: demora(retardoBucle.percentile(50)),
+            p99_ms: demora(retardoBucle.percentile(99)),
+            max_ms: demora(retardoBucle.max)
+        };
+        retardoBucle.reset();
+        resumen.retardo_p99_ms = retardoUltimoMinuto.p99_ms;
+    }
+    historialMetricas.push(resumen);
+    if (historialMetricas.length > HISTORIAL_METRICAS_MAX) historialMetricas.shift();
+    try { alCerrarMinuto(resumen); } catch (_) {}
     if (!m.total) return;
     console.log(
         `METRICAS 1 min | espectadores=${m.sesiones.size} | latidos=${m.latidos} pirateria=${m.pirateria} ` +
@@ -456,6 +518,8 @@ app.use('/auth/quick-login', (req, res, next) => {
                 `ALERTA ingreso: ${fallosIngresoMinuto.total} intentos fallidos de código en menos de un minuto ` +
                 `desde ${fallosIngresoMinuto.redes.size} redes distintas (posible adivinación de códigos).`
             );
+            // B11: el mismo aviso por Telegram, si está activado.
+            enviarAlerta(`Posible adivinación de códigos: ${fallosIngresoMinuto.total} intentos fallidos en menos de un minuto desde ${fallosIngresoMinuto.redes.size} redes distintas.`);
         }
     });
     next();
@@ -504,6 +568,8 @@ const STREAM_CONFIG_FORCE_MIN_INTERVAL_MS = parseInt(
 );
 let ultimaLecturaConfigAt = 0;
 let ultimaConfigValida = null;
+// Origen de la última lectura: "firestore", "ultima_valida" o "respaldo" (B9: el panel solo edita lo leído de Firestore).
+let ultimoOrigenConfig = "";
 let generacionConfig = 0;
 let lecturaConfigEnCurso = null;
 
@@ -559,7 +625,9 @@ app.get('/', (req, res) => {
         service: "Golazo Stream Backend",
         status: "online",
         version: VERSION_BACKEND,
-        stream_mode_default: STREAM_MODE_DEFAULT
+        stream_mode_default: STREAM_MODE_DEFAULT,
+        // B9: minutos de gracia de la limpieza de vencidos (el panel los muestra al confirmar).
+        limpieza_gracia_min: CLEANUP_GRACE_MINUTES
     });
 });
 
@@ -1012,6 +1080,7 @@ async function leerStreamConfig(generacion) {
             ultimaConfigValida = config;
         }
 
+        ultimoOrigenConfig = "firestore";
         return config;
 
     } catch (error) {
@@ -1019,6 +1088,7 @@ async function leerStreamConfig(generacion) {
 
         if (ultimaConfigValida) {
             console.warn(`Se mantiene la última configuración válida (versión ${ultimaConfigValida.version}).`);
+            ultimoOrigenConfig = "ultima_valida";
             if (vigente()) {
                 cachedStreamConfig = ultimaConfigValida;
                 cachedStreamConfigExpiresAt = now + STREAM_CONFIG_CACHE_TTL_MS;
@@ -1030,6 +1100,7 @@ async function leerStreamConfig(generacion) {
         config.transmissions = [createLegacyTransmission(config)];
         config.default_transmission_id = config.transmissions[0].id;
         config.version = createStreamConfigVersion(config);
+        ultimoOrigenConfig = "respaldo";
 
         if (vigente()) {
             cachedStreamConfig = config;
@@ -1136,6 +1207,34 @@ function materializeTransmissionCatalog(config, tokenDuration) {
 }
 
 // --- 8. MIDDLEWARE ADMIN ESTRICTO ---
+// Errores que sí significan «token inválido» (401). Cualquier otro error al verificar es de Google o de la red.
+const ERRORES_DE_TOKEN_ADMIN = new Set([
+    "auth/argument-error", "auth/invalid-argument", "auth/id-token-expired", "auth/invalid-id-token",
+    "auth/user-not-found", "auth/id-token-revoked", "auth/user-disabled"
+]);
+
+// Registro de acciones de los administradores (B9): quién hizo qué y cuándo. Una escritura por acción;
+// si falla, la acción no se detiene (queda la línea ADMIN en los registros de Render).
+// expira_en permite activar en Firestore una política de TTL que borre las entradas antiguas (opcional).
+const REGISTRO_ADMIN_DIAS = Math.max(1, parseInt(process.env.ADMIN_LOG_RETENTION_DAYS || "365", 10) || 365);
+function registrarAccionAdmin(req, accion, resumen, detalle = {}) {
+    const autor = req.golazoAdmin || {};
+    const entrada = {
+        accion,
+        resumen: String(resumen || "").slice(0, 300),
+        detalle,
+        actor_uid: autor.uid || "",
+        actor_email: autor.email || "",
+        ip: ipCliente(req),
+        en: nowTimestamp(),
+        expira_en: admin.firestore.Timestamp.fromMillis(Date.now() + REGISTRO_ADMIN_DIAS * 24 * 60 * 60 * 1000)
+    };
+    console.log(`ADMIN ${accion} | ${entrada.actor_email || entrada.actor_uid || "sin autor"} | ${entrada.resumen}`);
+    db.collection('registro_admin').add(entrada).catch(error => {
+        console.error("❌ No se pudo guardar el registro de la acción:", error.message);
+    });
+}
+
 async function verifyAdmin(req, res, next) {
     const authHeader = req.headers.authorization || "";
 
@@ -1149,9 +1248,14 @@ async function verifyAdmin(req, res, next) {
     const idToken = authHeader.replace("Bearer ", "").trim();
 
     try {
-        const decodedToken = await auth.verifyIdToken(idToken);
+        // checkRevoked: una sesión de administrador revocada (o una cuenta deshabilitada) deja de operar
+        // de inmediato, sin esperar a que venza su token de una hora.
+        const decodedToken = await auth.verifyIdToken(idToken, true);
 
         if (decodedToken.admin === true) {
+            req.golazoAdmin = { uid: decodedToken.uid, email: decodedToken.email || "" };
+            // B10: un ingreso nuevo (otra vez usuario y contraseña) queda en el registro y, si están activadas, avisa por Telegram.
+            notarIngresoAdmin(req, decodedToken);
             return next();
         }
 
@@ -1162,6 +1266,24 @@ async function verifyAdmin(req, res, next) {
 
     } catch (error) {
         console.error("❌ Token admin inválido:", error.message);
+
+        if (error.code === "auth/id-token-revoked" || error.code === "auth/user-disabled") {
+            return res.status(401).json({
+                success: false,
+                code: "ADMIN_SESSION_REVOKED",
+                message: "La sesión de administrador fue revocada. Vuelva a ingresar."
+            });
+        }
+
+        // Comprobar la revocación consulta a Google en cada solicitud. Si Google no responde (red, cuota,
+        // error interno), no es un token inválido: 503 para que el panel reintente sin cerrar la sesión.
+        if (!ERRORES_DE_TOKEN_ADMIN.has(error.code)) {
+            return res.status(503).json({
+                success: false,
+                code: "ADMIN_CHECK_UNAVAILABLE",
+                message: "No se pudo verificar la sesión con Google en este momento. Reintente en unos segundos."
+            });
+        }
 
         return res.status(401).json({
             success: false,
@@ -1925,7 +2047,7 @@ app.post('/qoe', qoeLimiter, express.text({ type: 'text/plain', limit: '4kb' }),
         const d = typeof req.body === 'string' ? JSON.parse(req.body || '{}') : (req.body || {});
         const numero = (v) => (v === null || v === undefined || v === '' || !Number.isFinite(Number(v)) ? null : Number(v));
         const texto = (v, max) => String(v === null || v === undefined ? '' : v).replace(/[^\w .,:/-]/g, '').slice(0, max);
-        console.log('QOE ' + JSON.stringify({
+        const resumenQoe = {
             fecha: new Date(Date.now()).toISOString(),
             id: texto(d.id, 24),
             dispositivo: texto(d.dispositivo, 10),
@@ -1938,7 +2060,9 @@ app.post('/qoe', qoeLimiter, express.text({ type: 'text/plain', limit: '4kb' }),
             relevosToken: numero(d.relevosToken),
             perfil: texto(d.perfil, 12),
             minutos: numero(d.minutos)
-        }));
+        };
+        console.log('QOE ' + JSON.stringify(resumenQoe));
+        acumularQoe(resumenQoe);
     } catch (_) {
         // Un resumen mal formado se ignora sin afectar a nadie.
     }
@@ -2095,6 +2219,14 @@ app.post('/admin/generar-pase-rapido', createPassLimiter, verifyAdmin, async (re
             });
         }
 
+        if (String(partido).length > 80) {
+            return res.status(400).json({
+                success: false,
+                code: "MATCH_TOO_LONG",
+                message: "El nombre del partido admite hasta 80 caracteres."
+            });
+        }
+
         const exp = fecha_corte
             ? new Date(fecha_corte)
             : new Date(Date.now() + 24 * 60 * 60 * 1000);
@@ -2131,11 +2263,23 @@ app.post('/admin/generar-pase-rapido', createPassLimiter, verifyAdmin, async (re
             // 8 cifras al azar criptográfico (se pueden escribir con el control remoto).
             const claveFinal = pass_manual || crypto.randomInt(10000000, 100000000).toString();
 
-            const userRecord = await auth.createUser({
-                email: emailFinal,
-                password: claveFinal,
-                displayName: partido
-            });
+            let userRecord;
+            try {
+                userRecord = await auth.createUser({
+                    email: emailFinal,
+                    password: claveFinal,
+                    displayName: partido
+                });
+            } catch (errorAlta) {
+                if (errorAlta.code === "auth/email-already-exists") {
+                    return res.status(409).json({
+                        success: false,
+                        code: "EMAIL_EXISTS",
+                        message: "Ese correo ya tiene una cuenta. Para renovar al socio, use «Extender» en la tabla del panel."
+                    });
+                }
+                throw errorAlta;
+            }
 
             await db.collection('usuarios').doc(userRecord.uid).set({
                 uid: userRecord.uid,
@@ -2153,6 +2297,8 @@ app.post('/admin/generar-pase-rapido', createPassLimiter, verifyAdmin, async (re
                 password_stored: false,
                 last_status: "created"
             });
+
+            registrarAccionAdmin(req, "crear_vip", `${emailFinal} · vence ${FORMATO_FECHA_HORA_LIMA.format(exp)}`, { uid: userRecord.uid });
 
             return res.json({
                 success: true,
@@ -2222,6 +2368,8 @@ app.post('/admin/generar-pase-rapido', createPassLimiter, verifyAdmin, async (re
             last_status: "created"
         });
 
+        registrarAccionAdmin(req, "crear_pase", `${String(partido).slice(0, 80)} · vence ${FORMATO_FECHA_HORA_LIMA.format(exp)}`, { uid: userRecord.uid, event_id: eventId });
+
         return res.json({
             success: true,
             tipo_acceso: "partido",
@@ -2260,6 +2408,8 @@ app.post('/admin/revocar-sesion', adminLimiter, verifyAdmin, async (req, res) =>
             last_heartbeat: nowTimestamp()
         });
 
+        registrarAccionAdmin(req, "revocar", `pase ${String(uid).slice(0, 40)}`, { uid });
+
         return res.json({
             success: true,
             message: "Sesión revocada exitosamente. El usuario será expulsado pronto."
@@ -2278,7 +2428,18 @@ app.post('/admin/revocar-sesion', adminLimiter, verifyAdmin, async (req, res) =>
 // --- 15.1 PANEL ADMIN: VER CONFIG STREAM ---
 app.post('/admin/ver-config-stream', adminLimiter, verifyAdmin, async (req, res) => {
     try {
-        const config = await getActiveStreamConfig();
+        // El panel recibe la configuración leída en este momento de Firestore. Si Firestore no responde,
+        // no se le entrega la de respaldo: guardarla reemplazaría las transmisiones reales para todos.
+        invalidarStreamConfig();
+        const config = await getActiveStreamConfig(true);
+
+        if (ultimoOrigenConfig !== "firestore") {
+            return res.status(503).json({
+                success: false,
+                code: "CONFIG_UNAVAILABLE",
+                message: "Firestore no respondió al leer la configuración. Reintente en unos segundos (no se muestra la de respaldo para no reemplazar la real)."
+            });
+        }
 
         return res.json({
             success: true,
@@ -2299,9 +2460,32 @@ app.post('/admin/ver-config-stream', adminLimiter, verifyAdmin, async (req, res)
 // --- 15.2 PANEL ADMIN: ACTUALIZAR CONFIG STREAM ---
 app.post('/admin/actualizar-config-stream', adminLimiter, verifyAdmin, async (req, res) => {
     try {
-        const currentConfig = await getActiveStreamConfig();
+        let currentConfig = await getActiveStreamConfig();
 
         if (Array.isArray(req.body?.transmissions)) {
+            // Concurrencia: si el panel informa la versión que editó y la guardada ya es otra, otro
+            // administrador la cambió mientras tanto; guardar ahora borraría su cambio.
+            const versionEsperada = String(req.body?.expected_version || "").trim();
+            if (versionEsperada) {
+                invalidarStreamConfig();
+                currentConfig = await getActiveStreamConfig(true);
+                if (ultimoOrigenConfig !== "firestore") {
+                    return res.status(503).json({
+                        success: false,
+                        code: "CONFIG_UNAVAILABLE",
+                        message: "Firestore no respondió; no se guardó nada. Reintente en unos segundos."
+                    });
+                }
+                if (currentConfig.version !== versionEsperada) {
+                    return res.status(409).json({
+                        success: false,
+                        code: "CONFIG_CHANGED",
+                        message: "Otro administrador cambió la configuración. Recárguela antes de guardar.",
+                        current_version: currentConfig.version
+                    });
+                }
+            }
+
             const normalizedCatalog = normalizeTransmissionCatalog(
                 req.body.transmissions,
                 true
@@ -2313,6 +2497,16 @@ app.post('/admin/actualizar-config-stream', adminLimiter, verifyAdmin, async (re
                     code: "INVALID_TRANSMISSION_CATALOG",
                     message: normalizedCatalog.errors[0],
                     errors: normalizedCatalog.errors
+                });
+            }
+
+            // Un catálogo vacío dejaría a todos los espectadores sin señal: solo llega así cuando el panel
+            // no pudo cargar la configuración. Para ocultar las transmisiones se desmarca «Visible».
+            if (!normalizedCatalog.transmissions.length) {
+                return res.status(400).json({
+                    success: false,
+                    code: "EMPTY_CATALOG",
+                    message: "No se guarda un catálogo sin transmisiones. Recargue la configuración; para ocultarlas, desmarque «Visible en la web»."
                 });
             }
 
@@ -2343,6 +2537,12 @@ app.post('/admin/actualizar-config-stream', adminLimiter, verifyAdmin, async (re
 
             console.log(
                 `✅ Catálogo actualizado | versión ${currentConfig.version || 'inicial'} -> ${savedConfig.version}`
+            );
+            registrarAccionAdmin(
+                req,
+                "configurar",
+                `${publicTransmissions.length} transmisión(es) visible(s) · versión ${currentConfig.version || 'inicial'} → ${savedConfig.version}`,
+                { anterior: currentConfig.version || "", nueva: savedConfig.version, visibles: publicTransmissions.length }
             );
 
             return res.json({
@@ -2415,6 +2615,11 @@ app.post('/admin/actualizar-config-stream', adminLimiter, verifyAdmin, async (re
 // archivan todos en un lote, luego se eliminan las cuentas de Auth en una sola llamada y
 // al final se borran, en otro lote, solo los pases cuya cuenta se eliminó. Si algo falla,
 // volver a pulsar completa lo pendiente (cada paso puede repetirse sin daño).
+// Margen (B9): los vencidos hace menos de CLEANUP_GRACE_MINUTES (180 por omisión; 0 lo desactiva) se
+// conservan por si el partido sigue en tiempo suplementario y hay que extenderlos: un pase borrado no
+// se puede recuperar.
+const CLEANUP_GRACE_MINUTES = Math.max(0, parseInt(process.env.CLEANUP_GRACE_MINUTES || "180", 10) || 0);
+const CLEANUP_GRACE_TEXTO = CLEANUP_GRACE_MINUTES % 60 === 0 ? `${CLEANUP_GRACE_MINUTES / 60} h` : `${CLEANUP_GRACE_MINUTES} min`;
 const CLEANUP_BATCH_SIZE = Math.min(400, Math.max(10, parseInt(process.env.CLEANUP_BATCH_SIZE || "400", 10) || 400));
 
 function datosDeArchivo(doc) {
@@ -2477,15 +2682,31 @@ app.post('/admin/limpiar-caducados', adminLimiter, verifyAdmin, async (req, res)
     try {
         const ahora = nowTimestamp();
 
+        const limiteLimpieza = admin.firestore.Timestamp.fromMillis(Date.now() - CLEANUP_GRACE_MINUTES * 60 * 1000);
+
         const vencidosSnap = await db.collection('usuarios')
-            .where('fecha_expiracion', '<', ahora)
+            .where('fecha_expiracion', '<', limiteLimpieza)
             .limit(CLEANUP_BATCH_SIZE + 1)
             .get();
+
+        // Cuántos se conservan: se cuenta solo en la primera parte (el panel envía continuacion en las siguientes).
+        let conservadosRecientes = 0;
+        if (CLEANUP_GRACE_MINUTES > 0 && req.body?.continuacion !== true) {
+            const recientes = await db.collection('usuarios')
+                .where('fecha_expiracion', '>=', limiteLimpieza)
+                .where('fecha_expiracion', '<', ahora)
+                .limit(1000)
+                .get();
+            conservadosRecientes = recientes.size;
+        }
 
         if (vencidosSnap.empty) {
             return res.json({
                 success: true,
-                mensaje: "✅ No hay usuarios vencidos."
+                mensaje: conservadosRecientes
+                    ? `✅ No hay vencidos para limpiar. ${conservadosRecientes} vencido(s) hace menos de ${CLEANUP_GRACE_TEXTO} se conservan para poder extenderlos.`
+                    : "✅ No hay usuarios vencidos.",
+                conservados_recientes: conservadosRecientes
             });
         }
 
@@ -2512,13 +2733,18 @@ app.post('/admin/limpiar-caducados', adminLimiter, verifyAdmin, async (req, res)
 
         const errores = fallidos.size;
 
+        registrarAccionAdmin(req, "limpiar", `${borrados} eliminados · ${archivados} archivados${conservadosRecientes ? ` · ${conservadosRecientes} recientes conservados` : ''}`,
+            { borrados, archivados, errores, conservados_recientes: conservadosRecientes });
+
         return res.json({
             success: true,
             mensaje: `🧹 ${borrados} pases eliminados · ${archivados} archivados${errores ? ` · ${errores} con error` : ''}` +
+                `${conservadosRecientes ? ` · ${conservadosRecientes} vencidos hace menos de ${CLEANUP_GRACE_TEXTO} se conservan` : ''}` +
                 `${quedanMas ? ' · Quedan más: vuelva a pulsar para continuar' : ''}.`,
             borrados,
             archivados,
             errores,
+            conservados_recientes: conservadosRecientes,
             quedan_mas: quedanMas
         });
 
@@ -2638,6 +2864,13 @@ app.post('/admin/extender-accesos', adminLimiter, verifyAdmin, async (req, res) 
 
         if (updated) await batch.commit();
 
+        registrarAccionAdmin(
+            req,
+            "extender",
+            `${updated} acceso(s) · ${mode === 'add' ? `+${Math.round(minutes)} min` : `hasta ${FORMATO_FECHA_HORA_LIMA.format(requestedExpiration)}`}${newLabel ? ` · partido: ${newLabel}` : ''}`,
+            { total: updated, modo: mode, uids: uids.slice(0, 20) }
+        );
+
         return res.json({
             success: true,
             updated,
@@ -2684,6 +2917,8 @@ app.post('/admin/revocar-multiples', adminLimiter, verifyAdmin, async (req, res)
         });
 
         if (updated) await batch.commit();
+
+        registrarAccionAdmin(req, "revocar_varios", `${updated} sesión(es) revocada(s)`, { total: updated, uids: uids.slice(0, 20) });
 
         return res.json({
             success: true,
@@ -2765,6 +3000,33 @@ app.post('/admin/listar-historial', adminLimiter, verifyAdmin, async (req, res) 
     } catch (e) {
         console.error("❌ Error listando historial archivado:", e);
         return res.status(500).json({ success: false, message: "Error cargando historial archivado." });
+    }
+});
+
+// --- 17.0 PANEL ADMIN: REGISTRO DE ACCIONES (B9) ---
+app.post('/admin/registro', adminLimiter, verifyAdmin, async (req, res) => {
+    try {
+        const limite = Math.min(200, Math.max(1, parseInt(req.body?.limite, 10) || 100));
+        const snap = await db.collection('registro_admin')
+            .orderBy('en', 'desc')
+            .limit(limite)
+            .get();
+
+        const items = snap.docs.map(doc => {
+            const d = doc.data() || {};
+            return {
+                accion: d.accion || "-",
+                resumen: d.resumen || "",
+                actor_email: d.actor_email || "",
+                actor_uid: d.actor_uid || "",
+                en_ms: getTimestampMillis(d.en)
+            };
+        });
+
+        return res.json({ success: true, items });
+    } catch (e) {
+        console.error("❌ Error leyendo el registro de acciones:", e);
+        return res.status(500).json({ success: false, message: "Error leyendo el registro de acciones." });
     }
 });
 
@@ -2895,7 +3157,7 @@ app.post('/admin/listar-usuarios', adminLimiter, verifyAdmin, async (req, res) =
                 ultima_conexion: ultimaConexion,
                 last_status: data.last_status || "-",
                 last_ip: data.last_ip || "Sin registro",
-                last_user_agent: data.last_user_agent || "Sin registro",
+                last_user_agent: String(data.last_user_agent || "Sin registro").slice(0, 300),
                 password_stored: data.password_stored === false ? false : true,
                 extension_count: Number(data.extension_count || 0),
                 last_extension_ms: getTimestampMillis(data.last_extension_at),
@@ -2929,6 +3191,1464 @@ app.post('/admin/listar-usuarios', adminLimiter, verifyAdmin, async (req, res) =
         });
     }
 });
+
+// --- 17.3 HERRAMIENTAS DE OPERACIÓN (B10) ---
+// Origen: sección 7 de la auditoría técnica del 16-09 («qué debería mostrar un panel profesional de
+// streaming») y herramientas de atención al cliente. Todo es de solo lectura salvo las acciones
+// explícitas del administrador (liberar, restaurar, nueva clave VIP), que quedan en registro_admin.
+
+// 17.3.1 Solicitudes salientes. Solo HTTP(S), con tiempo y tamaño máximos. Hacia direcciones que escribe
+// un administrador (una fuente externa) solo se consulta a IP públicas: el servidor no debe poder usarse
+// para leer su propia red interna (falsificación de solicitudes del lado del servidor, SSRF).
+function ipv4ANumero(ip) {
+    const p = String(ip).split('.').map(Number);
+    return (((p[0] << 24) >>> 0) + (p[1] << 16) + (p[2] << 8) + p[3]) >>> 0;
+}
+
+const REDES_V4_RESERVADAS = [
+    ['0.0.0.0', 8], ['10.0.0.0', 8], ['100.64.0.0', 10], ['127.0.0.0', 8], ['169.254.0.0', 16],
+    ['172.16.0.0', 12], ['192.0.0.0', 24], ['192.0.2.0', 24], ['192.168.0.0', 16], ['198.18.0.0', 15],
+    ['198.51.100.0', 24], ['203.0.113.0', 24], ['224.0.0.0', 4], ['240.0.0.0', 4]
+].map(([red, bits]) => [ipv4ANumero(red) >>> (32 - bits), bits]);
+
+function ipv4EsPublica(ip) {
+    const n = ipv4ANumero(ip);
+    return !REDES_V4_RESERVADAS.some(([prefijo, bits]) => (n >>> (32 - bits)) === prefijo);
+}
+
+function gruposIpv6(valor) {
+    const aGrupos = (texto) => {
+        if (!texto) return [];
+        const grupos = texto.split(':');
+        const ultimo = grupos[grupos.length - 1];
+        if (ultimo.includes('.')) {
+            const o = ultimo.split('.').map(Number);
+            grupos.splice(grupos.length - 1, 1, ((o[0] << 8) | o[1]).toString(16), ((o[2] << 8) | o[3]).toString(16));
+        }
+        return grupos;
+    };
+    const partes = valor.split('::');
+    const izquierda = aGrupos(partes[0]);
+    const derecha = partes.length > 1 ? aGrupos(partes[1]) : [];
+    const ceros = partes.length > 1 ? new Array(Math.max(0, 8 - izquierda.length - derecha.length)).fill('0') : [];
+    return izquierda.concat(ceros, derecha).map(g => parseInt(g || '0', 16));
+}
+
+function ipEsPublica(ip) {
+    let valor = String(ip || '').trim().replace(/^\[|\]$/g, '');
+    const zona = valor.indexOf('%');
+    if (zona >= 0) valor = valor.slice(0, zona);
+    if (net.isIPv4(valor)) return ipv4EsPublica(valor);
+    if (!net.isIPv6(valor)) return false;
+    const g = gruposIpv6(valor);
+    if (g.length !== 8 || g.some(x => !Number.isFinite(x))) return false;
+    const v4 = () => `${g[6] >> 8}.${g[6] & 255}.${g[7] >> 8}.${g[7] & 255}`;
+    if (g.slice(0, 5).every(x => x === 0) && g[5] === 0xffff) return ipv4EsPublica(v4());           // ::ffff:a.b.c.d
+    if (g[0] === 0x64 && g[1] === 0xff9b && g.slice(2, 6).every(x => x === 0)) return ipv4EsPublica(v4()); // NAT64
+    if (g.slice(0, 6).every(x => x === 0)) return false;          // ::, ::1 y ::a.b.c.d
+    if ((g[0] & 0xfe00) === 0xfc00) return false;                 // fc00::/7 privadas
+    if ((g[0] & 0xffc0) === 0xfe80) return false;                 // fe80::/10 enlace local
+    if ((g[0] & 0xff00) === 0xff00) return false;                 // ff00::/8 multidifusión
+    if (g[0] === 0x2001 && g[1] === 0x0db8) return false;         // 2001:db8::/32 documentación
+    if (g[0] === 0x0100 && g.slice(1, 4).every(x => x === 0)) return false; // 100::/64 descarte
+    if (g.slice(0, 4).every(x => x === 0) && g[4] === 0xffff && g[5] === 0) return false; // ::ffff:0:0/96 traducidas
+    if (g[0] === 0x64 && g[1] === 0xff9b && g[2] === 1) return false;    // 64:ff9b:1::/48 NAT64 local
+    if (g[0] === 0x2002) return false;                                 // 2002::/16 6to4
+    if (g[0] === 0x2001 && g[1] === 0) return false;                   // 2001::/32 Teredo
+    if ((g[0] & 0xffc0) === 0xfec0) return false;                      // fec0::/10 sitio (obsoleto)
+    return true;
+}
+
+// Resolución de nombres que rechaza las direcciones no públicas. Se usa también al conectar, así el
+// nombre no puede cambiar de dirección entre la comprobación y la conexión.
+function buscarSoloPublicas(nombre, opciones, callback) {
+    if (typeof opciones === 'function') { callback = opciones; opciones = {}; }
+    const familia = opciones && Number(opciones.family) ? Number(opciones.family) : 0;
+    dns.lookup(nombre, { all: true, family: familia }, (error, direcciones) => {
+        if (error) return callback(error);
+        const lista = Array.isArray(direcciones) ? direcciones : [];
+        if (!lista.length) {
+            const e = new Error('sin direcciones');
+            e.code = 'ENOTFOUND';
+            return callback(e);
+        }
+        if (!lista.every(d => ipEsPublica(d.address))) {
+            const e = new Error('dirección no pública');
+            e.code = 'EGOLAZO_RED_PRIVADA';
+            return callback(e);
+        }
+        if (opciones && opciones.all) return callback(null, lista);
+        return callback(null, lista[0].address, lista[0].family);
+    });
+}
+
+const agenteSalienteHttps = new https.Agent({ keepAlive: false, maxSockets: 16 });
+const agenteSalienteHttp = new http.Agent({ keepAlive: false, maxSockets: 16 });
+
+function solicitudSaliente(direccion, op = {}) {
+    const {
+        metodo = 'GET', cabeceras = {}, cuerpo = null, timeoutMs = 4000, maxBytes = 512 * 1024,
+        soloPublicas = true, redirecciones = 2
+    } = op;
+    const inicio = Date.now();
+    return new Promise((resolve) => {
+        let url;
+        try { url = new URL(String(direccion)); } catch (_) { return resolve({ ok: false, error: 'url', ms: 0 }); }
+        if (url.protocol !== 'https:' && url.protocol !== 'http:') return resolve({ ok: false, error: 'url', ms: 0 });
+        const host = url.hostname.replace(/^\[|\]$/g, '');
+        if (soloPublicas && net.isIP(host) && !ipEsPublica(host)) return resolve({ ok: false, error: 'red_privada', ms: 0 });
+        const esHttps = url.protocol === 'https:';
+        let terminado = false;
+        let reloj = null;
+        let solicitud = null;
+        const terminar = (r) => {
+            if (terminado) return;
+            terminado = true;
+            if (reloj) clearTimeout(reloj);
+            resolve({ ms: Date.now() - inicio, urlFinal: url.toString(), ...r });
+        };
+        const datos = cuerpo === null ? null : Buffer.from(typeof cuerpo === 'string' ? cuerpo : JSON.stringify(cuerpo));
+        const h = { 'user-agent': 'GolazoServidor/1.0', ...cabeceras };
+        if (datos) h['content-length'] = String(datos.length);
+        try {
+            solicitud = (esHttps ? https : http).request({
+                protocol: url.protocol, hostname: host, port: url.port || undefined,
+                path: url.pathname + url.search, method: metodo, headers: h,
+                agent: esHttps ? agenteSalienteHttps : agenteSalienteHttp,
+                lookup: soloPublicas ? buscarSoloPublicas : undefined
+            }, (respuesta) => {
+                const estado = respuesta.statusCode || 0;
+                if ([301, 302, 303, 307, 308].includes(estado) && respuesta.headers.location && redirecciones > 0) {
+                    // Se cierra la respuesta de la redirección: un cuerpo sin fin no debe quedar descargándose.
+                    try { respuesta.destroy(); } catch (_) {}
+                    let siguiente;
+                    try { siguiente = new URL(respuesta.headers.location, url).toString(); } catch (_) {
+                        return terminar({ ok: false, status: estado, error: 'redireccion' });
+                    }
+                    if (terminado) return;
+                    terminado = true;
+                    if (reloj) clearTimeout(reloj);
+                    const restante = Math.max(500, timeoutMs - (Date.now() - inicio));
+                    return solicitudSaliente(siguiente, { ...op, metodo: estado === 303 ? 'GET' : metodo, timeoutMs: restante, redirecciones: redirecciones - 1 })
+                        .then(r => resolve({ ...r, ms: Date.now() - inicio, redirigida: true }));
+                }
+                const trozos = [];
+                let total = 0;
+                respuesta.on('data', (trozo) => {
+                    if (terminado) return;
+                    total += trozo.length;
+                    if (total > maxBytes) {
+                        trozos.push(trozo.slice(0, Math.max(0, trozo.length - (total - maxBytes))));
+                        terminar({ ok: estado >= 200 && estado < 300, status: estado, headers: respuesta.headers, texto: Buffer.concat(trozos).toString('utf8'), cortada: true });
+                        try { respuesta.destroy(); } catch (_) {}
+                        return;
+                    }
+                    trozos.push(trozo);
+                });
+                respuesta.on('end', () => terminar({ ok: estado >= 200 && estado < 300, status: estado, headers: respuesta.headers, texto: Buffer.concat(trozos).toString('utf8'), cortada: false }));
+                respuesta.on('error', () => terminar({ ok: false, status: estado, error: 'conexion' }));
+            });
+        } catch (_) {
+            return terminar({ ok: false, error: 'conexion' });
+        }
+        reloj = setTimeout(() => {
+            terminar({ ok: false, error: 'tiempo' });
+            try { solicitud.destroy(); } catch (_) {}
+        }, timeoutMs);
+        solicitud.on('error', (e) => {
+            const codigo = e && e.code;
+            terminar({
+                ok: false,
+                error: codigo === 'EGOLAZO_RED_PRIVADA' ? 'red_privada'
+                    : (codigo === 'ENOTFOUND' || codigo === 'EAI_AGAIN' || codigo === 'ENODATA') ? 'dns' : 'conexion'
+            });
+        });
+        if (datos) solicitud.write(datos);
+        solicitud.end();
+    });
+}
+
+// 17.3.2 Avisos por Telegram (opcional). Se activan con ALERTAS_TELEGRAM=on y usan las variables que ya
+// existen en Render (TELEGRAM_BOT_TOKEN y MI_TELEGRAM_ID). El token nunca se escribe en los registros.
+const ALERTAS_TELEGRAM_PEDIDAS = String(process.env.ALERTAS_TELEGRAM || "").trim().toLowerCase() === "on";
+const TELEGRAM_BOT_TOKEN = String(process.env.TELEGRAM_BOT_TOKEN || "").trim();
+const TELEGRAM_CHAT_ID = String(process.env.MI_TELEGRAM_ID || "").trim();
+const ALERTAS_TELEGRAM = ALERTAS_TELEGRAM_PEDIDAS &&
+    /^\d{5,}:[A-Za-z0-9_-]{30,}$/.test(TELEGRAM_BOT_TOKEN) && /^-?\d{3,20}$/.test(TELEGRAM_CHAT_ID);
+if (ALERTAS_TELEGRAM_PEDIDAS && !ALERTAS_TELEGRAM) {
+    console.warn("AVISO alertas: ALERTAS_TELEGRAM=on, pero falta TELEGRAM_BOT_TOKEN o MI_TELEGRAM_ID con un valor válido: no se enviarán avisos.");
+}
+
+const estadoAlertas = { enviadas: 0, fallidas: 0, descartadas: 0, ultimo_error: "", ultima_ms: 0, recientes: [] };
+const colaAlertas = [];
+const alertasRecientes = new Map();
+let enviandoAlertas = false;
+
+function configuracionAlertas() {
+    if (ALERTAS_TELEGRAM) return "telegram";
+    return ALERTAS_TELEGRAM_PEDIDAS ? "incompleta" : "desactivadas";
+}
+
+function anotarAlerta(texto, entregada) {
+    estadoAlertas.recientes.unshift({ en_ms: Date.now(), texto: texto.slice(0, 300), entregada });
+    if (estadoAlertas.recientes.length > 10) estadoAlertas.recientes.length = 10;
+}
+
+async function entregarAlerta(texto) {
+    const r = await solicitudSaliente(`https://api.telegram.org/bot${TELEGRAM_BOT_TOKEN}/sendMessage`, {
+        metodo: 'POST', timeoutMs: 6000, maxBytes: 64 * 1024, soloPublicas: false, redirecciones: 0,
+        cabeceras: { 'content-type': 'application/json' },
+        cuerpo: { chat_id: TELEGRAM_CHAT_ID, text: texto.slice(0, 3500), disable_web_page_preview: true }
+    });
+    let respuesta = null;
+    try { respuesta = JSON.parse(r.texto || "null"); } catch (_) {}
+    if (r.ok && respuesta && respuesta.ok === true) {
+        estadoAlertas.enviadas++;
+        estadoAlertas.ultima_ms = Date.now();
+        anotarAlerta(texto, true);
+        return true;
+    }
+    anotarAlerta(texto, false);
+    estadoAlertas.fallidas++;
+    estadoAlertas.ultimo_error = r.error ? `sin respuesta (${r.error})` : `Telegram respondió ${r.status || "?"}${respuesta && respuesta.description ? `: ${String(respuesta.description).slice(0, 120)}` : ""}`;
+    console.warn(`AVISO alertas: no se pudo enviar el mensaje (${estadoAlertas.ultimo_error}).`);
+    return false;
+}
+
+async function procesarColaAlertas() {
+    if (enviandoAlertas) return;
+    enviandoAlertas = true;
+    try {
+        while (colaAlertas.length) {
+            const item = colaAlertas.shift();
+            const entregada = await entregarAlerta(item.texto);
+            item.resolver(entregada);
+            // Telegram admite un mensaje por segundo en un mismo chat.
+            if (colaAlertas.length) await new Promise(r => setTimeout(r, 1100));
+        }
+    } finally {
+        enviandoAlertas = false;
+    }
+}
+
+// Devuelve una promesa que se resuelve con true si el mensaje llegó a Telegram. Nunca lanza.
+function enviarAlerta(texto, { forzar = false } = {}) {
+    if (!ALERTAS_TELEGRAM) return Promise.resolve(false);
+    const mensaje = `GOLAZO · ${String(texto || "").replace(/\s+/g, " ").trim()}`;
+    const ahora = Date.now();
+    for (const [t, ms] of alertasRecientes) if (ahora - ms > 60000) alertasRecientes.delete(t);
+    if (!forzar && alertasRecientes.has(mensaje)) {
+        estadoAlertas.descartadas++;
+        return Promise.resolve(false);
+    }
+    if (colaAlertas.length >= 20) {
+        estadoAlertas.descartadas++;
+        return Promise.resolve(false);
+    }
+    alertasRecientes.set(mensaje, ahora);
+    return new Promise((resolver) => {
+        colaAlertas.push({ texto: mensaje, resolver });
+        procesarColaAlertas().catch(() => {});
+    });
+}
+
+// 17.3.3 Ingresos de administradores: cada ingreso nuevo (usuario y contraseña, no la renovación horaria
+// del token) queda en registro_admin con su IP y equipo, y se avisa por Telegram si está activado.
+// Se recuerdan los últimos 20 ingresos de cada administrador (también en estado_admin, para no repetir el
+// aviso tras un reinicio): una sesión iniciada antes que la última conocida también avisa.
+const INGRESOS_ADMIN_RECORDADOS = 20;
+const ingresosAdminVistos = new Map();     // uid -> Set de auth_time ya avisados
+const ingresosAdminEnCurso = new Map();    // `${uid}:${auth_time}` -> tarea
+
+function recordarIngresosAdmin(uid, lista) {
+    ingresosAdminVistos.set(uid, new Set([...lista].sort((a, b) => b - a).slice(0, INGRESOS_ADMIN_RECORDADOS)));
+}
+
+function notarIngresoAdmin(req, token) {
+    const uid = String(token && token.uid || "");
+    const authTime = Number(token && token.auth_time) || 0;
+    if (!uid || !authTime) return;
+    const vistos = ingresosAdminVistos.get(uid);
+    if (vistos && vistos.has(authTime)) return;
+    const claveIngreso = `${uid}:${authTime}`;
+    if (ingresosAdminEnCurso.has(claveIngreso)) return;
+    const tarea = (async () => {
+        const ref = db.collection('estado_admin').doc(uid);
+        let guardados = [];
+        try {
+            const snap = await ref.get();
+            const d = snap.exists ? snap.data() || {} : {};
+            guardados = Array.isArray(d.auth_times) ? d.auth_times.map(Number).filter(Number.isFinite) : [];
+            if (!guardados.length && Number(d.ultimo_auth_time)) guardados = [Number(d.ultimo_auth_time)];
+        } catch (_) {
+            // Si Firestore falla se registra igual: mejor un aviso repetido que un ingreso sin aviso.
+        }
+        const conocidos = new Set(guardados.concat(vistos ? [...vistos] : []));
+        if (conocidos.has(authTime)) {
+            recordarIngresosAdmin(uid, conocidos);
+            return;
+        }
+        conocidos.add(authTime);
+        recordarIngresosAdmin(uid, conocidos);
+        const ultimos = [...ingresosAdminVistos.get(uid)];
+        try {
+            await ref.set({ auth_times: ultimos, ultimo_auth_time: Math.max(...ultimos), email: token.email || "", visto_en: nowTimestamp() }, { merge: true });
+        } catch (error) {
+            console.error("❌ No se pudo guardar el último ingreso del administrador:", error.message);
+        }
+        const equipo = summarizeUserAgent(req.headers['user-agent'] || "Sin registro");
+        const ip = ipCliente(req);
+        registrarAccionAdmin(req, "ingreso", `Ingreso al panel desde ${equipo} · IP ${ip}`, { auth_time: authTime, equipo });
+        enviarAlerta(`Ingreso al panel de administración: ${token.email || uid}, desde ${equipo}, IP ${ip}, ${FORMATO_FECHA_HORA_LIMA.format(new Date())} (hora de Lima). Si no fue usted, cambie la contraseña y revoque la sesión.`);
+    })().catch(() => {}).finally(() => ingresosAdminEnCurso.delete(claveIngreso));
+    ingresosAdminEnCurso.set(claveIngreso, tarea);
+}
+
+// 17.3.4 Verificación de la señal: pide la lista HLS a la CDN como un espectador (URL firmada de 2 min)
+// y el comienzo del último segmento. «En vivo» significa que la lista avanza entre dos lecturas.
+const SENAL_CACHE_MS = Math.min(15000, Math.max(2000, parseInt(process.env.SENAL_CACHE_MS || "8000", 10) || 8000));
+const SENAL_TIMEOUT_MS = Math.min(10000, Math.max(1000, parseInt(process.env.SENAL_TIMEOUT_MS || "4000", 10) || 4000));
+const SENAL_MAX_VERIFICADAS = 6;
+const estadoSenal = new Map();
+
+function analizarListaHls(texto) {
+    const lineas = String(texto || "").split(/\r?\n/).map(l => l.trim()).filter(Boolean);
+    if (!lineas.length || lineas[0].replace(/^﻿/, "") !== "#EXTM3U") return null;
+    const r = { version: null, objetivo_s: null, secuencia: 0, segmentos: 0, duracion_s: 0, ultima_duracion_s: null, ultimo_segmento: "", fin: false, maestra: false, variantes: [] };
+    let esperandoSegmento = false;
+    let esperandoVariante = false;
+    let duracion = null;
+    lineas.slice(1).forEach(linea => {
+        if (linea.startsWith("#EXT-X-VERSION:")) r.version = Number(linea.slice(15)) || null;
+        else if (linea.startsWith("#EXT-X-TARGETDURATION:")) r.objetivo_s = Number(linea.slice(22)) || null;
+        else if (linea.startsWith("#EXT-X-MEDIA-SEQUENCE:")) r.secuencia = Number(linea.slice(22)) || 0;
+        else if (linea.startsWith("#EXT-X-ENDLIST")) r.fin = true;
+        else if (linea.startsWith("#EXT-X-STREAM-INF")) { r.maestra = true; esperandoVariante = true; }
+        else if (linea.startsWith("#EXTINF:")) { duracion = parseFloat(linea.slice(8)); esperandoSegmento = true; }
+        else if (!linea.startsWith("#")) {
+            if (esperandoVariante) { r.variantes.push(linea); esperandoVariante = false; }
+            else if (esperandoSegmento) {
+                r.segmentos++;
+                if (Number.isFinite(duracion)) { r.duracion_s += duracion; r.ultima_duracion_s = duracion; }
+                r.ultimo_segmento = linea;
+                esperandoSegmento = false;
+            }
+        }
+    });
+    r.duracion_s = Math.round(r.duracion_s * 10) / 10;
+    return r;
+}
+
+function nombreCorto(uri) {
+    return String(uri || "").split("?")[0].split("/").pop().slice(0, 80);
+}
+
+async function muestrearLista(url, cabeceras) {
+    const lectura = await solicitudSaliente(url, { cabeceras, timeoutMs: SENAL_TIMEOUT_MS, maxBytes: 512 * 1024 });
+    const muestra = { http: lectura.status || null, ms: lectura.ms, error: lectura.error || null, lista: null, segmento: null, maestra: false, variantes: 0 };
+    if (lectura.error || !lectura.ok) return muestra;
+    let lista = analizarListaHls(lectura.texto);
+    let urlLista = lectura.urlFinal || url;
+    if (!lista) { muestra.error = "no_lista"; return muestra; }
+    if (lista.maestra) {
+        muestra.maestra = true;
+        muestra.variantes = lista.variantes.length;
+        if (!lista.variantes.length) { muestra.error = "maestra_vacia"; return muestra; }
+        let urlVariante;
+        try { urlVariante = new URL(lista.variantes[0], urlLista).toString(); } catch (_) { muestra.error = "no_lista"; return muestra; }
+        const variante = await solicitudSaliente(urlVariante, { cabeceras, timeoutMs: SENAL_TIMEOUT_MS, maxBytes: 512 * 1024 });
+        muestra.http = variante.status || null;
+        muestra.ms += variante.ms;
+        if (variante.error || !variante.ok) { muestra.error = variante.error || null; return muestra; }
+        lista = analizarListaHls(variante.texto);
+        urlLista = variante.urlFinal || urlVariante;
+        if (!lista || lista.maestra) { muestra.error = "no_lista"; return muestra; }
+    }
+    muestra.lista = lista;
+    if (lista.segmentos && lista.ultimo_segmento) {
+        let urlSegmento = null;
+        try { urlSegmento = new URL(lista.ultimo_segmento, urlLista).toString(); } catch (_) {}
+        if (urlSegmento) {
+            const seg = await solicitudSaliente(urlSegmento, { cabeceras: { ...cabeceras, range: "bytes=0-1023" }, timeoutMs: SENAL_TIMEOUT_MS, maxBytes: 2048 });
+            muestra.segmento = { http: seg.status || null, ms: seg.ms, error: seg.error || null };
+        }
+    }
+    return muestra;
+}
+
+function clasificarSenal(clave, muestra, ahora, { umbralMs = 0 } = {}) {
+    const previo = estadoSenal.get(clave) || {};
+    const reciente = previo.vistoEn && ahora - previo.vistoEn <= 120000;
+    const base = { http: muestra.http, ms: muestra.ms, verificado_en: ahora, lista: null, segmento: muestra.segmento, maestra: muestra.maestra, variantes: muestra.variantes };
+    const conError = (motivo) => {
+        estadoSenal.set(clave, { ...(estadoSenal.get(clave) || {}), ultimaMuestraEn: ahora });
+        return { ...base, estado: "ERROR", motivo, avanzo_hace_s: reciente && previo.avanzoEn ? Math.round((ahora - previo.avanzoEn) / 1000) : null };
+    };
+    if (muestra.error === "tiempo") return conError(`Sin respuesta en ${Math.round(SENAL_TIMEOUT_MS / 1000)} s.`);
+    if (muestra.error === "red_privada") return conError("La dirección apunta a una red privada o reservada: el servidor no la consulta.");
+    if (muestra.error === "dns") return conError("No se encontró el dominio de la señal (DNS).");
+    if (muestra.error === "conexion" || muestra.error === "url") return conError("No se pudo conectar con la CDN o con el servidor de la señal.");
+    if (muestra.http === 403) return conError("La CDN rechazó el acceso (403). En Bunny, BUNNY_KEY debe coincidir con la clave de «Token authentication» y no debe haber una restricción de referer o de país que excluya al servidor.");
+    if (muestra.http === 404) return conError("La lista no existe (404): OBS no está transmitiendo a esa ruta, o la ruta configurada no es la correcta.");
+    if (muestra.http >= 500) return conError(`La CDN o el origen fallaron (código ${muestra.http}).`);
+    if (muestra.http && (muestra.http < 200 || muestra.http >= 300)) return conError(`Respuesta inesperada (código ${muestra.http}).`);
+    if (muestra.error === "no_lista") return conError("La respuesta no es una lista HLS (puede ser una página de error o un reproductor).");
+    if (muestra.error === "maestra_vacia") return conError("La lista maestra no nombra ninguna variante.");
+    if (muestra.error) return conError("No se pudo leer la lista.");
+
+    const lista = muestra.lista;
+    base.lista = {
+        version: lista.version, objetivo_s: lista.objetivo_s, secuencia: lista.secuencia, segmentos: lista.segmentos,
+        duracion_s: lista.duracion_s, ultimo_segmento: nombreCorto(lista.ultimo_segmento)
+    };
+    // En el tablero, «detenida» tras 15 s sin avanzar (o 3 duraciones de segmento); en la prueba del editor, el umbral es menor.
+    const umbral = umbralMs || Math.max(15000, 3 * Math.max(1000, (lista.objetivo_s || 2) * 1000));
+    const avanzo = Boolean(reciente && (lista.secuencia > (previo.secuencia || 0) ||
+        (lista.ultimo_segmento && previo.ultimoUri && lista.ultimo_segmento !== previo.ultimoUri)));
+    const nuevo = {
+        secuencia: lista.secuencia,
+        ultimoUri: lista.ultimo_segmento,
+        vistoEn: ahora,
+        avanzoEn: avanzo ? ahora : (reciente ? previo.avanzoEn || null : null),
+        primeraEn: reciente && previo.primeraEn ? previo.primeraEn : ahora,
+        ultimaMuestraEn: ahora
+    };
+    estadoSenal.set(clave, { ...(estadoSenal.get(clave) || {}), ...nuevo });
+    const hace = nuevo.avanzoEn ? Math.round((ahora - nuevo.avanzoEn) / 1000) : null;
+    base.avanzo_hace_s = hace;
+    if (lista.fin) return { ...base, estado: "DETENIDA", motivo: "La lista indica que la transmisión terminó (EXT-X-ENDLIST)." };
+    if (!lista.segmentos) return { ...base, estado: "DETENIDA", motivo: "La lista no tiene segmentos." };
+    if (muestra.segmento && muestra.segmento.error) return { ...base, estado: "ERROR", motivo: "La lista responde, pero el último segmento no llegó." };
+    if (muestra.segmento && muestra.segmento.http && (muestra.segmento.http < 200 || muestra.segmento.http >= 300)) {
+        return { ...base, estado: "ERROR", motivo: `La lista responde, pero el último segmento no (código ${muestra.segmento.http}).` };
+    }
+    if (nuevo.avanzoEn && ahora - nuevo.avanzoEn <= umbral) {
+        return { ...base, estado: "EN_VIVO", motivo: hace <= 1 ? "La lista avanza: hay un segmento nuevo." : `La lista avanza: último segmento nuevo hace ${hace} s.` };
+    }
+    if (ahora - nuevo.primeraEn >= umbral) {
+        return { ...base, estado: "DETENIDA", motivo: `La lista no avanza desde hace ${Math.round((ahora - (nuevo.avanzoEn || nuevo.primeraEn)) / 1000)} s: OBS pudo detenerse o el origen dejó de producir segmentos.` };
+    }
+    return { ...base, estado: "SIN_COMPARAR", motivo: "Primera lectura de la lista: en unos segundos se confirma si avanza." };
+}
+
+function describirOpcion(opcion) {
+    const d = { clave: opcion.clave, id: opcion.id || "", tipo: opcion.tipo, etiqueta: opcion.etiqueta || "", transmision: opcion.transmision || "", principal: Boolean(opcion.principal) };
+    if (opcion.tipo === "bunny") d.ruta = opcion.ruta;
+    if (opcion.url) {
+        try { d.host = new URL(opcion.url).host; } catch (_) { d.host = ""; }
+    }
+    return d;
+}
+
+function urlYCabecerasDe(opcion) {
+    if (opcion.tipo === "bunny") {
+        const base = String(APP_BASE_URL || "https://golazosp.net").replace(/\/+$/, "");
+        return {
+            url: generateBunnyTokenForStream(opcion.ruta, BUNNY_SECURITY_KEY, 120).url,
+            cabeceras: { accept: "*/*", referer: `${base}/`, origin: base }
+        };
+    }
+    return { url: opcion.url, cabeceras: { accept: "*/*" } };
+}
+
+function recortarEstadoSenal() {
+    if (estadoSenal.size <= 100) return;
+    const orden = [...estadoSenal.entries()].sort((a, b) => (a[1].ultimaMuestraEn || 0) - (b[1].ultimaMuestraEn || 0));
+    orden.slice(0, estadoSenal.size - 100).forEach(([clave, valor]) => { if (!valor.enCurso) estadoSenal.delete(clave); });
+}
+
+async function verificarSenal(opcion, { forzar = false } = {}) {
+    const previo = estadoSenal.get(opcion.clave) || {};
+    // La caché comparte el estado de la señal, no la descripción (una prueba del editor no cambia el tablero).
+    if (previo.enCurso) return previo.enCurso.then(r => ({ ...r, ...describirOpcion(opcion) }));
+    if (previo.resultado && Date.now() - previo.resultado.verificado_en < (forzar ? 2000 : SENAL_CACHE_MS)) {
+        return { ...previo.resultado, ...describirOpcion(opcion) };
+    }
+    const tarea = (async () => {
+        const { url, cabeceras } = urlYCabecerasDe(opcion);
+        const muestra = await muestrearLista(url, cabeceras);
+        return { ...describirOpcion(opcion), ...clasificarSenal(opcion.clave, muestra, Date.now()) };
+    })();
+    estadoSenal.set(opcion.clave, { ...previo, enCurso: tarea });
+    recortarEstadoSenal();
+    try {
+        const resultado = await tarea;
+        estadoSenal.set(opcion.clave, { ...(estadoSenal.get(opcion.clave) || {}), enCurso: null, resultado });
+        return resultado;
+    } catch (error) {
+        estadoSenal.set(opcion.clave, { ...(estadoSenal.get(opcion.clave) || {}), enCurso: null });
+        throw error;
+    }
+}
+
+// Qué se verifica en el tablero: las opciones Bunny visibles (hasta 6) y, si la señal principal (opción
+// predeterminada de la transmisión predeterminada) es de otro tipo, también esa.
+function opcionesParaTablero(config) {
+    const lista = [];
+    const transmisiones = (config.transmissions || []).filter(t => t.visible);
+    const predeterminada = transmisiones.find(t => t.id === config.default_transmission_id) || transmisiones[0];
+    const ordenadas = predeterminada ? [predeterminada, ...transmisiones.filter(t => t !== predeterminada)] : transmisiones;
+    ordenadas.forEach(t => {
+        const opciones = (t.options || []).filter(o => o.enabled);
+        const porOmision = opciones.find(o => o.id === t.default_option_id) || opciones[0];
+        [porOmision, ...opciones.filter(o => o !== porOmision)].filter(Boolean).forEach(o => {
+            const principal = t === predeterminada && o === porOmision;
+            const base = { id: `${t.id}/${o.id}`, transmision: t.name, etiqueta: o.label, principal };
+            if (o.source_type === "bunny" && o.path) lista.push({ ...base, tipo: "bunny", ruta: o.path, clave: "bunny:" + o.path });
+            else if (o.source_type === "external" && o.url && principal) lista.push({ ...base, tipo: "external", url: o.url, clave: "ext:" + o.url });
+            else if (principal) lista.push({ ...base, tipo: o.source_type, url: o.url, clave: `otra:${t.id}/${o.id}`, noVerificable: true });
+        });
+    });
+    const vistas = new Set();
+    return lista.filter(o => {
+        if (vistas.has(o.clave)) return false;
+        vistas.add(o.clave);
+        return true;
+    }).slice(0, SENAL_MAX_VERIFICADAS);
+}
+
+function resultadoNoVerificable(opcion) {
+    return {
+        ...describirOpcion(opcion), estado: "NO_VERIFICABLE", verificado_en: Date.now(),
+        motivo: opcion.tipo === "iframe"
+            ? "Reproductor externo (iframe): el servidor no puede comprobar el video que muestra."
+            : "Este tipo de fuente no se verifica."
+    };
+}
+
+// 17.3.5 Actividad y salud del servidor.
+function acumularQoe(r) {
+    const q = metricasMinuto.qoe;
+    const acotar = (v, max) => (Number.isFinite(v) && v >= 0 ? Math.min(v, max) : 0);
+    q.n++;
+    if (Number.isFinite(r.arranqueMs) && r.arranqueMs >= 0 && r.arranqueMs <= 600000 && q.arranques.length < 200) q.arranques.push(r.arranqueMs);
+    // /qoe no exige sesión: cada reporte se acota a valores posibles para que uno falso no domine el resumen.
+    q.rebuffers += acotar(r.rebuffers, 300);
+    q.rebufferMs += acotar(r.rebufferMs, 60 * 60 * 1000);
+    q.errores += acotar(r.errores, 100);
+    q.minutos += acotar(r.minutos, 240);
+}
+
+function resumenActividad() {
+    return {
+        minutos: historialMetricas.slice(-HISTORIAL_METRICAS_MAX),
+        en_curso: resumirMetricas(metricasMinuto, inicioMinutoMetricas),
+        rechazos_429_desde_arranque: { ...rechazosPorLimitador },
+        encendido_desde_ms: Date.now() - Math.round(process.uptime() * 1000)
+    };
+}
+
+function resumenServidor() {
+    const memoria = process.memoryUsage();
+    return {
+        version: VERSION_BACKEND,
+        encendido_s: Math.round(process.uptime()),
+        memoria_mb: Math.round(memoria.rss / 1048576),
+        heap_mb: Math.round(memoria.heapUsed / 1048576),
+        retardo: retardoUltimoMinuto,
+        node: process.version,
+        dependencias: VERSIONES_DEPENDENCIAS
+    };
+}
+
+// Las etapas siguientes agregan campos al tablero y herramientas a esta lista.
+const EXTENSIONES_TABLERO = [];
+const HERRAMIENTAS = {
+    tablero: true, probar_fuente: true, liberar_sesion: true, restaurar_pase: true,
+    nueva_clave_vip: true, ingresos_admin: true
+};
+const CIERRES_DE_MINUTO = [];
+function alCerrarMinuto(resumen) {
+    CIERRES_DE_MINUTO.forEach(fn => { try { fn(resumen); } catch (_) {} });
+}
+
+const TABLERO_RATE_LIMIT_MAX = parseInt(process.env.TABLERO_RATE_LIMIT_MAX || "30", 10);
+const tableroLimiter = rateLimit({
+    windowMs: 60 * 1000,
+    max: TABLERO_RATE_LIMIT_MAX,
+    standardHeaders: true,
+    legacyHeaders: false,
+    keyGenerator: claveLimitePorIp,
+    skip: (req) => req.method === 'OPTIONS',
+    message: MENSAJE_LIMITE_ADMIN,
+    handler: manejadorLimite("tablero", MENSAJE_LIMITE_ADMIN)
+});
+
+// El tablero tiene su propio límite: se actualiza solo cada 20 s y no debe consumir el de las acciones.
+app.post('/admin/tablero', tableroLimiter, verifyAdmin, async (req, res) => {
+    try {
+        const forzar = req.body?.verificar === true;
+        const config = await getActiveStreamConfig();
+        const opciones = opcionesParaTablero(config);
+        const verificadas = await Promise.all(opciones.map(o => o.noVerificable
+            ? Promise.resolve(resultadoNoVerificable(o))
+            : verificarSenal(o, { forzar }).catch(() => ({ ...describirOpcion(o), estado: "ERROR", motivo: "No se pudo verificar la señal.", verificado_en: Date.now() }))));
+        const principal = verificadas.find(v => v.principal) || verificadas[0] || null;
+        const extra = {};
+        EXTENSIONES_TABLERO.forEach(fn => { try { Object.assign(extra, fn()); } catch (_) {} });
+        return res.json({
+            success: true,
+            version: VERSION_BACKEND,
+            generado_en: Date.now(),
+            senal: {
+                principal: principal ? principal.estado : "SIN_FUENTES",
+                verificadas,
+                // La segunda lectura tiene que llegar después de la caché, o repetiría la primera.
+                reintentar_ms: verificadas.some(v => v.estado === "SIN_COMPARAR") ? SENAL_CACHE_MS + 1000 : null,
+                origen_config: ultimoOrigenConfig
+            },
+            actividad: resumenActividad(),
+            servidor: resumenServidor(),
+            alertas: { configuracion: configuracionAlertas(), ...estadoAlertas },
+            herramientas: { ...HERRAMIENTAS, alertas: configuracionAlertas() },
+            app_base_url: String(APP_BASE_URL || "https://golazosp.net").replace(/\/+$/, ""),
+            ...extra
+        });
+    } catch (e) {
+        console.error("❌ Error armando el tablero:", e);
+        return res.status(500).json({ success: false, message: "Error armando el tablero." });
+    }
+});
+
+// Prueba de una fuente desde el editor de transmisiones, antes o después de guardarla: hasta cuatro
+// lecturas de la lista (al inicio, a los 4, 7 y 10 s) hasta ver que avanza. Una lista que no avanza en
+// 7 s (o en 2,5 duraciones de segmento, si son más largos) se informa como detenida.
+app.post('/admin/probar-fuente', adminLimiter, verifyAdmin, async (req, res) => {
+    try {
+        const tipo = String(req.body?.source_type || "").trim().toLowerCase();
+        let opcion;
+        if (tipo === "bunny") {
+            const ruta = normalizeBunnyPath(req.body?.path);
+            if (!ruta) return res.status(400).json({ success: false, code: "INVALID_PATH", message: "Ruta Bunny inválida: debe empezar con /stream/ y terminar en .m3u8." });
+            opcion = { tipo: "bunny", ruta, clave: "bunny:" + ruta, etiqueta: String(req.body?.label || "").slice(0, 40) };
+        } else if (tipo === "external" || tipo === "hls" || tipo === "iframe") {
+            const url = String(req.body?.url || "").trim();
+            if (!isValidHttpUrl(url) || url.length > 2000) return res.status(400).json({ success: false, code: "INVALID_URL", message: "URL inválida." });
+            opcion = { tipo: tipo === "iframe" ? "iframe" : "external", url, clave: (tipo === "iframe" ? "pagina:" : "ext:") + url, etiqueta: String(req.body?.label || "").slice(0, 40) };
+        } else {
+            return res.status(400).json({ success: false, code: "INVALID_SOURCE", message: "Tipo de fuente inválido." });
+        }
+
+        if (opcion.tipo === "iframe") {
+            const pagina = await solicitudSaliente(opcion.url, { timeoutMs: SENAL_TIMEOUT_MS, maxBytes: 64 * 1024 });
+            const responde = pagina.ok;
+            return res.json({
+                success: true,
+                resultado: {
+                    ...describirOpcion(opcion), estado: responde ? "NO_VERIFICABLE" : "ERROR", http: pagina.status || null, ms: pagina.ms, verificado_en: Date.now(),
+                    motivo: responde
+                        ? `La página responde (código ${pagina.status}). El video dentro de un reproductor externo no se puede comprobar desde el servidor: ábralo para verlo.`
+                        : (pagina.error === "red_privada" ? "La dirección apunta a una red privada o reservada: el servidor no la consulta."
+                            : pagina.error === "tiempo" ? `La página no respondió en ${Math.round(SENAL_TIMEOUT_MS / 1000)} s.`
+                            : pagina.error ? "No se pudo conectar con la página." : `La página respondió con el código ${pagina.status}.`)
+                },
+                muestras: []
+            });
+        }
+
+        const { url, cabeceras } = urlYCabecerasDe(opcion);
+        const muestras = [];
+        let resultado = null;
+        let objetivoS = 2;
+        const comienzo = Date.now();
+        for (let i = 0; ; i++) {
+            if (i) await new Promise(r => setTimeout(r, i === 1 ? 4000 : 3000));
+            const muestra = await muestrearLista(url, cabeceras);
+            objetivoS = (muestra.lista && muestra.lista.objetivo_s) || objetivoS;
+            const umbral = Math.max(7000, 2.5 * Math.max(1000, objetivoS * 1000));
+            resultado = { ...describirOpcion(opcion), ...clasificarSenal(opcion.clave, muestra, Date.now(), { umbralMs: umbral }) };
+            muestras.push({ http: resultado.http, ms: resultado.ms, secuencia: resultado.lista ? resultado.lista.secuencia : null, estado: resultado.estado });
+            // Con segmentos largos se sigue leyendo hasta pasar el umbral (como máximo unos 20 s en total).
+            const limite = Math.min(19000, Math.max(10000, umbral + 1000));
+            if (resultado.estado !== "SIN_COMPARAR" || Date.now() - comienzo >= limite) break;
+        }
+        if (resultado && resultado.estado === "SIN_COMPARAR") {
+            resultado = { ...resultado, motivo: `No se pudo confirmar en ${Math.round((Date.now() - comienzo) / 1000)} s si la lista avanza (segmentos de ${objetivoS} s). Pruebe otra vez.` };
+        }
+        estadoSenal.set(opcion.clave, { ...(estadoSenal.get(opcion.clave) || {}), resultado });
+        recortarEstadoSenal();
+        return res.json({ success: true, resultado, muestras });
+    } catch (e) {
+        console.error("❌ Error probando la fuente:", e);
+        return res.status(500).json({ success: false, message: "Error probando la fuente." });
+    }
+});
+
+// Liberar la sesión de un pase: el cliente puede entrar desde cualquier equipo sin «Continuar aquí» (por
+// ejemplo, si su equipo anterior se apagó sin cerrar, o si alcanzó el tope de tomas de control). El equipo
+// que estuviera viendo se detiene en su siguiente comprobación.
+app.post('/admin/liberar-sesion', adminLimiter, verifyAdmin, async (req, res) => {
+    const uid = String(req.body?.uid || "").trim();
+    const reiniciarTomas = req.body?.reiniciar_tomas !== false;
+    if (!uid || uid.length > 128) return res.status(400).json({ success: false, code: "MISSING_UID", message: "Falta el pase (UID)." });
+    try {
+        const ref = db.collection('usuarios').doc(uid);
+        let resultado = null;
+        await db.runTransaction(async (t) => {
+            const snap = await t.get(ref);
+            if (!snap.exists) {
+                resultado = { status: 404, body: { success: false, code: "PASS_NOT_FOUND", message: "El pase ya no existe (pudo haberse limpiado)." } };
+                return;
+            }
+            const data = snap.data() || {};
+            if (isRevokedUser(data)) {
+                resultado = { status: 409, body: { success: false, code: "PASS_REVOKED", message: "Este pase está revocado: use «Restaurar» si fue un error." } };
+                return;
+            }
+            const estabaViendo = isUserWatchingNow(data);
+            const tomas = Array.isArray(data.takeover_log) ? data.takeover_log.filter(x => Number.isFinite(x)).length : 0;
+            const cambios = {
+                session_id: "", active_device_id: "", active_page_id: "",
+                last_status: "released_by_admin", session_released_at: nowTimestamp()
+            };
+            if (reiniciarTomas && tomas) cambios.takeover_log = [];
+            t.update(ref, cambios);
+            resultado = {
+                status: 200,
+                body: {
+                    success: true, estaba_viendo: estabaViendo, tomas_reiniciadas: reiniciarTomas ? tomas : 0,
+                    usuario: data.usuario_corto || uid,
+                    message: estabaViendo
+                        ? "Sesión liberada: el equipo que estaba viendo se detendrá en su próxima comprobación y el cliente puede entrar desde cualquier equipo."
+                        : "Pase liberado: el cliente puede entrar desde cualquier equipo sin pulsar «Continuar aquí»."
+                }
+            };
+        });
+        if (resultado.status === 200) {
+            const b = resultado.body;
+            registrarAccionAdmin(req, "liberar", `${String(b.usuario).slice(0, 60)}${b.estaba_viendo ? " · estaba viendo" : ""}${b.tomas_reiniciadas ? ` · ${b.tomas_reiniciadas} toma(s) reiniciada(s)` : ""}`, { uid });
+        }
+        return res.status(resultado.status).json(resultado.body);
+    } catch (e) {
+        console.error("❌ Error liberando la sesión:", e);
+        return res.status(500).json({ success: false, message: "Error liberando la sesión." });
+    }
+});
+
+// Restaurar un pase revocado por error: vuelve a permitir el ingreso con su mismo código o usuario.
+app.post('/admin/restaurar-pase', adminLimiter, verifyAdmin, async (req, res) => {
+    const uid = String(req.body?.uid || "").trim();
+    if (!uid || uid.length > 128) return res.status(400).json({ success: false, code: "MISSING_UID", message: "Falta el pase (UID)." });
+    try {
+        const ref = db.collection('usuarios').doc(uid);
+        let resultado = null;
+        await db.runTransaction(async (t) => {
+            const snap = await t.get(ref);
+            if (!snap.exists) {
+                resultado = { status: 404, body: { success: false, code: "PASS_NOT_FOUND", message: "El pase ya no existe (pudo haberse limpiado)." } };
+                return;
+            }
+            const data = snap.data() || {};
+            if (!isRevokedUser(data)) {
+                resultado = { status: 409, body: { success: false, code: "NOT_REVOKED", message: "Este pase no está revocado." } };
+                return;
+            }
+            const vencido = getTimestampMillis(data.fecha_expiracion) <= Date.now();
+            t.update(ref, {
+                session_id: "", active_device_id: "", active_page_id: "",
+                last_status: "restored_by_admin", restored_at: nowTimestamp()
+            });
+            resultado = {
+                status: 200,
+                body: {
+                    success: true, vencido, usuario: data.usuario_corto || uid,
+                    message: vencido
+                        ? "Pase restaurado, pero ya venció: extiéndalo para que el cliente pueda entrar."
+                        : "Pase restaurado: el cliente puede volver a entrar con su código o usuario."
+                }
+            };
+        });
+        if (resultado.status === 200) {
+            registrarAccionAdmin(req, "restaurar", `${String(resultado.body.usuario).slice(0, 60)}${resultado.body.vencido ? " · vencido" : ""}`, { uid });
+        }
+        return res.status(resultado.status).json(resultado.body);
+    } catch (e) {
+        console.error("❌ Error restaurando el pase:", e);
+        return res.status(500).json({ success: false, message: "Error restaurando el pase." });
+    }
+});
+
+// Nueva contraseña para un socio VIP que perdió la suya (la clave no se guarda en ningún lado, así que no
+// se puede «reenviar»). Las sesiones abiertas con la anterior dejan de renovarse (en una hora como máximo).
+app.post('/admin/nueva-clave-vip', adminLimiter, verifyAdmin, async (req, res) => {
+    const uid = String(req.body?.uid || "").trim();
+    if (!uid || uid.length > 128) return res.status(400).json({ success: false, code: "MISSING_UID", message: "Falta el socio (UID)." });
+    try {
+        const snap = await db.collection('usuarios').doc(uid).get();
+        if (!snap.exists) return res.status(404).json({ success: false, code: "PASS_NOT_FOUND", message: "El socio ya no existe (pudo haberse limpiado)." });
+        const data = snap.data() || {};
+        const esVip = data.tipo_acceso === "vip" || data.login_mode === "email_password";
+        if (!esVip) return res.status(400).json({ success: false, code: "NOT_VIP", message: "Solo los socios VIP tienen contraseña: los pases rápidos entran con su código." });
+        if (isRevokedUser(data)) return res.status(409).json({ success: false, code: "PASS_REVOKED", message: "Este socio está revocado: restáurelo antes de darle una contraseña nueva." });
+        try {
+            const cuenta = await auth.getUser(uid);
+            if (cuenta && cuenta.customClaims && cuenta.customClaims.admin === true) {
+                return res.status(403).json({ success: false, code: "ADMIN_ACCOUNT", message: "Esa cuenta es de un administrador: su contraseña no se cambia desde el panel." });
+            }
+        } catch (_) {
+            // Si Auth no responde aquí, el cambio de contraseña de abajo dará el error que corresponda.
+        }
+        const clave = crypto.randomInt(10000000, 100000000).toString();
+        try {
+            await auth.updateUser(uid, { password: clave });
+        } catch (errorAuth) {
+            if (errorAuth && errorAuth.code === "auth/user-not-found") {
+                return res.status(404).json({ success: false, code: "AUTH_USER_NOT_FOUND", message: "La cuenta del socio no existe en Firebase Authentication." });
+            }
+            throw errorAuth;
+        }
+        let sesionesCerradas = false;
+        try {
+            await auth.revokeRefreshTokens(uid);
+            sesionesCerradas = true;
+        } catch (errorRevocar) {
+            console.error("❌ No se pudieron cerrar las sesiones anteriores del socio:", errorRevocar.message);
+        }
+        registrarAccionAdmin(req, "nueva_clave_vip", `${String(data.usuario_corto || uid).slice(0, 80)}${sesionesCerradas ? "" : " · sin cerrar sesiones"}`, { uid });
+        return res.json({
+            success: true, usuario: data.usuario_corto || "", clave, expira_ms: getTimestampMillis(data.fecha_expiracion),
+            sesiones_cerradas: sesionesCerradas,
+            message: sesionesCerradas
+                ? "Contraseña nueva generada. Las sesiones abiertas con la anterior dejan de renovarse (en una hora como máximo)."
+                : "Contraseña nueva generada, pero no se pudieron cerrar las sesiones abiertas con la anterior: si el socio compartió su acceso, revóquelo y restáurelo."
+        });
+    } catch (e) {
+        console.error("❌ Error generando la contraseña del socio:", e);
+        return res.status(500).json({ success: false, message: "Error generando la contraseña." });
+    }
+});
+
+// --- 17.4 VIGILANCIA DE LA SEÑAL Y ALERTAS (B11) ---
+// Con VIGILANCIA_SENAL=on, el servidor verifica la señal principal cada VIGILANCIA_INTERVALO_S (20 s) aunque
+// no haya un panel abierto. Si la señal estaba en vivo y deja de avanzar durante VIGILANCIA_CAIDA_S (45 s),
+// abre un incidente y avisa; al recuperarse, lo cierra con su duración. Si nunca estuvo en vivo (no hay
+// partido) no avisa. También avisa de picos de rechazos por límite (429) y de errores del servidor (5xx).
+const VIGILANCIA_SENAL = String(process.env.VIGILANCIA_SENAL || "").trim().toLowerCase() === "on";
+const VIGILANCIA_INTERVALO_MS = Math.max(10, parseInt(process.env.VIGILANCIA_INTERVALO_S || "20", 10) || 20) * 1000;
+const VIGILANCIA_CAIDA_MS = Math.max(20, parseInt(process.env.VIGILANCIA_CAIDA_S || "45", 10) || 45) * 1000;
+const VIGILANCIA_FIN_MS = 30 * 60 * 1000;
+const ALERTA_429_POR_MIN = Math.max(1, parseInt(process.env.ALERTA_429_POR_MIN || "30", 10) || 30);
+const ALERTA_5XX_POR_MIN = Math.max(1, parseInt(process.env.ALERTA_5XX_POR_MIN || "10", 10) || 10);
+const INCIDENTES_DIAS = 90;
+
+const vigilancia = {
+    estado: "INACTIVA",        // INACTIVA (no hay transmisión en curso), EN_VIVO o CAIDA
+    desde_ms: Date.now(),
+    ultima: null,              // última verificación de la señal principal
+    ultimoAvanceEn: 0,
+    incidente: null,           // incidente abierto
+    incidentes: [],            // últimos incidentes (abiertos y cerrados), en memoria
+    verificaciones: 0,
+    errores: 0
+};
+
+function describirFuenteVigilada(v) {
+    return `${v.transmision ? v.transmision + " / " : ""}${v.etiqueta || v.ruta || v.host || "señal principal"}`;
+}
+
+function minutosTexto(ms) {
+    const min = Math.round(ms / 60000);
+    return min < 1 ? `${Math.round(ms / 1000)} s` : `${min} min`;
+}
+
+// B12 lo reemplaza: estado del emisor (OBS) según el agente del origen, o null si no hay datos recientes.
+let emisorSegunAgente = () => null;
+
+async function abrirIncidente(ahora, resultado, principal) {
+    const emisor = emisorSegunAgente();
+    const emisorDetenido = Boolean(emisor && emisor.conectado === false);
+    const fuente = describirFuenteVigilada(resultado);
+    const incidente = {
+        id: "", tipo: emisorDetenido ? "emision_detenida" : "senal_caida", clave: principal ? principal.clave : "",
+        inicio_ms: vigilancia.ultimoAvanceEn || ahora, fin_ms: null, duracion_s: null,
+        motivo: String(resultado.motivo || "").slice(0, 300), fuente, cierre: "", guardado: null
+    };
+    vigilancia.incidente = incidente;
+    vigilancia.incidentes.unshift(incidente);
+    if (vigilancia.incidentes.length > 20) vigilancia.incidentes.length = 20;
+    console.warn(`VIGILANCIA ${emisorDetenido ? "emisión detenida" : "señal caída"} | ${fuente} | ${incidente.motivo}`);
+    // El aviso sale primero: un Firestore lento no lo retrasa ni detiene la vigilancia.
+    const hace = minutosTexto(ahora - incidente.inicio_ms);
+    if (emisorDetenido) {
+        enviarAlerta(`AVISO: OBS dejó de emitir y la señal ${fuente} no avanza desde hace ${hace}. Si terminó el partido, no hace falta hacer nada; si no, revise OBS.`);
+    } else if (emisor && emisor.conectado) {
+        enviarAlerta(`ALERTA: la señal ${fuente} dejó de avanzar hace ${hace} aunque OBS sigue conectado. Causa probable: ${incidente.motivo}`);
+    } else {
+        enviarAlerta(`ALERTA: la señal ${fuente} dejó de avanzar hace ${hace}. Si terminó el partido, ignore este aviso. Causa probable: ${incidente.motivo}`);
+    }
+    incidente.guardado = db.collection('incidentes').add({
+        tipo: incidente.tipo, inicio: admin.firestore.Timestamp.fromMillis(incidente.inicio_ms), fin: null,
+        duracion_s: null, motivo: incidente.motivo, fuente: incidente.fuente, cierre: "",
+        expira_en: admin.firestore.Timestamp.fromMillis(ahora + INCIDENTES_DIAS * 86400000)
+    }).then(ref => { incidente.id = ref.id; }).catch(error => {
+        console.error("❌ No se pudo guardar el incidente:", error.message);
+    });
+}
+
+async function cerrarIncidente(ahora, cierre) {
+    const incidente = vigilancia.incidente;
+    if (!incidente) return;
+    vigilancia.incidente = null;
+    incidente.fin_ms = ahora;
+    incidente.duracion_s = Math.round((ahora - incidente.inicio_ms) / 1000);
+    incidente.cierre = cierre;
+    console.warn(`VIGILANCIA incidente cerrado (${cierre}) | ${incidente.fuente} | ${incidente.duracion_s} s`);
+    const duracion = minutosTexto(ahora - incidente.inicio_ms);
+    if (cierre === "recuperada") {
+        enviarAlerta(`Señal recuperada: ${incidente.fuente} vuelve a estar en vivo tras ${duracion} sin avanzar.`);
+    } else if (cierre === "fuente_cambiada") {
+        enviarAlerta(`Se cambió la señal principal durante la caída de ${incidente.fuente} (${duracion}): se cierra el incidente y la vigilancia sigue con la señal nueva.`);
+    }
+    // «sin_recuperacion» (30 minutos sin volver) solo se registra: un segundo aviso no aporta nada.
+    Promise.resolve(incidente.guardado).then(() => {
+        if (!incidente.id) return null;
+        return db.collection('incidentes').doc(incidente.id).update({
+            fin: admin.firestore.Timestamp.fromMillis(ahora), duracion_s: incidente.duracion_s, cierre
+        });
+    }).catch(error => console.error("❌ No se pudo cerrar el incidente:", error.message));
+}
+
+function pasarAEnEspera(ahora) {
+    vigilancia.estado = "INACTIVA";
+    vigilancia.desde_ms = ahora;
+}
+
+let vigilandoAhora = false;
+async function vigilarSenal() {
+    if (vigilandoAhora) return;
+    vigilandoAhora = true;
+    try {
+        const config = await getActiveStreamConfig();
+        const principal = opcionesParaTablero(config).find(o => o.principal);
+        if (!principal || principal.noVerificable) {
+            vigilancia.ultima = { estado: principal ? "NO_VERIFICABLE" : "SIN_FUENTES", motivo: principal ? "La señal principal no es verificable (reproductor externo)." : "No hay transmisiones visibles.", en_ms: Date.now() };
+            // Si durante una caída la señal principal pasa a un reproductor externo o desaparece, el incidente se cierra.
+            if (vigilancia.estado === "CAIDA") await cerrarIncidente(Date.now(), "fuente_cambiada");
+            if (vigilancia.estado !== "INACTIVA") pasarAEnEspera(Date.now());
+            return;
+        }
+        // Si se cambió la señal principal durante una caída, el incidente de la anterior se cierra.
+        if (vigilancia.estado === "CAIDA" && vigilancia.incidente && vigilancia.incidente.clave && vigilancia.incidente.clave !== principal.clave) {
+            await cerrarIncidente(Date.now(), "fuente_cambiada");
+            pasarAEnEspera(Date.now());
+        }
+        const r = await verificarSenal(principal);
+        const ahora = Date.now();
+        vigilancia.verificaciones++;
+        vigilancia.ultima = { estado: r.estado, motivo: r.motivo, en_ms: ahora, fuente: describirFuenteVigilada(r) };
+        if (r.estado === "EN_VIVO") {
+            // Con un resultado en caché, el avance cuenta desde cuando se verificó, no desde ahora.
+            vigilancia.ultimoAvanceEn = Math.min(ahora, Number(r.verificado_en) || ahora);
+            if (vigilancia.estado === "CAIDA") await cerrarIncidente(ahora, "recuperada");
+            else if (vigilancia.estado === "INACTIVA") {
+                console.log(`VIGILANCIA señal en vivo | ${describirFuenteVigilada(r)}`);
+                enviarAlerta(`Comenzó la transmisión (o se reanudó la vigilancia tras un reinicio del servidor): ${describirFuenteVigilada(r)} está en vivo. La vigilancia de la señal queda activa.`);
+            }
+            if (vigilancia.estado !== "EN_VIVO") vigilancia.desde_ms = ahora;
+            vigilancia.estado = "EN_VIVO";
+            return;
+        }
+        if (r.estado === "SIN_COMPARAR") return;
+        if (vigilancia.estado === "EN_VIVO" && ahora - vigilancia.ultimoAvanceEn >= VIGILANCIA_CAIDA_MS) {
+            vigilancia.estado = "CAIDA";
+            vigilancia.desde_ms = ahora;
+            await abrirIncidente(ahora, r, principal);
+        } else if (vigilancia.estado === "CAIDA" && vigilancia.incidente && ahora - vigilancia.incidente.inicio_ms >= VIGILANCIA_FIN_MS) {
+            await cerrarIncidente(ahora, "sin_recuperacion");
+            pasarAEnEspera(ahora);
+        }
+    } catch (error) {
+        vigilancia.errores++;
+    } finally {
+        vigilandoAhora = false;
+    }
+}
+
+if (VIGILANCIA_SENAL) {
+    // El estado de la vigilancia vive en memoria (una sola instancia del servicio): un incidente que quedó
+    // abierto en Firestore por un reinicio se cierra al arrancar.
+    const temporizadorLimpieza = setTimeout(() => {
+        try {
+            db.collection('incidentes').where('fin', '==', null).limit(20).get().then(snap => {
+                snap.forEach(doc => {
+                    doc.ref.update({ fin: admin.firestore.Timestamp.fromMillis(Date.now()), cierre: "reinicio_servidor" }).catch(() => {});
+                });
+            }).catch(() => {});
+        } catch (_) {
+            // Nunca debe tumbar el proceso: a lo sumo, el incidente viejo queda abierto en Firestore.
+        }
+    }, 5000);
+    if (temporizadorLimpieza.unref) temporizadorLimpieza.unref();
+    const temporizadorVigilancia = setInterval(() => { vigilarSenal().catch(() => {}); }, VIGILANCIA_INTERVALO_MS);
+    if (temporizadorVigilancia.unref) temporizadorVigilancia.unref();
+    console.log(`VIGILANCIA de la señal activa: cada ${VIGILANCIA_INTERVALO_MS / 1000} s; aviso tras ${VIGILANCIA_CAIDA_MS / 1000} s sin avanzar.`);
+}
+
+// Picos por minuto (con o sin vigilancia de la señal): como máximo un aviso de cada tipo cada 15 minutos.
+const ultimoAvisoPico = { r429: 0, r5xx: 0 };
+CIERRES_DE_MINUTO.push((m) => {
+    const ahora = Date.now();
+    if (m.r429 >= ALERTA_429_POR_MIN && ahora - ultimoAvisoPico.r429 >= 15 * 60000) {
+        ultimoAvisoPico.r429 = ahora;
+        enviarAlerta(`Atención: ${m.r429} solicitudes rechazadas por límite (429) en el último minuto. Si hay un partido en curso, revise el tablero del panel: pueden ser espectadores bloqueados.`);
+    }
+    if (m.r5xx >= ALERTA_5XX_POR_MIN && ahora - ultimoAvisoPico.r5xx >= 15 * 60000) {
+        ultimoAvisoPico.r5xx = ahora;
+        enviarAlerta(`Atención: ${m.r5xx} errores del servidor (5xx) en el último minuto. Revise los registros de Render.`);
+    }
+});
+
+function resumenVigilancia() {
+    return {
+        activa: VIGILANCIA_SENAL,
+        estado: vigilancia.estado,
+        desde_ms: vigilancia.desde_ms,
+        ultima: vigilancia.ultima,
+        intervalo_s: VIGILANCIA_INTERVALO_MS / 1000,
+        caida_s: VIGILANCIA_CAIDA_MS / 1000,
+        incidentes: vigilancia.incidentes.slice(0, 10).map(i => ({
+            id: i.id, tipo: i.tipo, inicio_ms: i.inicio_ms, fin_ms: i.fin_ms, duracion_s: i.duracion_s,
+            motivo: i.motivo, fuente: i.fuente, cierre: i.cierre
+        }))
+    };
+}
+
+HERRAMIENTAS.vigilancia = VIGILANCIA_SENAL ? "activa" : "desactivada";
+HERRAMIENTAS.alerta_prueba = true;
+EXTENSIONES_TABLERO.push(() => ({ vigilancia: resumenVigilancia() }));
+
+// Aviso de prueba desde el panel: confirma que el bot y el chat están bien configurados.
+app.post('/admin/alertas/prueba', adminLimiter, verifyAdmin, async (req, res) => {
+    if (!ALERTAS_TELEGRAM) {
+        return res.status(409).json({
+            success: false, code: "ALERTS_OFF", configuracion: configuracionAlertas(),
+            message: configuracionAlertas() === "incompleta"
+                ? "Los avisos están pedidos (ALERTAS_TELEGRAM=on), pero falta TELEGRAM_BOT_TOKEN o MI_TELEGRAM_ID con un valor válido en Render."
+                : "Los avisos por Telegram están desactivados. En Render: ALERTAS_TELEGRAM=on, con TELEGRAM_BOT_TOKEN y MI_TELEGRAM_ID."
+        });
+    }
+    try {
+        // Si hay avisos en cola (o Telegram está lento), no se espera más de 10 s: el aviso sale igual después.
+        const entregada = await Promise.race([
+            enviarAlerta(`Prueba de avisos desde el panel (${(req.golazoAdmin && req.golazoAdmin.email) || "administrador"}): si lee este mensaje, los avisos funcionan.`, { forzar: true }),
+            new Promise(resolver => { const t = setTimeout(() => resolver("en_cola"), 10000); if (t.unref) t.unref(); })
+        ]);
+        if (entregada === "en_cola") {
+            registrarAccionAdmin(req, "alerta_prueba", "Aviso de prueba en cola", {});
+            return res.json({ success: true, entregada: false, en_cola: true, message: "El aviso quedó en cola: Telegram está lento o hay otros avisos pendientes. Llegará en cuanto se pueda." });
+        }
+        registrarAccionAdmin(req, "alerta_prueba", entregada ? "Aviso de prueba entregado" : `Aviso de prueba no entregado (${estadoAlertas.ultimo_error || "sin detalle"})`, {});
+        return res.json({
+            success: true, entregada,
+            message: entregada ? "Aviso entregado: revise Telegram." : `No se pudo entregar el aviso: ${estadoAlertas.ultimo_error || "sin detalle"}.`
+        });
+    } catch (e) {
+        console.error("❌ Error enviando el aviso de prueba:", e);
+        return res.status(500).json({ success: false, message: "Error enviando el aviso de prueba." });
+    }
+});
+
+// --- 17.5 AGENTE DEL ORIGEN Y CLAVE DE EMISIÓN (B12) ---
+// El agente es un programa pequeño en el VPS que cada 15 s envía el estado de OBS (emisor RTMP), del HLS
+// que genera nginx y del propio VPS. Firma cada envío con AGENTE_CLAVE (HMAC-SHA256 del instante y del
+// cuerpo) y recibe, firmada igual, la lista de claves de emisión vigentes (solo sus huellas SHA-256) para
+// validar la publicación de OBS (on_publish). Sin AGENTE_CLAVE de 32 caracteres o más, nada de esto existe.
+const AGENTE_CLAVE = String(process.env.AGENTE_CLAVE || "").trim();
+const AGENTE_ACTIVO = AGENTE_CLAVE.length >= 32;
+if (AGENTE_CLAVE && !AGENTE_ACTIVO) {
+    console.warn("AVISO agente: AGENTE_CLAVE debe tener al menos 32 caracteres; el agente del origen queda desactivado.");
+}
+const CLAVE_ANTERIOR_HORAS = Math.min(72, Math.max(1, parseInt(process.env.CLAVE_EMISION_ANTERIOR_HORAS || "24", 10) || 24));
+const EMISION_NOMBRE = (String(process.env.EMISION_NOMBRE || "canal").trim().replace(/[^A-Za-z0-9_-]/g, "") || "canal").slice(0, 40);
+const EMISION_SERVIDOR = String(process.env.EMISION_SERVIDOR_RTMP || "").trim().slice(0, 200);
+const estadoOrigen = { datos: null, recibido_en: 0, ip: "", latidos: 0, rechazados: 0 };
+let clavesEmision = null;
+let clavesEmisionLeidasEn = 0;
+let ultimoTiempoAgente = 0;
+const CLAVES_ANTERIORES_MAX = 3;
+
+// La firma separa el sentido del mensaje («latido» del agente, «respuesta» del servidor): una respuesta
+// copiada no sirve como latido. Además, el instante de cada latido debe ser mayor que el del anterior.
+function firmarAgente(tipo, tiempo, cuerpo) {
+    return crypto.createHmac('sha256', AGENTE_CLAVE).update(`${tipo}\n${tiempo}.${cuerpo}`).digest('hex');
+}
+
+function compararSeguro(a, b) {
+    const x = Buffer.from(String(a));
+    const y = Buffer.from(String(b));
+    return x.length === y.length && crypto.timingSafeEqual(x, y);
+}
+
+function numeroAcotado(v, min, max) {
+    const n = Number(v);
+    return v === null || v === undefined || v === "" || !Number.isFinite(n) ? null : Math.min(max, Math.max(min, n));
+}
+
+function textoCorto(v, max = 40) {
+    return String(v === null || v === undefined ? "" : v).replace(/[^\w .:,/+-]/g, "").slice(0, max);
+}
+
+function ipOVacio(v) {
+    return net.isIP(String(v || "")) ? String(v) : "";
+}
+
+// Solo se guardan los campos conocidos, acotados: el agente no puede llenar la memoria del servidor.
+function depurarDatosAgente(d) {
+    const o = (x) => (x && typeof x === "object" && !Array.isArray(x) ? x : {});
+    const e = o(d && d.emisor), h = o(d && d.hls), s = o(d && d.sistema), v = o(d && d.validador);
+    return {
+        agente_version: textoCorto(d && d.agente_version, 20),
+        emisor: {
+            conectado: e.conectado === true, ip: ipOVacio(e.ip), segundos: numeroAcotado(e.segundos, 0, 1e7),
+            kbps_entrada: numeroAcotado(e.kbps_entrada, 0, 1e6), kbps_video: numeroAcotado(e.kbps_video, 0, 1e6), kbps_audio: numeroAcotado(e.kbps_audio, 0, 1e6),
+            ancho: numeroAcotado(e.ancho, 0, 10000), alto: numeroAcotado(e.alto, 0, 10000), fps: numeroAcotado(e.fps, 0, 300),
+            codec_video: textoCorto(e.codec_video, 20), perfil: textoCorto(e.perfil, 20), nivel: textoCorto(e.nivel, 10),
+            codec_audio: textoCorto(e.codec_audio, 20), canales: numeroAcotado(e.canales, 0, 16), frecuencia: numeroAcotado(e.frecuencia, 0, 192000),
+            clientes: numeroAcotado(e.clientes, 0, 1e6)
+        },
+        hls: {
+            existe: h.existe === true, edad_lista_s: numeroAcotado(h.edad_lista_s, 0, 1e8), segmentos: numeroAcotado(h.segmentos, 0, 10000),
+            objetivo_s: numeroAcotado(h.objetivo_s, 0, 3600), secuencia: numeroAcotado(h.secuencia, 0, 1e12),
+            ultima_duracion_s: numeroAcotado(h.ultima_duracion_s, 0, 3600), edad_segmento_s: numeroAcotado(h.edad_segmento_s, 0, 1e8)
+        },
+        sistema: {
+            carga_1m: numeroAcotado(s.carga_1m, 0, 1000), cpus: numeroAcotado(s.cpus, 0, 1024),
+            memoria_total_mb: numeroAcotado(s.memoria_total_mb, 0, 1e7), memoria_libre_mb: numeroAcotado(s.memoria_libre_mb, 0, 1e7),
+            hls_uso_pct: numeroAcotado(s.hls_uso_pct, 0, 100), salida_mbps: numeroAcotado(s.salida_mbps, 0, 1e5),
+            entrada_mbps: numeroAcotado(s.entrada_mbps, 0, 1e5), encendido_s: numeroAcotado(s.encendido_s, 0, 1e10), nginx: s.nginx === true
+        },
+        validador: {
+            activo: v.activo === true, claves_version: numeroAcotado(v.claves_version, 0, 1e9), aceptadas: numeroAcotado(v.aceptadas, 0, 1e9),
+            rechazadas: numeroAcotado(v.rechazadas, 0, 1e9), ultima_ip_rechazada: ipOVacio(v.ultima_ip_rechazada),
+            ultimo_rechazo_hace_s: numeroAcotado(v.ultimo_rechazo_hace_s, 0, 1e9)
+        },
+        // Nombre de la aplicación y del stream que valida el agente (deben coincidir con EMISION_NOMBRE).
+        rtmp_app: textoCorto(d && d.rtmp_app, 40),
+        rtmp_stream: textoCorto(d && d.rtmp_stream, 40)
+    };
+}
+
+async function leerClavesEmision(forzar = false) {
+    if (!forzar && clavesEmision && Date.now() - clavesEmisionLeidasEn < 60000) return clavesEmision;
+    const snap = await db.collection('config').doc('emision').get();
+    const d = snap.exists ? snap.data() || {} : {};
+    clavesEmision = { version: Number(d.version) || 0, actual: d.actual || null, anterior: d.anterior || null, anteriores: Array.isArray(d.anteriores) ? d.anteriores : [] };
+    clavesEmisionLeidasEn = Date.now();
+    return clavesEmision;
+}
+
+// Claves anteriores todavía vigentes, de la más reciente a la más antigua (hasta 3).
+function anterioresVigentes(c, ahora = Date.now()) {
+    if (!c) return [];
+    return [c.anterior].concat(Array.isArray(c.anteriores) ? c.anteriores : [])
+        .filter(x => x && x.hash && Number(x.vence_en_ms) > ahora).slice(0, CLAVES_ANTERIORES_MAX);
+}
+
+// Lo que recibe el agente: las huellas vigentes y hasta cuándo vale cada una (null: la actual, sin plazo).
+// Sin una clave actual se responde null («conserve las suyas»): una lista vacía haría rechazar a OBS.
+function clavesParaAgente(c) {
+    if (!c || !c.actual || !c.actual.hash) return null;
+    const anteriores = anterioresVigentes(c);
+    return {
+        version: c.version,
+        hashes: [String(c.actual.hash)].concat(anteriores.map(x => String(x.hash))),
+        vencen: [null].concat(anteriores.map(x => Number(x.vence_en_ms)))
+    };
+}
+
+function describirClaves(c) {
+    const ahora = Date.now();
+    return {
+        version: c ? c.version : 0,
+        actual: c && c.actual ? { version: c.actual.version, creada_en_ms: c.actual.creada_en_ms, creada_por: c.actual.creada_por || "" } : null,
+        anterior: c && c.anterior ? {
+            version: c.anterior.version, creada_en_ms: c.anterior.creada_en_ms, vence_en_ms: c.anterior.vence_en_ms,
+            vigente: Number(c.anterior.vence_en_ms) > ahora
+        } : null,
+        anteriores_vigentes: anterioresVigentes(c, ahora).length,
+        nombre: EMISION_NOMBRE, servidor_rtmp: EMISION_SERVIDOR, horas_anterior: CLAVE_ANTERIOR_HORAS
+    };
+}
+
+function resumenAgente() {
+    const ahora = Date.now();
+    return {
+        activo: AGENTE_ACTIVO,
+        conectado: Boolean(estadoOrigen.recibido_en && ahora - estadoOrigen.recibido_en < 60000),
+        visto_hace_s: estadoOrigen.recibido_en ? Math.round((ahora - estadoOrigen.recibido_en) / 1000) : null,
+        ip: estadoOrigen.ip, latidos: estadoOrigen.latidos, firmas_rechazadas: estadoOrigen.rechazados,
+        datos: estadoOrigen.datos
+    };
+}
+
+HERRAMIENTAS.agente = AGENTE_ACTIVO ? "activo" : "desactivado";
+HERRAMIENTAS.clave_emision = AGENTE_ACTIVO;
+
+// La vigilancia (B11) usa el estado de OBS que informa el agente para distinguir el fin de una emisión de una
+// caída. Sin datos recientes, o si nginx no responde (no se sabe si OBS está conectado), no opina.
+emisorSegunAgente = () => {
+    const d = estadoOrigen.datos;
+    if (!AGENTE_ACTIVO || !d || !estadoOrigen.recibido_en || Date.now() - estadoOrigen.recibido_en > 60000) return null;
+    if (!d.sistema || d.sistema.nginx !== true) return null;
+    return { conectado: Boolean(d.emisor && d.emisor.conectado) };
+};
+
+if (AGENTE_ACTIVO) {
+    EXTENSIONES_TABLERO.push(() => ({ origen: resumenAgente(), emision: clavesEmision ? describirClaves(clavesEmision) : null }));
+
+    const agenteLimiter = rateLimit({
+        windowMs: 60 * 1000,
+        max: 12,
+        standardHeaders: true,
+        legacyHeaders: false,
+        keyGenerator: claveLimitePorIp,
+        message: MENSAJE_LIMITE_GENERAL,
+        handler: manejadorLimite("agente", MENSAJE_LIMITE_GENERAL)
+    });
+
+    // El agente envía texto plano (así el analizador JSON general no toca el cuerpo y la firma se comprueba
+    // sobre los bytes recibidos). Un reloj desfasado más de 60 s se rechaza: una copia vieja no sirve.
+    app.post('/agente/latido', agenteLimiter, express.text({ type: '*/*', limit: '16kb' }), async (req, res) => {
+        try {
+            const tiempo = Number(req.headers['x-golazo-tiempo']);
+            const firma = String(req.headers['x-golazo-firma'] || "");
+            const cuerpo = typeof req.body === "string" ? req.body : "";
+            if (!Number.isFinite(tiempo) || Math.abs(Date.now() - tiempo) > 60000 || tiempo <= ultimoTiempoAgente ||
+                !compararSeguro(firma, firmarAgente("latido", tiempo, cuerpo))) {
+                estadoOrigen.rechazados++;
+                return res.status(401).json({ success: false, code: "AGENT_SIGNATURE" });
+            }
+            ultimoTiempoAgente = tiempo;
+            let datos;
+            try { datos = JSON.parse(cuerpo); } catch (_) {
+                return res.status(400).json({ success: false, code: "BAD_JSON" });
+            }
+            estadoOrigen.datos = depurarDatosAgente(datos);
+            estadoOrigen.recibido_en = Date.now();
+            estadoOrigen.ip = ipCliente(req);
+            estadoOrigen.latidos++;
+            let claves = null;
+            try {
+                claves = clavesParaAgente(await leerClavesEmision());
+            } catch (error) {
+                // Sin Firestore, el agente conserva las claves que ya tiene.
+                console.error("❌ No se pudieron leer las claves de emisión:", error.message);
+            }
+            const respuesta = JSON.stringify({ success: true, servidor_ms: Date.now(), claves });
+            const t = Date.now();
+            res.set('X-Golazo-Tiempo', String(t));
+            res.set('X-Golazo-Firma', firmarAgente("respuesta", t, respuesta));
+            return res.type('application/json').send(respuesta);
+        } catch (e) {
+            console.error("❌ Error atendiendo al agente del origen:", e && e.message);
+            return res.status(500).json({ success: false });
+        }
+    });
+
+    app.post('/admin/clave-emision/estado', adminLimiter, verifyAdmin, async (req, res) => {
+        try {
+            const c = await leerClavesEmision(true);
+            return res.json({ success: true, ...describirClaves(c), agente: resumenAgente() });
+        } catch (e) {
+            console.error("❌ Error leyendo la clave de emisión:", e);
+            return res.status(500).json({ success: false, message: "Error leyendo la clave de emisión." });
+        }
+    });
+
+    // Nueva clave: se muestra una sola vez (Firestore guarda solo su huella). La anterior sigue valiendo
+    // CLAVE_EMISION_ANTERIOR_HORAS (24 h) o hasta retirarla: cambiar la clave no corta a OBS si reconecta.
+    app.post('/admin/clave-emision/nueva', adminLimiter, verifyAdmin, async (req, res) => {
+        if (req.body?.confirmar !== true) {
+            return res.status(400).json({ success: false, code: "CONFIRM_REQUIRED", message: "Confirme que no hay un partido en curso antes de generar una clave nueva." });
+        }
+        try {
+            const abc = "ABCDEFGHJKLMNPQRSTUVWXYZabcdefghijkmnopqrstuvwxyz23456789";
+            let clave = "";
+            for (let i = 0; i < 24; i++) clave += abc[crypto.randomInt(abc.length)];
+            const hash = crypto.createHash('sha256').update(clave).digest('hex');
+            const ref = db.collection('config').doc('emision');
+            let resultado = null;
+            await db.runTransaction(async (t) => {
+                const snap = await t.get(ref);
+                const d = snap.exists ? snap.data() || {} : {};
+                const version = (Number(d.version) || 0) + 1;
+                const ahora = Date.now();
+                // La clave actual pasa a «anterior» y las anteriores que siguen vigentes se conservan (hasta 3):
+                // dos rotaciones seguidas (doble clic o un reenvío del navegador) no dejan sin validez la de OBS.
+                const relevada = d.actual && d.actual.hash ? { ...d.actual, vence_en_ms: ahora + CLAVE_ANTERIOR_HORAS * 3600000 } : null;
+                const previas = (relevada ? [relevada] : []).concat(anterioresVigentes(d, ahora)).slice(0, CLAVES_ANTERIORES_MAX);
+                const anterior = previas[0] || null;
+                const anteriores = previas.slice(1);
+                const actual = { hash, version, creada_en_ms: ahora, creada_por: (req.golazoAdmin && (req.golazoAdmin.email || req.golazoAdmin.uid)) || "" };
+                t.set(ref, { version, actual, anterior, anteriores, actualizado_en: nowTimestamp() });
+                resultado = { version, actual, anterior, anteriores };
+            });
+            clavesEmision = resultado;
+            clavesEmisionLeidasEn = Date.now();
+            registrarAccionAdmin(req, "clave_emision", `Nueva clave de emisión (versión ${resultado.version})${resultado.anterior ? `; la anterior vale ${CLAVE_ANTERIOR_HORAS} h más` : ""}`, { version: resultado.version });
+            return res.json({
+                success: true, clave, clave_obs: `${EMISION_NOMBRE}?k=${clave}`, servidor_rtmp: EMISION_SERVIDOR,
+                version: resultado.version, anterior_vence_en_ms: resultado.anterior ? resultado.anterior.vence_en_ms : null,
+                anteriores_vigentes: anterioresVigentes(resultado).length,
+                message: "Clave nueva generada. Cópiela ahora: no se vuelve a mostrar."
+            });
+        } catch (e) {
+            console.error("❌ Error generando la clave de emisión:", e);
+            return res.status(500).json({ success: false, message: "Error generando la clave de emisión." });
+        }
+    });
+
+    app.post('/admin/clave-emision/retirar-anterior', adminLimiter, verifyAdmin, async (req, res) => {
+        try {
+            const ref = db.collection('config').doc('emision');
+            let resultado = null;
+            await db.runTransaction(async (t) => {
+                const snap = await t.get(ref);
+                const d = snap.exists ? snap.data() || {} : {};
+                const vigentes = anterioresVigentes(d);
+                if (!vigentes.length) {
+                    resultado = { status: 409, body: { success: false, code: "NO_PREVIOUS_KEY", message: "No hay claves anteriores vigentes." } };
+                    return;
+                }
+                t.set(ref, { ...d, anterior: null, anteriores: [], actualizado_en: nowTimestamp() });
+                resultado = { status: 200, body: { success: true, retiradas: vigentes.length, message: vigentes.length > 1 ? `${vigentes.length} claves anteriores retiradas: solo vale la actual.` : "Clave anterior retirada: solo vale la actual." }, version: vigentes.map(x => x.version).join(", "), datos: { version: Number(d.version) || 0, actual: d.actual || null, anterior: null, anteriores: [] } };
+            });
+            if (resultado.status === 200) {
+                clavesEmision = resultado.datos;
+                clavesEmisionLeidasEn = Date.now();
+                registrarAccionAdmin(req, "clave_emision", `Claves de emisión anteriores retiradas (versión ${resultado.version})`, { version: resultado.version });
+            }
+            return res.status(resultado.status).json(resultado.body);
+        } catch (e) {
+            console.error("❌ Error retirando la clave anterior:", e);
+            return res.status(500).json({ success: false, message: "Error retirando la clave anterior." });
+        }
+    });
+}
+
+// --- 17.6 CDN: PURGA Y CONSUMO (B13, OPCIONAL) ---
+// Necesita la clave de la API de la cuenta de Bunny (BUNNY_API_KEY) y el número de la zona (BUNNY_PULLZONE_ID).
+// Advertencia: Bunny tiene una sola clave de API por cuenta y controla toda la cuenta (zonas, facturación).
+// Sin ambas variables, nada de esto existe. La clave nunca se escribe en los registros ni en las respuestas.
+const BUNNY_API_KEY = String(process.env.BUNNY_API_KEY || "").trim();
+const BUNNY_PULLZONE_ID = String(process.env.BUNNY_PULLZONE_ID || "").trim();
+const CDN_API_ACTIVA = /^[A-Za-z0-9-]{20,}$/.test(BUNNY_API_KEY) && /^\d{1,12}$/.test(BUNNY_PULLZONE_ID);
+if ((BUNNY_API_KEY || BUNNY_PULLZONE_ID) && !CDN_API_ACTIVA) {
+    console.warn("AVISO CDN: faltan BUNNY_API_KEY o BUNNY_PULLZONE_ID con un valor válido; la purga y el consumo quedan desactivados.");
+}
+const CDN_PRECIO_GB_USD = Number(process.env.CDN_PRECIO_GB_USD) > 0 ? Number(process.env.CDN_PRECIO_GB_USD) : null;
+const TIPO_CAMBIO_PEN = Number(process.env.TIPO_CAMBIO_PEN) > 0 ? Number(process.env.TIPO_CAMBIO_PEN) : null;
+const PRECIO_ACCESO_PEN = Number(process.env.PRECIO_ACCESO_PEN) > 0 ? Number(process.env.PRECIO_ACCESO_PEN) : 5;
+let ultimaPurgaCdn = 0;
+let consumoCdnCache = null;
+
+function mensajeErrorBunny(r) {
+    if (r.error) return `Bunny no respondió (${r.error === "tiempo" ? "tiempo agotado" : r.error}).`;
+    if (r.status === 401 || r.status === 403) return `Bunny rechazó la clave de la API (${r.status}): revise BUNNY_API_KEY.`;
+    return `Bunny respondió con el código ${r.status}.`;
+}
+
+HERRAMIENTAS.cdn = CDN_API_ACTIVA ? "bunny" : "desactivada";
+
+if (CDN_API_ACTIVA) {
+    // Purga de la lista de reproducción de una transmisión configurada (no de toda la zona). Con listas de 2 s
+    // rara vez hace falta; sirve si la CDN guardó una respuesta de error o una lista vieja tras un corte.
+    app.post('/admin/cdn/purgar', adminLimiter, verifyAdmin, async (req, res) => {
+        try {
+            const ruta = normalizeBunnyPath(req.body?.ruta);
+            const config = await getActiveStreamConfig();
+            const rutas = new Set((config.transmissions || []).flatMap(t => (t.options || []).filter(o => o.source_type === "bunny" && o.path).map(o => o.path)));
+            if (!ruta || !rutas.has(ruta)) {
+                return res.status(400).json({ success: false, code: "PATH_NOT_IN_CATALOG", message: "Solo se purgan las listas de las transmisiones configuradas." });
+            }
+            const espera = 60000 - (Date.now() - ultimaPurgaCdn);
+            if (espera > 0) {
+                res.set('Retry-After', String(Math.ceil(espera / 1000)));
+                return res.status(429).json({ success: false, code: "PURGE_TOO_SOON", message: `Espere ${Math.ceil(espera / 1000)} s entre purgas.` });
+            }
+            ultimaPurgaCdn = Date.now();
+            const url = `${BUNNY_CDN_URL}${ruta}`;
+            // Si la ruta es una lista maestra, también se purgan sus listas de medios (las que cambian cada 2 s).
+            const urls = [url];
+            try {
+                const { url: firmada, cabeceras } = urlYCabecerasDe({ tipo: "bunny", ruta });
+                const lectura = await solicitudSaliente(firmada, { cabeceras, timeoutMs: SENAL_TIMEOUT_MS, maxBytes: 256 * 1024 });
+                const lista = lectura.ok ? analizarListaHls(lectura.texto) : null;
+                if (lista && lista.maestra) {
+                    lista.variantes.slice(0, 4).forEach(v => {
+                        try {
+                            const u = new URL(v, url);
+                            if (u.origin === new URL(url).origin && !urls.includes(u.origin + u.pathname)) urls.push(u.origin + u.pathname);
+                        } catch (_) {}
+                    });
+                }
+            } catch (_) {}
+            let r = null;
+            let purgadas = 0;
+            for (const destino of urls) {
+                r = await solicitudSaliente(`https://api.bunny.net/purge?url=${encodeURIComponent(destino)}&async=false`, {
+                    metodo: 'POST', cabeceras: { AccessKey: BUNNY_API_KEY, accept: 'application/json' },
+                    timeoutMs: 15000, maxBytes: 16384, soloPublicas: false, redirecciones: 0
+                });
+                if (!r.ok) break;
+                purgadas++;
+            }
+            registrarAccionAdmin(req, "purgar_cdn", `${ruta} · ${r.ok ? `purgada${purgadas > 1 ? ` (con ${purgadas - 1} lista(s) de medios)` : ""}` : `falló (${r.status || r.error})`}`, { ruta, ok: Boolean(r.ok) });
+            if (!r.ok) {
+                ultimaPurgaCdn = 0;   // si Bunny falló, se puede reintentar enseguida
+                return res.status(502).json({ success: false, code: "CDN_PURGE_FAILED", message: mensajeErrorBunny(r) });
+            }
+            return res.json({ success: true, url, urls, message: purgadas > 1 ? `Lista purgada junto con ${purgadas - 1} lista(s) de medios: la CDN las vuelve a pedir al origen en la siguiente lectura.` : "Lista purgada: la CDN la vuelve a pedir al origen en la siguiente lectura." });
+        } catch (e) {
+            console.error("❌ Error purgando la CDN:", e);
+            return res.status(500).json({ success: false, message: "Error purgando la CDN." });
+        }
+    });
+
+    // Consumo del día (hora de Lima) según las estadísticas de Bunny: GB entregados, solicitudes y acierto de
+    // caché, con costo estimado si se configura CDN_PRECIO_GB_USD. Se guarda 5 minutos.
+    app.post('/admin/cdn/consumo', adminLimiter, verifyAdmin, async (req, res) => {
+        try {
+            if (consumoCdnCache && Date.now() - consumoCdnCache.en < 5 * 60000 && req.body?.actualizar !== true) {
+                return res.json({ success: true, ...consumoCdnCache.datos, en_cache: true });
+            }
+            const ahora = new Date();
+            const dia = formatPeruDateKey(ahora);
+            const desde = `${dia}T05:00:00Z`;
+            const hasta = `${ahora.toISOString().slice(0, 19)}Z`;
+            const url = `https://api.bunny.net/statistics?pullZone=${encodeURIComponent(BUNNY_PULLZONE_ID)}&dateFrom=${encodeURIComponent(desde)}&dateTo=${encodeURIComponent(hasta)}&hourly=true&exactRange=true&loadBandwidthUsed=true&loadRequestsServed=true`;
+            const r = await solicitudSaliente(url, {
+                cabeceras: { AccessKey: BUNNY_API_KEY, accept: 'application/json' },
+                timeoutMs: 15000, maxBytes: 2 * 1024 * 1024, soloPublicas: false, redirecciones: 0
+            });
+            if (!r.ok) return res.status(502).json({ success: false, code: "CDN_STATS_FAILED", message: mensajeErrorBunny(r) });
+            let d;
+            try { d = JSON.parse(r.texto || "{}"); } catch (_) {
+                return res.status(502).json({ success: false, code: "CDN_STATS_FAILED", message: "Bunny devolvió estadísticas ilegibles." });
+            }
+            const gb = (Number(d.TotalBandwidthUsed) || 0) / 1e9;
+            const acierto = Number(d.CacheHitRate) || 0;
+            const serie = Object.entries(d.BandwidthUsedChart && typeof d.BandwidthUsedChart === "object" ? d.BandwidthUsedChart : {})
+                .map(([hora, bytes]) => ({ hora, gb: Math.round((Number(bytes) || 0) / 1e7) / 100 }))
+                .sort((a, b) => String(a.hora).localeCompare(String(b.hora)))
+                .slice(-48);
+            const datos = {
+                dia, desde, hasta,
+                gb: Math.round(gb * 100) / 100,
+                solicitudes: Number(d.TotalRequestsServed) || 0,
+                acierto_cache_pct: Math.round((acierto <= 1 && acierto > 0 ? acierto * 100 : acierto) * 10) / 10,
+                serie,
+                precio_gb_usd: CDN_PRECIO_GB_USD, tipo_cambio_pen: TIPO_CAMBIO_PEN, precio_acceso_pen: PRECIO_ACCESO_PEN,
+                costo_usd: CDN_PRECIO_GB_USD ? Math.round(gb * CDN_PRECIO_GB_USD * 100) / 100 : null
+            };
+            consumoCdnCache = { en: Date.now(), datos };
+            return res.json({ success: true, ...datos, en_cache: false });
+        } catch (e) {
+            console.error("❌ Error leyendo el consumo de la CDN:", e);
+            return res.status(500).json({ success: false, message: "Error leyendo el consumo de la CDN." });
+        }
+    });
+}
 
 // --- 17.2 RUTAS INEXISTENTES Y ERRORES NO CONTROLADOS ---
 // Respuesta JSON breve con el mismo formato que el resto de la API: sin página HTML
