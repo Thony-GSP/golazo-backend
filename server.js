@@ -11,7 +11,7 @@ const dns = require('dns');
 const { monitorEventLoopDelay } = require('perf_hooks');
 
 // Versión visible en GET / y en el registro de arranque (identifica el despliegue).
-const VERSION_BACKEND = "FASE 10.18 - B13 integrado";
+const VERSION_BACKEND = "FASE 10.19 - B13 + tipo de cambio automático";
 
 // --- 1. FIREBASE ---
 const serviceAccount = JSON.parse(process.env.FIREBASE_JSON);
@@ -4537,8 +4537,188 @@ if ((BUNNY_API_KEY || BUNNY_PULLZONE_ID) && !CDN_API_ACTIVA) {
     console.warn("AVISO CDN: faltan BUNNY_API_KEY o BUNNY_PULLZONE_ID con un valor válido; la purga y el consumo quedan desactivados.");
 }
 const CDN_PRECIO_GB_USD = Number(process.env.CDN_PRECIO_GB_USD) > 0 ? Number(process.env.CDN_PRECIO_GB_USD) : null;
-const TIPO_CAMBIO_PEN = Number(process.env.TIPO_CAMBIO_PEN) > 0 ? Number(process.env.TIPO_CAMBIO_PEN) : null;
+const TIPO_CAMBIO_PEN = Number.isFinite(Number(process.env.TIPO_CAMBIO_PEN)) && Number(process.env.TIPO_CAMBIO_PEN) > 0 ? Number(process.env.TIPO_CAMBIO_PEN) : null;
 const PRECIO_ACCESO_PEN = Number(process.env.PRECIO_ACCESO_PEN) > 0 ? Number(process.env.PRECIO_ACCESO_PEN) : 5;
+// Tipo de cambio: la serie PD04640PD es SBS venta (S/ por US$), publicada por BCRP.
+// Se actualiza en segundo plano; un fallo de la fuente no bloquea el consumo de Bunny.
+// «off» permite fijar expresamente el cambio manual. Por defecto queda automático.
+const TIPO_CAMBIO_AUTOMATICO = String(process.env.TIPO_CAMBIO_AUTOMATICO || "on").trim().toLowerCase() !== "off";
+const TIPO_CAMBIO_SERIE = "PD04640PD";
+const TIPO_CAMBIO_URL = `https://estadisticas.bcrp.gob.pe/estadisticas/series/api/${TIPO_CAMBIO_SERIE}/json`;
+const TIPO_CAMBIO_INTERVALO_MS = 6 * 60 * 60 * 1000;
+const TIPO_CAMBIO_REINTENTO_MS = 15 * 60 * 1000;
+let tipoCambioGuardado = null;
+let tipoCambioCarga = null;
+let tipoCambioConsulta = null;
+let tipoCambioProximaConsulta = 0;
+let tipoCambioError = null;
+let temporizadorTipoCambio = null;
+
+function valorTipoCambioPen(valor) {
+    if (typeof valor !== "string" && typeof valor !== "number") return null;
+    const texto = String(valor).trim();
+    if (!/^\d+(?:[.,]\d+)?$/.test(texto)) return null;
+    const numero = Number(texto.replace(",", "."));
+    return Number.isFinite(numero) && numero > 0 && numero <= 100 ? numero : null;
+}
+
+function fechaTipoCambioPen(valor) {
+    if (typeof valor !== "string") return null;
+    const texto = valor.trim();
+    let partes = /^(\d{4})-(\d{2})-(\d{2})$/.exec(texto);
+    let anio, mes, dia;
+    if (partes) {
+        anio = Number(partes[1]); mes = Number(partes[2]); dia = Number(partes[3]);
+    } else {
+        partes = /^(\d{1,2})\.([a-z]{3})\.(\d{2}|\d{4})$/i.exec(texto);
+        if (!partes) return null;
+        const meses = { ene: 1, jan: 1, feb: 2, mar: 3, abr: 4, apr: 4, may: 5, jun: 6,
+            jul: 7, ago: 8, aug: 8, set: 9, sep: 9, oct: 10, nov: 11, dic: 12, dec: 12 };
+        dia = Number(partes[1]); mes = meses[partes[2].toLowerCase()]; anio = Number(partes[3]);
+        if (partes[3].length === 2) anio += anio >= 70 ? 1900 : 2000;
+    }
+    if (!mes || anio < 1997 || anio > 2100) return null;
+    const fecha = new Date(Date.UTC(anio, mes - 1, dia));
+    if (fecha.getUTCFullYear() !== anio || fecha.getUTCMonth() + 1 !== mes || fecha.getUTCDate() !== dia) return null;
+    const iso = fecha.toISOString().slice(0, 10);
+    return iso <= formatPeruDateKey(new Date()) ? iso : null;
+}
+
+function normalizarTipoCambioGuardado(datos) {
+    if (!datos || datos.serie !== TIPO_CAMBIO_SERIE) return null;
+    const valor = valorTipoCambioPen(datos.valor);
+    const fecha = fechaTipoCambioPen(datos.fecha);
+    const consultado = Number(datos.consultado_en_ms);
+    if (valor === null || !fecha || !Number.isFinite(consultado) || consultado <= 0 || consultado > Date.now() + 60000) return null;
+    return { version: 1, serie: TIPO_CAMBIO_SERIE, valor, fecha, consultado_en_ms: consultado };
+}
+
+function analizarTipoCambioBcrp(texto) {
+    let datos;
+    try { datos = JSON.parse(texto); } catch (_) { return null; }
+    const series = datos && datos.config && datos.config.series;
+    if (!Array.isArray(series) || series.length !== 1 || !/SBS.*Venta/i.test(String(series[0] && series[0].name || "")) || !Array.isArray(datos.periods)) return null;
+    let ultima = null;
+    for (const periodo of datos.periods) {
+        if (!periodo || !Array.isArray(periodo.values) || periodo.values.length !== 1) continue;
+        const valor = valorTipoCambioPen(periodo.values[0]);
+        const fecha = fechaTipoCambioPen(periodo.name);
+        if (valor !== null && fecha && (!ultima || fecha > ultima.fecha)) ultima = { valor, fecha };
+    }
+    return ultima ? { version: 1, serie: TIPO_CAMBIO_SERIE, ...ultima, consultado_en_ms: Date.now() } : null;
+}
+
+function adoptarTipoCambioPen(cotizacion) {
+    if (cotizacion && (!tipoCambioGuardado || cotizacion.fecha > tipoCambioGuardado.fecha ||
+        (cotizacion.fecha === tipoCambioGuardado.fecha && cotizacion.consultado_en_ms >= tipoCambioGuardado.consultado_en_ms))) {
+        tipoCambioGuardado = cotizacion;
+    }
+}
+
+function limitarEsperaTipoCambio(promesa) {
+    let reloj;
+    return Promise.race([promesa, new Promise((_, rechazar) => {
+        reloj = setTimeout(() => rechazar(new Error("tiempo_tipo_cambio")), 3000);
+    })]).finally(() => clearTimeout(reloj));
+}
+
+function cargarTipoCambioGuardado() {
+    if (tipoCambioCarga) return tipoCambioCarga;
+    tipoCambioCarga = (async () => {
+        try {
+            const documento = await limitarEsperaTipoCambio(db.collection('config').doc('tipo_cambio_pen').get());
+            if (documento.exists) adoptarTipoCambioPen(normalizarTipoCambioGuardado(documento.data()));
+        } catch (_) {
+            console.warn("AVISO TIPO CAMBIO: no se pudo recuperar la cotización guardada; se consulta la fuente oficial.");
+        }
+    })();
+    return tipoCambioCarga;
+}
+
+async function guardarTipoCambioPen(cotizacion) {
+    adoptarTipoCambioPen(cotizacion);
+    try {
+        const ref = db.collection('config').doc('tipo_cambio_pen');
+        const elegida = await limitarEsperaTipoCambio(db.runTransaction(async (transaccion) => {
+            const documento = await transaccion.get(ref);
+            const previa = documento.exists ? normalizarTipoCambioGuardado(documento.data()) : null;
+            // Una instancia que recibió datos antiguos no reemplaza una cotización más nueva.
+            if (previa && (previa.fecha > cotizacion.fecha ||
+                (previa.fecha === cotizacion.fecha && previa.consultado_en_ms > cotizacion.consultado_en_ms))) return previa;
+            transaccion.set(ref, cotizacion);
+            return cotizacion;
+        }));
+        adoptarTipoCambioPen(elegida);
+    } catch (_) {
+        console.warn("AVISO TIPO CAMBIO: la cotización se usa en memoria, pero no se pudo guardar para el próximo reinicio.");
+    }
+}
+
+function programarTipoCambioPen() {
+    if (temporizadorTipoCambio) clearTimeout(temporizadorTipoCambio);
+    if (!TIPO_CAMBIO_AUTOMATICO || !CDN_API_ACTIVA) return;
+    temporizadorTipoCambio = setTimeout(() => {
+        actualizarTipoCambioPen().catch(() => {});
+    }, Math.max(1000, tipoCambioProximaConsulta - Date.now()));
+    if (temporizadorTipoCambio.unref) temporizadorTipoCambio.unref();
+}
+
+function actualizarTipoCambioPen() {
+    if (!TIPO_CAMBIO_AUTOMATICO || !CDN_API_ACTIVA) return Promise.resolve();
+    if (tipoCambioConsulta) return tipoCambioConsulta;
+    if (Date.now() < tipoCambioProximaConsulta) return Promise.resolve();
+    tipoCambioConsulta = (async () => {
+        try {
+            await cargarTipoCambioGuardado();
+            const respuesta = await solicitudSaliente(TIPO_CAMBIO_URL, {
+                cabeceras: { accept: 'application/json' }, timeoutMs: 6000, maxBytes: 256 * 1024,
+                soloPublicas: true, redirecciones: 0
+            });
+            const cotizacion = respuesta.ok && !respuesta.cortada ? analizarTipoCambioBcrp(respuesta.texto) : null;
+            if (!cotizacion) throw new Error("fuente_no_disponible");
+            await guardarTipoCambioPen(cotizacion);
+            tipoCambioError = null;
+            tipoCambioProximaConsulta = Date.now() + TIPO_CAMBIO_INTERVALO_MS;
+        } catch (_) {
+            tipoCambioError = "fuente_no_disponible";
+            tipoCambioProximaConsulta = Date.now() + TIPO_CAMBIO_REINTENTO_MS;
+            console.warn("AVISO TIPO CAMBIO: no se pudo actualizar la fuente oficial; se conserva la última cotización o el respaldo manual. Reintento en 15 minutos.");
+        }
+    })().finally(() => {
+        tipoCambioConsulta = null;
+        programarTipoCambioPen();
+    });
+    return tipoCambioConsulta;
+}
+
+function tipoCambioPenParaPanel() {
+    const cotizacion = TIPO_CAMBIO_AUTOMATICO ? tipoCambioGuardado : null;
+    const valor = cotizacion ? cotizacion.valor : TIPO_CAMBIO_PEN;
+    const origen = cotizacion ? "bcrp" : (valor ? (TIPO_CAMBIO_AUTOMATICO ? "respaldo" : "manual") : "sin_datos");
+    const antigua = cotizacion && Date.parse(`${formatPeruDateKey(new Date())}T00:00:00Z`) - Date.parse(`${cotizacion.fecha}T00:00:00Z`) > 7 * 86400000;
+    let aviso = "";
+    if (tipoCambioError && TIPO_CAMBIO_AUTOMATICO) aviso = cotizacion
+        ? "La fuente oficial no respondió en el último intento; se mantiene la última cotización guardada."
+        : "La fuente oficial no respondió; se usa el respaldo manual si está configurado. Se reintentará automáticamente.";
+    else if (TIPO_CAMBIO_AUTOMATICO && !cotizacion) aviso = tipoCambioConsulta
+        ? "Consultando la fuente oficial; por ahora se utiliza el respaldo manual disponible."
+        : "La cotización oficial todavía no está disponible.";
+    if (antigua) aviso += `${aviso ? " " : ""}La última cotización disponible tiene más de 7 días; revise su fecha.`;
+    return {
+        tipo_cambio_pen: valor,
+        tipo_cambio: {
+            modo: TIPO_CAMBIO_AUTOMATICO ? "automatico" : "manual", origen,
+            fuente: cotizacion ? "BCRP · SBS venta" : (valor ? "Render · TIPO_CAMBIO_PEN" : null),
+            serie: cotizacion ? TIPO_CAMBIO_SERIE : null,
+            fecha: cotizacion ? cotizacion.fecha : null,
+            consultado_en_ms: cotizacion ? cotizacion.consultado_en_ms : null,
+            proxima_consulta_en_ms: TIPO_CAMBIO_AUTOMATICO ? tipoCambioProximaConsulta || null : null,
+            actualizando: Boolean(tipoCambioConsulta), aviso
+        }
+    };
+}
+
+
 let ultimaPurgaCdn = 0;
 let consumoCdnCache = null;
 
@@ -4551,6 +4731,8 @@ function mensajeErrorBunny(r) {
 HERRAMIENTAS.cdn = CDN_API_ACTIVA ? "bunny" : "desactivada";
 
 if (CDN_API_ACTIVA) {
+    actualizarTipoCambioPen().catch(() => {});
+
     // Purga de la lista de reproducción de una transmisión configurada (no de toda la zona). Con listas de 2 s
     // rara vez hace falta; sirve si la CDN guardó una respuesta de error o una lista vieja tras un corte.
     app.post('/admin/cdn/purgar', adminLimiter, verifyAdmin, async (req, res) => {
@@ -4609,8 +4791,10 @@ if (CDN_API_ACTIVA) {
     // caché, con costo estimado si se configura CDN_PRECIO_GB_USD. Se guarda 5 minutos.
     app.post('/admin/cdn/consumo', adminLimiter, verifyAdmin, async (req, res) => {
         try {
+            // Se refresca en segundo plano, sin retrasar las estadísticas si BCRP no responde.
+            actualizarTipoCambioPen().catch(() => {});
             if (consumoCdnCache && Date.now() - consumoCdnCache.en < 5 * 60000 && req.body?.actualizar !== true) {
-                return res.json({ success: true, ...consumoCdnCache.datos, en_cache: true });
+                return res.json({ success: true, ...consumoCdnCache.datos, ...tipoCambioPenParaPanel(), en_cache: true });
             }
             const ahora = new Date();
             const dia = formatPeruDateKey(ahora);
@@ -4638,11 +4822,11 @@ if (CDN_API_ACTIVA) {
                 solicitudes: Number(d.TotalRequestsServed) || 0,
                 acierto_cache_pct: Math.round((acierto <= 1 && acierto > 0 ? acierto * 100 : acierto) * 10) / 10,
                 serie,
-                precio_gb_usd: CDN_PRECIO_GB_USD, tipo_cambio_pen: TIPO_CAMBIO_PEN, precio_acceso_pen: PRECIO_ACCESO_PEN,
+                precio_gb_usd: CDN_PRECIO_GB_USD, precio_acceso_pen: PRECIO_ACCESO_PEN,
                 costo_usd: CDN_PRECIO_GB_USD ? Math.round(gb * CDN_PRECIO_GB_USD * 100) / 100 : null
             };
             consumoCdnCache = { en: Date.now(), datos };
-            return res.json({ success: true, ...datos, en_cache: false });
+            return res.json({ success: true, ...datos, ...tipoCambioPenParaPanel(), en_cache: false });
         } catch (e) {
             console.error("❌ Error leyendo el consumo de la CDN:", e);
             return res.status(500).json({ success: false, message: "Error leyendo el consumo de la CDN." });
