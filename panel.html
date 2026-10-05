@@ -508,7 +508,7 @@
             </div>
         </div>
     </div>
-    <p class="pie-panel">Panel <span id="versionPanel">A9 - mantenimiento y alertas</span></p>
+    <p class="pie-panel">Panel <span id="versionPanel">A9.1 - tipo de cambio automático</span></p>
 </div>
 
 <div id="extensionModal" class="modal-overlay">
@@ -606,7 +606,7 @@
 
     // Versión visible del panel: confirma que GitHub Pages ya sirve el archivo nuevo
     // (GitHub Pages guarda la página hasta 10 minutos en caché).
-    const PANEL_VERSION = "A9 - mantenimiento y alertas";
+    const PANEL_VERSION = "A9.1 - tipo de cambio automático";
 
     // Medición (solo observa): con ?debug=1 se muestra un recuadro con los datos del último listado.
     const DIAGNOSTICO_ACTIVO = /[?&]debug=1\b/.test(location.search);
@@ -3970,6 +3970,31 @@ Acceso válido para 1 dispositivo a la vez.
             <div class="muted">GB por hora (máximo ${escapeHtml(maximo)} GB).</div>`;
     }
 
+    function detalleTipoCambioCdn(c) {
+        const cambio = Number(c.tipo_cambio_pen);
+        const info = c.tipo_cambio && typeof c.tipo_cambio === "object" ? c.tipo_cambio : {};
+        const disponible = Number.isFinite(cambio) && cambio > 0;
+        const partes = [disponible ? `S/ ${cambio.toFixed(3)} por US$ 1` : "Pendiente de cotización"];
+        if (info.origen === "bcrp") {
+            partes.push(`Automático · ${info.fuente || "BCRP · SBS venta"}`);
+            if (/^\d{4}-\d{2}-\d{2}$/.test(String(info.fecha || ""))) {
+                const [anio, mes, dia] = info.fecha.split("-");
+                partes.push(`cotización del ${dia}/${mes}/${anio}`);
+            }
+            if (Number.isFinite(Number(info.consultado_en_ms)) && Number(info.consultado_en_ms) > 0) {
+                partes.push(`consultada el ${formatDateTimeMs(Number(info.consultado_en_ms))}`);
+            }
+        } else if (info.origen === "respaldo") {
+            partes.push("Respaldo manual · actualización automática activa");
+        } else if (disponible) {
+            partes.push("Valor manual configurado");
+        }
+        let html = escapeHtml(partes.join(" · "));
+        if (info.aviso) html += `<div class="help-text">${escapeHtml(String(info.aviso))}</div>`;
+        if (disponible) html += '<div class="help-text">Conversión orientativa: el banco puede aplicar un cambio diferente al pagar Bunny.</div>';
+        return html;
+    }
+
     function renderCdnMant() {
         const purga = document.getElementById('mantCdnPurga');
         if (herramientasServidor.cdn !== "bunny") {
@@ -4001,9 +4026,11 @@ Acceso válido para 1 dispositivo a la vez.
         const fila = (k, html) => filas.push(`<dt>${escapeHtml(k)}</dt><dd>${html}</dd>`);
         const esHoy = c.dia === dia(Date.now());
         fila(esHoy ? "Hoy" : `Día ${c.dia}`, escapeHtml(`${c.gb} GB entregados · ${Number(c.solicitudes || 0).toLocaleString('es-PE')} solicitudes · acierto de caché ${c.acierto_cache_pct} %`));
+        fila("Tipo de cambio", detalleTipoCambioCdn(c));
         const ventas = ventasDelDia(c.dia, Date.parse(c.hasta) || 0);
         if (hayValor(c.costo_usd)) {
-            const soles = c.tipo_cambio_pen ? Number(c.costo_usd) * Number(c.tipo_cambio_pen) : null;
+            const cambio = Number(c.tipo_cambio_pen);
+            const soles = Number.isFinite(cambio) && cambio > 0 ? Number(c.costo_usd) * cambio : null;
             fila("Costo estimado", escapeHtml(`US$ ${Number(c.costo_usd).toFixed(2)}${soles !== null ? ` (S/ ${soles.toFixed(2)})` : ""}, a US$ ${c.precio_gb_usd} por GB`));
             if (soles !== null && ventas > 0) {
                 const precio = Number(c.precio_acceso_pen) || 5;
@@ -4014,10 +4041,12 @@ Acceso válido para 1 dispositivo a la vez.
             } else if (soles !== null) {
                 fila("Por venta", `todavía no hay pases creados ${esHoy ? "hoy" : "ese día"} en la lista`);
             } else {
-                fila("Por venta", "configure TIPO_CAMBIO_PEN en Render para calcularlo en soles");
+                fila("Por venta", c.tipo_cambio && c.tipo_cambio.modo === "automatico"
+                    ? "Pendiente de cotización. Se actualizará automáticamente; puede configurar TIPO_CAMBIO_PEN como respaldo en Render."
+                    : "Configure TIPO_CAMBIO_PEN en Render para calcularlo en soles.");
             }
         } else {
-            fila("Costo", "configure CDN_PRECIO_GB_USD (precio por GB de su zona en Bunny) y TIPO_CAMBIO_PEN en Render para estimarlo");
+            fila("Costo", "Configure CDN_PRECIO_GB_USD (precio por GB de su zona en Bunny) en Render para estimarlo");
         }
         bloque('mantCdn', `<dl class="dato-lista">${filas.join("")}</dl>${graficoConsumo(c.serie)}
             <div class="help-text" style="margin-top:6px;">Datos de Bunny desde las 00:00 de Lima del ${escapeHtml(c.dia)} (consulta de las ${escapeHtml(formatearHoraLima(cdnConsumoEn))}${c.en_cache ? "; el servidor los guarda 5 minutos" : ""}). Semáforo del costo por venta: verde por debajo del 10 % del precio, amarillo entre 10 y 20 %, rojo por encima del 20 %. Las ventas se cuentan con los pases creados ${esHoy ? "hoy" : "ese día"} que siguen en la lista.</div>`);
