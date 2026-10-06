@@ -11,7 +11,7 @@ const dns = require('dns');
 const { monitorEventLoopDelay } = require('perf_hooks');
 
 // Versión visible en GET / y en el registro de arranque (identifica el despliegue).
-const VERSION_BACKEND = "FASE 10.19 - B13 + tipo de cambio automático";
+const VERSION_BACKEND = "FASE 10.20.1 - B14.1 eliminar revocados";
 
 // --- 1. FIREBASE ---
 const serviceAccount = JSON.parse(process.env.FIREBASE_JSON);
@@ -1358,7 +1358,7 @@ function summarizeUserAgent(userAgent) {
 }
 
 function isRevokedUser(data) {
-    return data?.last_status === "revoked_by_admin" ||
+    return Boolean(data?.eliminacion) || data?.last_status === "revoked_by_admin" ||
         String(data?.session_id || "").startsWith("revoked_");
 }
 
@@ -2006,6 +2006,8 @@ app.post('/release-session', leerTextoPlano, beaconComoJson, ...limitesReproducc
             if (data.session_id !== sessionId || data.active_page_id !== pageId) {
                 return;
             }
+            // B14: liberar no quita una revocación.
+            if (isRevokedUser(data)) return;
 
             transaction.update(userRef, {
                 session_id: "",
@@ -2710,28 +2712,44 @@ app.post('/admin/limpiar-caducados', adminLimiter, verifyAdmin, async (req, res)
             });
         }
 
-        const docs = vencidosSnap.docs.slice(0, CLEANUP_BATCH_SIZE);
+        const limpiezaId = "caducados_" + crypto.randomBytes(12).toString('hex');
+        const docs = [];
+        let archivados = 0, borrados = 0, errores = 0;
         const quedanMas = vencidosSnap.docs.length > CLEANUP_BATCH_SIZE;
-
-        const loteArchivo = db.batch();
-        docs.forEach(doc => {
-            loteArchivo.set(db.collection('historial_accesos').doc(doc.id), datosDeArchivo(doc), { merge: true });
-        });
-        await loteArchivo.commit();
-        const archivados = docs.length;
-
-        const fallidos = await eliminarCuentasAuth(docs.map(doc => doc.id));
-
-        const loteBorrado = db.batch();
-        let borrados = 0;
-        docs.forEach((doc, index) => {
-            if (fallidos.has(index)) return;
-            loteBorrado.delete(doc.ref);
-            borrados++;
-        });
-        if (borrados) await loteBorrado.commit();
-
-        const errores = fallidos.size;
+        try {
+            for (const doc of vencidosSnap.docs.slice(0, CLEANUP_BATCH_SIZE)) {
+                if (pasesAdminEnCurso.has(doc.id)) continue;
+                pasesAdminEnCurso.set(doc.id, limpiezaId);
+                const elegible = await db.runTransaction(async t => {
+                    const actual = await t.get(doc.ref);
+                    if (!actual.exists) return false;
+                    const d = actual.data() || {};
+                    if (getTimestampMillis(d.fecha_expiracion) >= limiteLimpieza.toMillis()) return false;
+                    if ((d.eliminacion && d.eliminacion.tipo !== "caducado") || (!d.eliminacion && isRevokedUser(d))) return false;
+                    t.set(db.collection('historial_accesos').doc(doc.id), datosDeArchivo(actual), { merge: true });
+                    t.update(doc.ref, { eliminacion: { solicitud_id: limpiezaId, tipo: "caducado", estado: "en_curso", en_ms: Date.now() } });
+                    return true;
+                });
+                if (elegible) { docs.push(doc); archivados++; }
+                else pasesAdminEnCurso.delete(doc.id);
+            }
+            const fallidos = await eliminarCuentasAuth(docs.map(doc => doc.id));
+            errores = fallidos.size;
+            for (let index = 0; index < docs.length; index++) {
+                if (fallidos.has(index)) continue;
+                const doc = docs[index];
+                const retirado = await db.runTransaction(async t => {
+                    const actual = await t.get(doc.ref);
+                    if (!actual.exists) return true;
+                    if ((actual.data().eliminacion || {}).solicitud_id !== limpiezaId) return false;
+                    t.delete(doc.ref);
+                    return true;
+                });
+                if (retirado) borrados++; else errores++;
+            }
+        } finally {
+            for (const [uid, solicitud] of pasesAdminEnCurso) if (solicitud === limpiezaId) pasesAdminEnCurso.delete(uid);
+        }
 
         registrarAccionAdmin(req, "limpiar", `${borrados} eliminados · ${archivados} archivados${conservadosRecientes ? ` · ${conservadosRecientes} recientes conservados` : ''}`,
             { borrados, archivados, errores, conservados_recientes: conservadosRecientes });
@@ -2790,20 +2808,22 @@ app.post('/admin/extender-accesos', adminLimiter, verifyAdmin, async (req, res) 
         }
 
         const refs = uids.map(uid => db.collection('usuarios').doc(uid));
-        const snaps = await db.getAll(...refs);
-        const batch = db.batch();
         const nowMillis = Date.now();
         const extensionAt = nowTimestamp();
         const results = [];
         let updated = 0;
 
-        snaps.forEach((snap, index) => {
+        for (let index = 0; index < refs.length; index++) {
+            const resultado = await db.runTransaction(async transaction => {
+            const snap = await transaction.get(refs[index]);
             if (!snap.exists) {
-                results.push({ uid: uids[index], success: false, reason: 'not_found' });
-                return;
+                return { uid: uids[index], success: false, reason: 'not_found' };
             }
 
             const data = snap.data() || {};
+            if (isRevokedUser(data) || data.eliminacion || pasesAdminEnCurso.has(uids[index])) {
+                return { uid: uids[index], success: false, reason: 'revoked_or_deleting' };
+            }
             const currentExpirationMillis = getTimestampMillis(data.fecha_expiracion);
             const targetMillis = mode === 'set'
                 ? requestedExpiration.getTime()
@@ -2852,17 +2872,17 @@ app.post('/admin/extender-accesos', adminLimiter, verifyAdmin, async (req, res) 
                 patch.active_page_id = '';
             }
 
-            batch.update(refs[index], patch);
-            updated++;
-            results.push({
+            transaction.update(refs[index], patch);
+            return {
                 uid: uids[index],
                 success: true,
                 new_expiration_ms: targetMillis,
                 etiqueta: targetLabel
+            };
             });
-        });
-
-        if (updated) await batch.commit();
+            results.push(resultado);
+            if (resultado.success) updated++;
+        }
 
         registrarAccionAdmin(
             req,
@@ -2965,7 +2985,9 @@ app.post('/admin/historial-usuario', adminLimiter, verifyAdmin, async (req, res)
                 creado_ms: getTimestampMillis(data.creado_el),
                 expira_ms: getTimestampMillis(data.fecha_expiracion),
                 extension_count: Number(data.extension_count || 0),
-                extension_history: serializeExtensionHistory(data.extension_history)
+                extension_history: serializeExtensionHistory(data.extension_history),
+                archive_reason: archived ? (data.archive_reason || "expired_cleanup") : null,
+                eliminado_ms: archived ? getTimestampMillis(data.eliminado_el) : null
             }
         });
     } catch (e) {
@@ -2992,7 +3014,12 @@ app.post('/admin/listar-historial', adminLimiter, verifyAdmin, async (req, res) 
                 expira_ms: getTimestampMillis(data.fecha_expiracion),
                 archivado_ms: getTimestampMillis(data.archivado_el),
                 extension_count: Number(data.extension_count || 0),
-                last_status: data.last_status || "-"
+                last_status: data.last_status || "-",
+                // B14: distingue la limpieza de vencidos de la eliminación de un revocado.
+                archive_reason: data.archive_reason || "expired_cleanup",
+                eliminado_ms: getTimestampMillis(data.eliminado_el),
+                eliminado_por: data.eliminado_por || "",
+                motivo_eliminacion: data.motivo_eliminacion || ""
             };
         });
 
@@ -3147,6 +3174,7 @@ app.post('/admin/listar-usuarios', adminLimiter, verifyAdmin, async (req, res) =
                 esActivo,
                 fecha_vigente: fechaVigente,
                 revocado,
+                eliminacion_pendiente: Boolean(data.eliminacion),
                 viendo_ahora: viendoAhora,
                 nunca_ingreso: nuncaIngreso,
                 dispositivo,
@@ -3943,6 +3971,11 @@ app.post('/admin/restaurar-pase', adminLimiter, verifyAdmin, async (req, res) =>
                 resultado = { status: 409, body: { success: false, code: "NOT_REVOKED", message: "Este pase no está revocado." } };
                 return;
             }
+            // B14: un pase cuya eliminación ya empezó no se restaura (su cuenta puede estar borrada).
+            if (data.eliminacion) {
+                resultado = { status: 409, body: { success: false, code: "DELETION_IN_PROGRESS", message: "Este pase tiene una eliminación en curso o pendiente y ya no se puede restaurar. Complete la eliminación y, si el cliente debe seguir viendo, créele un pase nuevo." } };
+                return;
+            }
             const vencido = getTimestampMillis(data.fecha_expiracion) <= Date.now();
             t.update(ref, {
                 session_id: "", active_device_id: "", active_page_id: "",
@@ -4015,6 +4048,332 @@ app.post('/admin/nueva-clave-vip', adminLimiter, verifyAdmin, async (req, res) =
     } catch (e) {
         console.error("❌ Error generando la contraseña del socio:", e);
         return res.status(500).json({ success: false, message: "Error generando la contraseña." });
+    }
+});
+
+// --- 17.7 ELIMINAR PASES REVOCADOS (B14) ---
+// Revocar bloquea el acceso y permite restaurarlo. Eliminar retira un pase revocado sin esperar a su
+// vencimiento: conserva su archivo operativo en historial_accesos, borra su cuenta de Firebase Auth y quita
+// su documento de la lista. Firestore y Auth no forman una transacción, así que cada pase avanza por pasos
+// que se pueden repetir sin daño:
+//   1. marca de eliminación, en una transacción y solo si el pase sigue revocado (desde aquí Restaurar se niega);
+//   2. archivo en historial_accesos (mismos datos que la limpieza de vencidos: sin hashes, sesiones ni IP);
+//   3. cuenta de Firebase Auth (si ya no existe, el paso está hecho);
+//   4. documento de usuarios, en otra transacción que comprueba que la marca sigue siendo de esta solicitud.
+// Si un paso falla, el pase queda revocado y marcado: no recupera el acceso, y repetir la eliminación
+// completa lo que falta. Cada solicitud lleva un identificador: repetirla (doble clic, reenvío del navegador)
+// devuelve el resultado guardado en lugar de volver a ejecutarla.
+const ELIMINAR_REVOCADOS_MAX = 100;
+// Una sola instancia de Render: reservas locales durante toda la operación, sin caducar por lentitud.
+const operacionesEliminacionActivas = new Map();
+const pasesAdminEnCurso = new Map();
+const ELIMINACION_TOMA_MS = 2 * 60 * 1000;      // una marca más antigua de otra solicitud se puede retomar
+const OPERACION_ELIMINACION_DIAS = 30;
+const SOLICITUD_ADMIN_VALIDA = /^[A-Za-z0-9_-]{16,64}$/;
+const RESULTADOS_ELIMINACION = {
+    eliminado: "Eliminado: el código ya no sirve y su archivo queda en el historial.",
+    ya_eliminado: "Ya no estaba en la lista (archivado antes).",
+    no_existe: "No existe en la lista.",
+    omitido_no_revocado: "Omitido: ya no está revocado (pudo restaurarse).",
+    omitido_administrador: "Omitido: es una cuenta de administrador.",
+    en_curso_por_otra_solicitud: "Omitido: otro administrador lo está eliminando en este momento.",
+    error_reintentable: "No se completó: el pase sigue revocado; vuelva a intentarlo."
+};
+
+HERRAMIENTAS.eliminar_revocados = true;
+HERRAMIENTAS.eliminar_revocados_max = ELIMINAR_REVOCADOS_MAX;
+
+// Un UID de Firebase admite hasta 128 caracteres; como identificador de documento no puede llevar «/»,
+// caracteres de control ni ser «.», «..» o un nombre reservado (__x__).
+function uidDePaseValido(u) {
+    return typeof u === "string" && u.length >= 1 && u.length <= 128 &&
+        !/[\/\u0000-\u001f\u007f]/.test(u) && u !== "." && u !== ".." && !/^__.*__$/.test(u);
+}
+
+function documentoDeArchivo(uid, datos) {
+    return { id: uid, data: () => datos };
+}
+
+// Una marca está «activa» mientras la solicitud que la puso sigue trabajando: otra solicitud no la toca.
+// Si esa solicitud termina con error, la deja «pendiente» y cualquier reintento la retoma de inmediato;
+// si no alcanzó a hacerlo (reinicio del servidor), se retoma pasados ELIMINACION_TOMA_MS.
+function marcaDeOtraSolicitudActiva(marca, solicitudId) {
+    return Boolean(marca && marca.solicitud_id !== solicitudId && (operacionesEliminacionActivas.has(marca.solicitud_id) || (marca.estado !== "pendiente" &&
+        Date.now() - Number(marca.en_ms || 0) < ELIMINACION_TOMA_MS)));
+}
+
+async function dejarEliminacionPendiente(ref, solicitudId) {
+    try {
+        await db.runTransaction(async (t) => {
+            const snap = await t.get(ref);
+            if (!snap.exists) return;
+            const marca = (snap.data() || {}).eliminacion;
+            if (!marca || marca.solicitud_id !== solicitudId) return;
+            t.update(ref, { eliminacion: { ...marca, estado: "pendiente" } });
+        });
+    } catch (_) {
+        // Sin Firestore la marca queda activa: se podrá retomar pasados ELIMINACION_TOMA_MS.
+    }
+}
+
+async function eliminarPaseRevocado(uid, ctx) {
+    if (pasesAdminEnCurso.has(uid)) return { uid, resultado: "en_curso_por_otra_solicitud", mensaje: RESULTADOS_ELIMINACION.en_curso_por_otra_solicitud };
+    pasesAdminEnCurso.set(uid, ctx.solicitudId);
+    try { return await eliminarPaseRevocadoReservado(uid, ctx); }
+    finally { if (pasesAdminEnCurso.get(uid) === ctx.solicitudId) pasesAdminEnCurso.delete(uid); }
+}
+
+async function eliminarPaseRevocadoReservado(uid, ctx) {
+    const ref = db.collection('usuarios').doc(uid);
+    const resultado = (clave, extra = {}) => ({ uid, resultado: clave, mensaje: RESULTADOS_ELIMINACION[clave], ...extra });
+
+    // Rol real, no la etiqueta del pase: una cuenta de administrador (o la del operador) nunca se elimina aquí.
+    if (uid === ctx.actorUid) return resultado("omitido_administrador");
+    try {
+        const cuenta = await auth.getUser(uid);
+        if (cuenta && cuenta.customClaims && cuenta.customClaims.admin === true) return resultado("omitido_administrador");
+    } catch (e) {
+        if (!e || e.code !== 'auth/user-not-found') return resultado("error_reintentable", { paso: "comprobar_cuenta" });
+    }
+
+    // 1. Marca de eliminación (bloquea Restaurar y otra eliminación simultánea).
+    let datos = null;
+    let previo = null;
+    try {
+        await db.runTransaction(async (t) => {
+            const snap = await t.get(ref);
+            datos = null;
+            previo = null;
+            if (!snap.exists) { previo = "no_existe"; return; }
+            const d = snap.data() || {};
+            if (!isRevokedUser(d)) {
+                if (d.eliminacion) {
+                    // Marcado pero sin revocar: solo una anomalía lo produce (Restaurar se niega con marca) y su cuenta
+                    // pudo borrarse ya. Se revoca de nuevo para que nadie entre y queda pendiente de reintento.
+                    t.update(ref, {
+                        session_id: "revoked_" + Date.now(), last_status: "revoked_by_admin",
+                        eliminacion: { ...d.eliminacion, estado: "pendiente" }
+                    });
+                    previo = "revocado_de_nuevo"; datos = d; return;
+                }
+                previo = "omitido_no_revocado"; datos = d; return;
+            }
+            const marca = d.eliminacion || null;
+            if (marcaDeOtraSolicitudActiva(marca, ctx.solicitudId)) {
+                previo = "en_curso_por_otra_solicitud"; datos = d; return;
+            }
+            t.update(ref, {
+                eliminacion: {
+                    solicitud_id: ctx.solicitudId, por: ctx.actor, en_ms: Date.now(), estado: "en_curso",
+                    motivo: ctx.motivo, intento: Number(marca && marca.intento || 0) + 1
+                }
+            });
+            datos = d;
+        });
+    } catch (e) {
+        return resultado("error_reintentable", { paso: "marca" });
+    }
+    const usuario = datos && datos.usuario_corto ? String(datos.usuario_corto) : "";
+    if (previo === "no_existe") {
+        try {
+            const archivo = await db.collection('historial_accesos').doc(uid).get();
+            if (archivo.exists) return resultado("ya_eliminado", { usuario: String((archivo.data() || {}).usuario_corto || "") });
+        } catch (_) { /* sin archivo legible: se informa como inexistente */ }
+        return resultado("no_existe");
+    }
+    if (previo === "revocado_de_nuevo") return resultado("error_reintentable", { usuario, paso: "estado" });
+    if (previo) return resultado(previo, { usuario });
+
+    // 2. Archivo operativo (idempotente: el documento del historial usa el UID).
+    try {
+        await db.collection('historial_accesos').doc(uid).set({
+            ...datosDeArchivo(documentoDeArchivo(uid, datos)),
+            archive_reason: "revoked_deletion",
+            eliminado_el: nowTimestamp(),
+            eliminado_por: ctx.actor,
+            motivo_eliminacion: ctx.motivo,
+            solicitud_eliminacion: ctx.solicitudId
+        }, { merge: true });
+    } catch (e) {
+        await dejarEliminacionPendiente(ref, ctx.solicitudId);
+        return resultado("error_reintentable", { usuario, paso: "archivo" });
+    }
+
+    // 3. Cuenta de Firebase Auth: sin ella, el código y la contraseña dejan de servir.
+    try {
+        await auth.deleteUser(uid);
+    } catch (e) {
+        if (!e || e.code !== 'auth/user-not-found') {
+            await dejarEliminacionPendiente(ref, ctx.solicitudId);
+            return resultado("error_reintentable", { usuario, paso: "cuenta" });
+        }
+    }
+
+    // 4. Documento: solo si la marca sigue siendo de esta solicitud y el pase sigue revocado.
+    let fin = "eliminado";
+    try {
+        await db.runTransaction(async (t) => {
+            const snap = await t.get(ref);
+            if (!snap.exists) { fin = "eliminado"; return; }
+            const d = snap.data() || {};
+            const marca = d.eliminacion || {};
+            if (marca.solicitud_id !== ctx.solicitudId) { fin = "en_curso_por_otra_solicitud"; return; }
+            if (!isRevokedUser(d)) {
+                // Ninguna ruta debería quitar la revocación de un pase marcado; si ocurriera, su cuenta ya no
+                // existe y un ingreso la volvería a crear: se revoca de nuevo y queda pendiente de reintento.
+                t.update(ref, {
+                    session_id: "revoked_" + Date.now(), last_status: "revoked_by_admin",
+                    eliminacion: { ...marca, estado: "pendiente" }
+                });
+                fin = "error_reintentable";
+                return;
+            }
+            t.delete(ref);
+            fin = "eliminado";
+        });
+    } catch (e) {
+        await dejarEliminacionPendiente(ref, ctx.solicitudId);
+        return resultado("error_reintentable", { usuario, paso: "documento" });
+    }
+    if (fin === "error_reintentable") return resultado(fin, { usuario, paso: "documento" });
+    return resultado(fin, { usuario });
+}
+
+function resumenEliminacion(resultados) {
+    const r = { eliminados: 0, ya_eliminados: 0, omitidos: 0, errores: 0 };
+    resultados.forEach(x => {
+        if (x.resultado === "eliminado") r.eliminados++;
+        else if (x.resultado === "ya_eliminado") r.ya_eliminados++;
+        else if (x.resultado === "error_reintentable") r.errores++;
+        else r.omitidos++;
+    });
+    return r;
+}
+
+function respuestaOperacionEliminacion(op, extra = {}) {
+    const resultados = Array.isArray(op.resultados) ? op.resultados : [];
+    return {
+        success: true,
+        solicitud_id: op.solicitud_id,
+        estado: op.estado,
+        resultados,
+        resumen: op.resumen || resumenEliminacion(resultados),
+        iniciada_en_ms: op.inicio_ms || null,
+        terminada_en_ms: op.fin_ms || null,
+        ...extra
+    };
+}
+
+app.post('/admin/eliminar-revocados', adminLimiter, verifyAdmin, async (req, res) => {
+    const solicitudId = String(req.body?.solicitud_id || "").trim();
+    const crudos = Array.isArray(req.body?.uids) ? req.body.uids : null;
+    if (!SOLICITUD_ADMIN_VALIDA.test(solicitudId)) {
+        return res.status(400).json({ success: false, code: "BAD_REQUEST_ID", message: "Falta el identificador de la solicitud." });
+    }
+    if (!crudos || !crudos.length) {
+        return res.status(400).json({ success: false, code: "MISSING_UIDS", message: "Indique qué pases revocados quiere eliminar." });
+    }
+    const uids = [...new Set(crudos.map(u => typeof u === "string" ? u.trim() : ""))];
+    if (uids.some(u => !uidDePaseValido(u))) {
+        return res.status(400).json({ success: false, code: "BAD_UID", message: "Hay identificadores de pase con formato inválido." });
+    }
+    if (uids.length > ELIMINAR_REVOCADOS_MAX) {
+        return res.status(400).json({ success: false, code: "TOO_MANY", message: `Elimine como máximo ${ELIMINAR_REVOCADOS_MAX} pases por vez.` });
+    }
+    const motivo = String(req.body?.motivo || "").replace(/[\u0000-\u001f\u007f]/g, " ").replace(/\s+/g, " ").trim().slice(0, 200);
+    const actor = (req.golazoAdmin && (req.golazoAdmin.email || req.golazoAdmin.uid)) || "";
+    const ctx = { solicitudId, actor, actorUid: (req.golazoAdmin && req.golazoAdmin.uid) || "", motivo };
+    const refOp = db.collection('operaciones_eliminacion').doc(solicitudId);
+    const activaLocal = operacionesEliminacionActivas.get(solicitudId);
+    if (activaLocal) {
+        const mismos = activaLocal.uids.length === uids.length && activaLocal.uids.every(u => uids.includes(u));
+        return res.status(409).json({ success: false, code: mismos ? "OPERACION_EN_CURSO" : "SOLICITUD_DISTINTA", message: mismos ? "Esta eliminación sigue en curso: consulte su estado." : "Ese identificador corresponde a otros pases." });
+    }
+    operacionesEliminacionActivas.set(solicitudId, { uids });
+    try {
+
+    // La solicitud queda registrada antes de tocar ningún pase: una repetición devuelve el resultado guardado.
+    let op;
+    try {
+        op = await db.runTransaction(async (t) => {
+            const snap = await t.get(refOp);
+            const ahora = Date.now();
+            if (snap.exists) {
+                const previa = snap.data() || {};
+                const mismos = Array.isArray(previa.uids) && previa.uids.length === uids.length && previa.uids.every(u => uids.includes(u));
+                if (!mismos) return { conflicto: "SOLICITUD_DISTINTA" };
+                if (previa.estado === "completada") return { repetida: true, ...previa };
+                if (previa.estado === "en_curso" && ahora - Number(previa.inicio_ms || 0) < ELIMINACION_TOMA_MS) return { conflicto: "OPERACION_EN_CURSO", ...previa };
+                const retomada = { ...previa, estado: "en_curso", inicio_ms: ahora, intento: Number(previa.intento || 1) + 1 };
+                t.set(refOp, retomada);
+                return retomada;
+            }
+            const nueva = {
+                solicitud_id: solicitudId, uids, actor, motivo, estado: "en_curso", inicio_ms: ahora, intento: 1,
+                expira_en: admin.firestore.Timestamp.fromMillis(ahora + OPERACION_ELIMINACION_DIAS * 86400000)
+            };
+            t.set(refOp, nueva);
+            return nueva;
+        });
+    } catch (e) {
+        console.error("❌ No se pudo registrar la solicitud de eliminación:", e.message);
+        return res.status(503).json({ success: false, code: "STORE_UNAVAILABLE", message: "No se pudo registrar la solicitud. No se eliminó ningún pase; reintente en unos segundos." });
+    }
+    if (op.conflicto === "SOLICITUD_DISTINTA") {
+        return res.status(409).json({ success: false, code: "SOLICITUD_DISTINTA", message: "Ese identificador ya se usó para otros pases." });
+    }
+    if (op.conflicto === "OPERACION_EN_CURSO") {
+        return res.status(409).json({ ...respuestaOperacionEliminacion(op), success: false, code: "OPERACION_EN_CURSO", message: "Esta eliminación ya se está procesando. Consulte su estado en unos segundos." });
+    }
+    if (op.repetida) return res.json(respuestaOperacionEliminacion(op, { repetida: true, message: "Esta solicitud ya se había procesado: se muestra su resultado." }));
+
+    const resultados = [];
+    for (let i = 0; i < uids.length; i += 5) {
+        const parte = await Promise.all(uids.slice(i, i + 5).map(uid => eliminarPaseRevocado(uid, ctx).catch(() => ({
+            uid, resultado: "error_reintentable", mensaje: RESULTADOS_ELIMINACION.error_reintentable, paso: "inesperado"
+        }))));
+        resultados.push(...parte);
+    }
+    const resumen = resumenEliminacion(resultados);
+    const final = { estado: resumen.errores ? "parcial" : "completada", resultados, resumen, fin_ms: Date.now() };
+    try {
+        await db.runTransaction(async t => {
+            const snap = await t.get(refOp);
+            if (!snap.exists || Number(snap.data().intento) !== Number(op.intento)) return;
+            t.set(refOp, final, { merge: true });
+        });
+    } catch (e) {
+        console.error("❌ No se pudo guardar el resultado de la eliminación:", e.message);
+    }
+    const eliminados = resultados.filter(x => x.resultado === "eliminado").map(x => x.uid);
+    if (eliminados.length || resumen.errores) {
+        registrarAccionAdmin(req, "eliminar_revocados",
+            `${eliminados.length} revocado(s) eliminado(s)${resumen.omitidos ? ` · ${resumen.omitidos} omitido(s)` : ""}${resumen.errores ? ` · ${resumen.errores} pendiente(s)` : ""}${motivo ? ` · ${motivo}` : ""}`,
+            { solicitud_id: solicitudId, eliminados: eliminados.length, omitidos: resumen.omitidos, errores: resumen.errores, uids: eliminados.slice(0, 20), motivo });
+    }
+    const partes = [];
+    if (resumen.eliminados) partes.push(`${resumen.eliminados} eliminado(s)`);
+    if (resumen.ya_eliminados) partes.push(`${resumen.ya_eliminados} ya no estaba(n) en la lista`);
+    if (resumen.omitidos) partes.push(`${resumen.omitidos} omitido(s)`);
+    if (resumen.errores) partes.push(`${resumen.errores} sin completar (siguen revocados; vuelva a intentarlo)`);
+    return res.json(respuestaOperacionEliminacion({ solicitud_id: solicitudId, inicio_ms: op.inicio_ms, ...final }, { message: partes.join(" · ") + "." }));
+    } finally { operacionesEliminacionActivas.delete(solicitudId); }
+});
+
+// Estado de una solicitud cuya respuesta no llegó (corte, 524): el panel pregunta antes de repetirla.
+app.post('/admin/eliminar-revocados/estado', adminLimiter, verifyAdmin, async (req, res) => {
+    const solicitudId = String(req.body?.solicitud_id || "").trim();
+    if (!SOLICITUD_ADMIN_VALIDA.test(solicitudId)) {
+        return res.status(400).json({ success: false, code: "BAD_REQUEST_ID", message: "Falta el identificador de la solicitud." });
+    }
+    try {
+        const snap = await db.collection('operaciones_eliminacion').doc(solicitudId).get();
+        if (!snap.exists) return res.status(404).json({ success: false, code: "OPERACION_DESCONOCIDA", message: "El servidor no recibió esa solicitud: no se eliminó nada." });
+        const op = snap.data() || {};
+        const enCurso = operacionesEliminacionActivas.has(solicitudId) || (op.estado === "en_curso" && Date.now() - Number(op.inicio_ms || 0) < ELIMINACION_TOMA_MS);
+        return res.json(respuestaOperacionEliminacion(op, { en_curso: enCurso, interrumpida: op.estado === "en_curso" && !enCurso }));
+    } catch (e) {
+        return res.status(503).json({ success: false, code: "STORE_UNAVAILABLE", message: "No se pudo consultar la solicitud. Reintente en unos segundos." });
     }
 });
 
