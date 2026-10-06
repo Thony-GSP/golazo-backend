@@ -11,7 +11,7 @@ const dns = require('dns');
 const { monitorEventLoopDelay } = require('perf_hooks');
 
 // Versión visible en GET / y en el registro de arranque (identifica el despliegue).
-const VERSION_BACKEND = "FASE 10.20.1 - B14.1 eliminar revocados";
+const VERSION_BACKEND = "FASE 10.22.1 - B16.1 tareas del VPS";
 
 // --- 1. FIREBASE ---
 const serviceAccount = JSON.parse(process.env.FIREBASE_JSON);
@@ -4624,6 +4624,7 @@ const estadoOrigen = { datos: null, recibido_en: 0, ip: "", latidos: 0, rechazad
 let clavesEmision = null;
 let clavesEmisionLeidasEn = 0;
 let ultimoTiempoAgente = 0;
+let ganchoLatidoVps = async () => ({});   // B16: tareas del VPS (se define en la sección 17.9)
 const CLAVES_ANTERIORES_MAX = 3;
 
 // La firma separa el sentido del mensaje («latido» del agente, «respuesta» del servidor): una respuesta
@@ -4767,7 +4768,7 @@ if (AGENTE_ACTIVO) {
 
     // El agente envía texto plano (así el analizador JSON general no toca el cuerpo y la firma se comprueba
     // sobre los bytes recibidos). Un reloj desfasado más de 60 s se rechaza: una copia vieja no sirve.
-    app.post('/agente/latido', agenteLimiter, express.text({ type: '*/*', limit: '16kb' }), async (req, res) => {
+    app.post('/agente/latido', agenteLimiter, express.text({ type: '*/*', limit: '32kb' }), async (req, res) => {
         try {
             const tiempo = Number(req.headers['x-golazo-tiempo']);
             const firma = String(req.headers['x-golazo-firma'] || "");
@@ -4793,7 +4794,10 @@ if (AGENTE_ACTIVO) {
                 // Sin Firestore, el agente conserva las claves que ya tiene.
                 console.error("❌ No se pudieron leer las claves de emisión:", error.message);
             }
-            const respuesta = JSON.stringify({ success: true, servidor_ms: Date.now(), claves });
+            // B16: informes de tareas que trae el latido y órdenes pendientes (cada una con su propia firma).
+            let vps = {};
+            try { vps = await ganchoLatidoVps(datos); } catch (error) { console.error("❌ No se pudieron procesar las tareas del VPS:", error && error.message); }
+            const respuesta = JSON.stringify({ success: true, servidor_ms: Date.now(), claves, ...vps });
             const t = Date.now();
             res.set('X-Golazo-Tiempo', String(t));
             res.set('X-Golazo-Firma', firmarAgente("respuesta", t, respuesta));
@@ -4881,6 +4885,440 @@ if (AGENTE_ACTIVO) {
         } catch (e) {
             console.error("❌ Error retirando la clave anterior:", e);
             return res.status(500).json({ success: false, message: "Error retirando la clave anterior." });
+        }
+    });
+}
+
+// --- 17.9 TAREAS DE MANTENIMIENTO DEL VPS DE EMISIÓN (B16) ---
+// El panel pide una tarea de una lista CERRADA; el servidor la valida, la guarda (tareas_vps/{id}) y la entrega
+// al agente en la respuesta firmada de su próximo latido. Cada orden lleva su propia firma: HMAC-SHA256 con una
+// subclave derivada de AGENTE_CLAVE («golazo/ordenes/v1») y el prefijo «orden», de modo que la firma de un latido
+// o de una respuesta nunca autoriza una tarea. El agente (sin privilegios) la comprueba y la deja al ayudante
+// golazo-mant, que corre como root, vuelve a comprobar la firma, el plazo y que no se haya ejecutado, y ejecuta
+// una función fija. El resultado vuelve en el latido (firmado por el agente) y el servidor confirma su recepción.
+// Estados: pendiente → en_ejecucion → completada | fallida; una orden no recogida en 90 s «caduca»; una que no
+// informa a tiempo queda «por_verificar» (no se presenta un resultado que no llegó). Una sola tarea a la vez.
+const TAREAS_VPS = {
+    revisar_servidor: { titulo: "Revisar servidor", lectura: true, espera_s: 15, limite_s: 60 },
+    vista_previa_limpieza: { titulo: "Vista previa de la limpieza de registros", lectura: true, espera_s: 15, limite_s: 60 },
+    limpiar_registros: { titulo: "Limpiar registros antiguos", lectura: false, espera_s: 600, limite_s: 180, confirmar: true },
+    validar_nginx: { titulo: "Validar la configuración de Nginx", lectura: true, espera_s: 15, limite_s: 60 },
+    recargar_nginx: { titulo: "Validar y recargar Nginx", lectura: false, espera_s: 120, limite_s: 90, confirmar: true },
+    reiniciar_servicio: { titulo: "Reiniciar servicio", lectura: false, espera_s: 600, limite_s: 120, confirmar: true }
+};
+function tareaPermitida(accion) { return typeof accion === "string" && Object.prototype.hasOwnProperty.call(TAREAS_VPS, accion); }
+const escriturasTareaVps = new Map();
+let colaLatidosVps = Promise.resolve();
+const TAREA_ENTREGA_MS = 90 * 1000;
+const TAREA_MARGEN_MS = 60 * 1000;
+const TAREAS_VPS_DIAS = 30;
+const ESTADOS_TAREA_FINALES = ["completada", "fallida", "caducada", "por_verificar"];
+const estadoVps = { capacidades: [], ayudante: null, tareas: new Map(), ultimaPorClave: {}, cargadas: null };
+
+function claveOrdenesAgente() {
+    return crypto.createHmac('sha256', AGENTE_CLAVE).update('golazo/ordenes/v1').digest();
+}
+
+// JSON canónico (claves ordenadas) idéntico al de Python: json.dumps(..., sort_keys=True, separators=(",", ":"),
+// ensure_ascii=True). Todos los campos de una orden son ASCII, enteros o booleanos.
+function jsonCanonico(v) {
+    if (Array.isArray(v)) return `[${v.map(jsonCanonico).join(",")}]`;
+    if (v && typeof v === "object") return `{${Object.keys(v).sort().map(k => `${JSON.stringify(k)}:${jsonCanonico(v[k])}`).join(",")}}`;
+    return JSON.stringify(v);
+}
+
+function firmarOrdenVps(orden) {
+    return crypto.createHmac('sha256', claveOrdenesAgente()).update(`orden\n${jsonCanonico(orden)}`).digest('hex');
+}
+
+function ordenDeTarea(t) {
+    return { v: 1, id: t.id, destino: "vps_emision", accion: t.accion, parametros: t.parametros,
+        creada_en_ms: t.creada_en_ms, expira_en_ms: t.expira_en_ms, limite_s: TAREAS_VPS[t.accion].limite_s };
+}
+
+// Quita de cualquier texto lo que parezca una clave antes de guardarlo o mostrarlo.
+function ocultarSecretosTexto(texto) {
+    let s = String(texto === null || texto === undefined ? "" : texto);
+    for (const secreto of [AGENTE_CLAVE, typeof BUNNY_API_KEY === "string" ? BUNNY_API_KEY : "", process.env.BUNNY_KEY, process.env.TELEGRAM_BOT_TOKEN]) {
+        if (secreto && String(secreto).length >= 8) s = s.split(String(secreto)).join("***");
+    }
+    s = s.replace(/([?&](?:k|key|token|clave|pass|password|secret|auth)=)[^&\s"']+/gi, "$1***");
+    s = s.replace(/\b([A-Z0-9_]*(?:PASSWORD|SECRET|TOKEN|API_KEY|CLAVE|_KEY)\s*[=:]\s*)\S+/gi, "$1***");
+    s = s.replace(/[A-Za-z0-9+_-]{32,}={0,2}/g, "***");
+    return s.replace(/[\u0000-\u0008\u000b-\u001f\u007f]/g, "");
+}
+
+// Resultado del ayudante: solo estructuras pequeñas, claves simples, textos acotados y sin secretos.
+function depurarResultadoVps(v, profundidad = 0) {
+    if (v === null || typeof v === "boolean") return v;
+    if (typeof v === "number") return Number.isFinite(v) ? v : null;
+    if (typeof v === "string") return ocultarSecretosTexto(v).slice(0, 300);
+    if (profundidad >= 4) return null;
+    if (Array.isArray(v)) return v.slice(0, 30).map(x => depurarResultadoVps(x, profundidad + 1));
+    if (typeof v === "object") {
+        const o = {};
+        for (const k of Object.keys(v).slice(0, 40)) {
+            if (/^[a-z0-9_]{1,40}$/.test(k)) o[k] = depurarResultadoVps(v[k], profundidad + 1);
+        }
+        return o;
+    }
+    return null;
+}
+
+function depurarAyudante(a) {
+    if (!a || typeof a !== "object") return { instalado: false };
+    return {
+        instalado: a.instalado === true, version: textoCorto(a.version, 10), clave_ok: a.clave_ok === true,
+        escribible: a.escribible === true, actualizado_ms: numeroAcotado(a.actualizado_ms, 0, 1e15)
+    };
+}
+
+function tareaPublica(t) {
+    if (!t) return null;
+    const def = TAREAS_VPS[t.accion] || {};
+    return {
+        id: t.id, accion: t.accion, titulo: def.titulo || t.accion, destino: "Servidor de emisión (Vultr)", parametros: t.parametros,
+        solicitada_por: t.admin || "", creada_en_ms: t.creada_en_ms, expira_en_ms: t.expira_en_ms,
+        iniciada_en_ms: t.iniciada_en_ms || null, terminada_en_ms: t.terminada_en_ms || null,
+        estado: t.estado, mensaje: t.mensaje || "", resultado: t.resultado || null, reconciliada: Boolean(t.reconciliada),
+        limite_s: def.limite_s || null
+    };
+}
+
+function refTareaVps(id) { return db.collection('tareas_vps').doc(id); }
+
+async function guardarTareaVps(t) {
+    // Capturar ahora y escribir en orden; una escritura lenta no puede tapar un resultado posterior.
+    const datos = { ...t, persistida: true, expira_en: admin.firestore.Timestamp.fromMillis(t.creada_en_ms + TAREAS_VPS_DIAS * 86400000) };
+    const anterior = escriturasTareaVps.get(t.id) || Promise.resolve();
+    const escritura = anterior.catch(() => {}).then(() => refTareaVps(t.id).set(datos));
+    escriturasTareaVps.set(t.id, escritura);
+    try { await escritura; } finally { if (escriturasTareaVps.get(t.id) === escritura) escriturasTareaVps.delete(t.id); }
+}
+
+function claveEsperaTarea(accion, parametros) {
+    return accion === "reiniciar_servicio" ? `${accion}:${parametros.servicio}` : accion;
+}
+
+function liberarEsperaTarea(t) {
+    const clave = claveEsperaTarea(t.accion, t.parametros || {});
+    if (estadoVps.ultimaPorClave[clave] === t.creada_en_ms) delete estadoVps.ultimaPorClave[clave];
+}
+
+// Caducidad de las pendientes y «por verificar» de las que no informan; también tras un reinicio del servidor.
+function actualizarEstadosVps() {
+    const ahora = Date.now();
+    for (const t of estadoVps.tareas.values()) {
+        let cambio = null;
+        if (t.persistida === false) continue;
+        if (t.estado === "pendiente" && ahora > t.expira_en_ms) {
+            cambio = t.entregada_en_ms || t.persistida !== true
+                ? { estado: "por_verificar", mensaje: "La orden se entregó, pero no llegó su resultado. Revise el VPS antes de repetirla." }
+                : { estado: "caducada", mensaje: "La orden venció antes de entregarse al agente: no se ejecutó." };
+        } else if (t.estado === "en_ejecucion" && ahora > Number(t.iniciada_en_ms || t.creada_en_ms) + TAREAS_VPS[t.accion].limite_s * 1000 + TAREA_MARGEN_MS) {
+            cambio = { estado: "por_verificar", mensaje: "No llegó el resultado a tiempo: la tarea pudo completarse o no. Revise el servidor antes de repetirla." };
+        }
+        if (cambio) {
+            Object.assign(t, cambio, { terminada_en_ms: ahora });
+            // Una tarea que no llegó a ejecutarse no cuenta para la espera entre tareas iguales.
+            if (cambio.estado === "caducada") liberarEsperaTarea(t);
+            guardarTareaVps(t).catch(() => {});
+        }
+    }
+    // En memoria solo quedan las activas y las terminadas en la última hora (el historial está en Firestore).
+    for (const [id, t] of estadoVps.tareas) {
+        if (ESTADOS_TAREA_FINALES.includes(t.estado) && (t.estado !== "por_verificar" || t.revision_manual_confirmada_en_ms) && ahora - Number(t.terminada_en_ms || t.creada_en_ms) > 3600000) estadoVps.tareas.delete(id);
+    }
+}
+
+function cargarTareasVps() {
+    if (!estadoVps.cargadas) {
+        estadoVps.cargadas = (async () => {
+            for (const estado of ["pendiente", "en_ejecucion", "por_verificar"]) {
+                const snap = await db.collection('tareas_vps').where('estado', '==', estado).limit(20).get();
+                snap.docs.forEach(d => { const t = d.data(); if (t && t.id && tareaPermitida(t.accion)) estadoVps.tareas.set(t.id, t); });
+            }
+            const recientes = await db.collection('tareas_vps').orderBy('creada_en_ms', 'desc').limit(20).get();
+            recientes.docs.forEach(d => {
+                const t = d.data();
+                if (!t || !tareaPermitida(t.accion) || t.estado === "caducada") return;
+                const clave = claveEsperaTarea(t.accion, t.parametros || {});
+                estadoVps.ultimaPorClave[clave] = Math.max(estadoVps.ultimaPorClave[clave] || 0, Number(t.creada_en_ms) || 0);
+            });
+            actualizarEstadosVps();
+        })().catch((e) => { estadoVps.cargadas = null; throw e; });
+    }
+    return estadoVps.cargadas;
+}
+
+function tareaActivaVps() {
+    for (const t of estadoVps.tareas.values()) if (t.estado === "pendiente" || t.estado === "en_ejecucion" || (t.estado === "por_verificar" && !t.revision_manual_confirmada_en_ms)) return t;
+    return null;
+}
+
+function agenteAdmiteTareas() {
+    return estadoVps.capacidades.includes("tareas_v1");
+}
+
+async function leerTareaVps(id) {
+    if (estadoVps.tareas.has(id)) return estadoVps.tareas.get(id);
+    const snap = await refTareaVps(id).get();
+    return snap.exists ? snap.data() : null;
+}
+
+function registrarResultadoVps(t) {
+    const def = TAREAS_VPS[t.accion] || {};
+    const resumen = `${def.titulo || t.accion}${t.parametros && t.parametros.servicio ? ` (${t.parametros.servicio})` : ""} · ${t.estado}${t.reconciliada ? " · reconciliada" : ""}`;
+    console.log(`ADMIN vps_tarea_resultado | ${t.admin || "sin autor"} | ${resumen}`);
+    db.collection('registro_admin').add({
+        accion: "vps_tarea_resultado", resumen: resumen.slice(0, 300),
+        detalle: { id: t.id, accion: t.accion, estado: t.estado, ejecutada_por: "agente del VPS" },
+        actor_uid: t.admin_uid || "", actor_email: t.admin || "", ip: "agente",
+        en: nowTimestamp(), expira_en: admin.firestore.Timestamp.fromMillis(Date.now() + REGISTRO_ADMIN_DIAS * 86400000)
+    }).catch(error => console.error("❌ No se pudo guardar el resultado de la tarea:", error.message));
+}
+
+// Llamado desde /agente/latido (B12) con el cuerpo ya verificado: aplica los informes de tareas y devuelve las
+// órdenes pendientes (cada una firmada) y el acuse de los resultados guardados.
+async function procesarLatidoVps(crudo) {
+    if (!crudo || typeof crudo !== "object") return {};
+    estadoVps.capacidades = Array.isArray(crudo.capacidades)
+        ? crudo.capacidades.filter(x => typeof x === "string" && /^[a-z0-9_]{1,30}$/.test(x)).slice(0, 10) : [];
+    estadoVps.ayudante = depurarAyudante(crudo.ayudante);
+    await cargarTareasVps();
+    const acuse = [];
+    const informes = Array.isArray(crudo.tareas) ? crudo.tareas.slice(0, 10) : [];
+    for (const r of informes) {
+        const id = String(r && r.id || "");
+        if (!SOLICITUD_ADMIN_VALIDA.test(id)) continue;
+        const t = await leerTareaVps(id);
+        if (!t) { acuse.push(id); continue; }   // tarea desconocida: el agente puede olvidarla
+        if (t.persistida === false || (!t.entregada_en_ms && t.persistida === true)) continue;
+        const estado = String(r.estado || "");
+        const ahora = Date.now();
+        const desde = t.estado;
+        if (estado === "en_ejecucion") {
+            if (desde === "pendiente" || desde === "caducada") {
+                const siguiente = { ...t, estado: "en_ejecucion", iniciada_en_ms: Math.min(ahora, numeroAcotado(r.inicio_ms, 0, 1e15) || ahora), reconciliada: desde === "caducada", terminada_en_ms: null };
+                try { await guardarTareaVps(siguiente); estadoVps.tareas.set(id, siguiente); } catch (_) {}
+            }
+            continue;
+        }
+        if (!["completada", "fallida", "rechazada", "por_verificar"].includes(estado)) continue;
+        if (["completada", "fallida"].includes(desde) && t.recibido_final) { acuse.push(id); continue; }
+        const siguiente = { ...t,
+            estado: estado === "rechazada" ? "fallida" : estado,
+            mensaje: ocultarSecretosTexto(r.mensaje || "").slice(0, 300),
+            resultado: depurarResultadoVps(r.resultado && typeof r.resultado === "object" ? r.resultado : {}),
+            iniciada_en_ms: t.iniciada_en_ms || numeroAcotado(r.inicio_ms, 0, 1e15) || ahora,
+            terminada_en_ms: Math.min(ahora, numeroAcotado(r.fin_ms, 0, 1e15) || ahora),
+            reconciliada: Boolean(t.reconciliada || desde === "caducada" || desde === "por_verificar"),
+            recibido_final: true
+        };
+        if (JSON.stringify(siguiente.resultado).length > 8000) siguiente.resultado = { truncado: true };
+        // Una recarga o un reinicio que no se hizo porque la configuración de Nginx no era válida no cambió nada:
+        // tras corregirla se puede volver a intentar enseguida.
+        try {
+            await guardarTareaVps(siguiente);
+            estadoVps.tareas.set(id, siguiente);
+            if (estado === "rechazada" || (siguiente.estado === "fallida" && siguiente.resultado.validada === false)) liberarEsperaTarea(siguiente);
+            acuse.push(id);   // solo se confirma lo que quedó guardado: si no, el agente lo reenvía
+            registrarResultadoVps(siguiente);
+        } catch (_) { /* se reintenta en el próximo latido */ }
+    }
+    actualizarEstadosVps();
+    const ordenes = [];
+    if (agenteAdmiteTareas()) {
+        for (const t of [...estadoVps.tareas.values()].filter(t => t.persistida === true && t.estado === "pendiente" && Date.now() <= t.expira_en_ms).slice(0, 2)) {
+            const entregada = { ...t, entregada_en_ms: t.entregada_en_ms || Date.now() };
+            try { await guardarTareaVps(entregada); } catch (_) { continue; }
+            estadoVps.tareas.set(t.id, entregada);
+            const orden = ordenDeTarea(entregada);
+            ordenes.push({ orden, firma: firmarOrdenVps(orden) });
+        }
+    }
+    return { ordenes, acuse };
+}
+
+ganchoLatidoVps = (crudo) => {
+    const siguiente = colaLatidosVps.catch(() => {}).then(() => procesarLatidoVps(crudo));
+    colaLatidosVps = siguiente.catch(() => {});
+    return siguiente;
+};
+
+async function confirmarRevisionVps(id, uid) {
+    const revision = colaLatidosVps.catch(() => {}).then(async () => {
+        const actual = await leerTareaVps(id);
+        if (!actual || actual.estado !== "por_verificar") return;
+        const revisada = { ...actual, revision_manual_confirmada_en_ms: Date.now(), revision_manual_por: uid };
+        await guardarTareaVps(revisada);
+        estadoVps.tareas.set(id, revisada);
+    });
+    colaLatidosVps = revision.catch(() => {});
+    await revision;
+}
+
+function resumenVps() {
+    const activa = tareaActivaVps();
+    const terminadas = [...estadoVps.tareas.values()].filter(t => ESTADOS_TAREA_FINALES.includes(t.estado))
+        .sort((a, b) => Number(b.terminada_en_ms || 0) - Number(a.terminada_en_ms || 0));
+    return {
+        admite_tareas: agenteAdmiteTareas(), ayudante: estadoVps.ayudante,
+        tarea_activa: tareaPublica(activa), ultima: tareaPublica(terminadas[0] || null)
+    };
+}
+
+HERRAMIENTAS.vps_tareas = AGENTE_ACTIVO;
+
+if (AGENTE_ACTIVO) {
+    EXTENSIONES_TABLERO.push(() => {
+        try { actualizarEstadosVps(); } catch (_) {}
+        return { vps: resumenVps() };
+    });
+
+    const tareasVpsLimiter = rateLimit({
+        windowMs: 60 * 1000,
+        max: 40,
+        standardHeaders: true,
+        legacyHeaders: false,
+        keyGenerator: claveLimitePorIp,
+        skip: (req) => req.method === 'OPTIONS',
+        message: MENSAJE_LIMITE_ADMIN,
+        handler: manejadorLimite("tareas_vps", MENSAJE_LIMITE_ADMIN)
+    });
+
+    app.post('/admin/vps/tareas/crear', adminLimiter, verifyAdmin, async (req, res) => {
+        const accion = String(req.body?.accion || "");
+        const def = tareaPermitida(accion) ? TAREAS_VPS[accion] : null;
+        if (!def) return res.status(400).json({ success: false, code: "ACCION_DESCONOCIDA", message: "Tarea no permitida." });
+        const id = String(req.body?.solicitud_id || "").trim();
+        if (!SOLICITUD_ADMIN_VALIDA.test(id)) return res.status(400).json({ success: false, code: "BAD_REQUEST_ID", message: "Falta el identificador de la solicitud." });
+        try { await cargarTareasVps(); } catch (_) {
+            return res.status(503).json({ success: false, code: "STORE_UNAVAILABLE", message: "No se pudo leer el estado de las tareas. No se creó ninguna; reintente en unos segundos." });
+        }
+        let existente = null;
+        try { existente = await leerTareaVps(id); } catch (_) {
+            return res.status(503).json({ success: false, code: "STORE_UNAVAILABLE", message: "No se pudo comprobar la solicitud. No se creó ninguna tarea; reintente en unos segundos." });
+        }
+        if (existente) {
+            if (existente.persistida === false) return res.status(503).json({ success: false, code: "STORE_BUSY", message: "La solicitud todavía se está guardando; consulte de nuevo el mismo identificador." });
+            if (existente.accion !== accion) return res.status(409).json({ success: false, code: "SOLICITUD_DISTINTA", message: "Ese identificador ya se usó para otra tarea." });
+            actualizarEstadosVps();
+            return res.json({ success: true, repetida: true, tarea: tareaPublica(existente), message: "Esta solicitud ya se había recibido: se muestra su estado." });
+        }
+        if (def.confirmar && req.body?.confirmar !== true) {
+            return res.status(400).json({ success: false, code: "CONFIRMATION_REQUIRED", message: "Confirme la tarea antes de enviarla." });
+        }
+        const p = req.body?.parametros && typeof req.body.parametros === "object" ? req.body.parametros : {};
+        let parametros = {};
+        if (accion === "vista_previa_limpieza" || accion === "limpiar_registros") {
+            const dias = Number(p.dias);
+            if (!Number.isInteger(dias) || dias < 3 || dias > 90) return res.status(400).json({ success: false, code: "BAD_PARAMS", message: "Indique una antigüedad entre 3 y 90 días." });
+            parametros = { dias };
+            if (accion === "limpiar_registros") {
+                // La limpieza exige una vista previa completada en los últimos 30 minutos con la misma antigüedad.
+                const previaId = String(p.vista_previa_id || "");
+                let previa = null;
+                try { previa = SOLICITUD_ADMIN_VALIDA.test(previaId) ? await leerTareaVps(previaId) : null; } catch (_) {}
+                if (!previa || previa.accion !== "vista_previa_limpieza" || previa.estado !== "completada" || !previa.parametros || previa.parametros.dias !== dias ||
+                    Date.now() - Number(previa.terminada_en_ms || 0) > 30 * 60000) {
+                    return res.status(409).json({ success: false, code: "PREVIEW_REQUIRED", message: "Revise primero la vista previa (de los últimos 30 minutos) con la misma antigüedad." });
+                }
+                const huella = previa.resultado && previa.resultado.huella;
+                if (typeof huella !== "string" || !/^[0-9a-f]{24}$/.test(huella)) return res.status(409).json({ success: false, code: "PREVIEW_REQUIRED", message: "La vista previa no tiene una huella válida. Genere una nueva antes de limpiar." });
+                parametros = { dias, huella };
+            }
+        } else if (accion === "reiniciar_servicio") {
+            const servicio = String(p.servicio || "");
+            if (!["nginx", "golazo-agente"].includes(servicio)) return res.status(400).json({ success: false, code: "BAD_PARAMS", message: "Solo se puede reiniciar nginx o golazo-agente." });
+            parametros = { servicio };
+        }
+        const agente = resumenAgente();
+        if (!agente.conectado) {
+            return res.status(409).json({ success: false, code: "AGENTE_DESCONECTADO", message: agente.visto_hace_s === null
+                ? "El agente del VPS no se ha conectado desde que arrancó el servidor: la tarea no se puede entregar."
+                : `El agente del VPS no informa desde hace ${agente.visto_hace_s} s: la tarea no se puede entregar.` });
+        }
+        if (!agenteAdmiteTareas()) {
+            return res.status(409).json({ success: false, code: "AGENTE_SIN_TAREAS", message: `El agente instalado (versión ${agente.datos && agente.datos.agente_version || "anterior a 1.2"}) no admite tareas de mantenimiento: actualícelo a la 1.2.` });
+        }
+        if (!estadoVps.ayudante || !estadoVps.ayudante.instalado || !estadoVps.ayudante.clave_ok || !estadoVps.ayudante.escribible) {
+            return res.status(409).json({ success: false, code: "AYUDANTE_NO_INSTALADO", message: "El ayudante de mantenimiento (golazo-mant) no está instalado en el VPS." });
+        }
+        actualizarEstadosVps();
+        const porVerificar = tareaActivaVps();
+        if (porVerificar && porVerificar.estado === "por_verificar") {
+            if (req.body?.resultado_anterior_verificado !== true) return res.status(409).json({ success: false, code: "RESULTADO_POR_VERIFICAR", tarea: tareaPublica(porVerificar), message: "No se conoce el resultado de la tarea anterior. Revise el VPS antes de autorizar otra." });
+            try { await confirmarRevisionVps(porVerificar.id, req.golazoAdmin?.uid || ""); } catch (_) { return res.status(503).json({ success: false, code: "STORE_UNAVAILABLE", message: "No se pudo guardar la verificación. No se creó otra tarea." }); }
+        }
+        const emitiendo = Boolean(agente.datos && agente.datos.emisor && agente.datos.emisor.conectado);
+        if (emitiendo && (accion === "recargar_nginx" || (accion === "reiniciar_servicio" && parametros.servicio === "nginx")) && req.body?.en_vivo_confirmado !== true) {
+            return res.status(409).json({ success: false, code: "EMISION_EN_CURSO", message: "OBS está emitiendo ahora: recargar o reiniciar Nginx puede cortar la emisión. Confírmelo expresamente si es necesario." });
+        }
+        // Desde aquí no hay pausas hasta reservar: un doble clic con el mismo identificador recibe la misma tarea.
+        const reservada = estadoVps.tareas.get(id);
+        if (reservada) {
+            if (reservada.persistida === false) return res.status(503).json({ success: false, code: "STORE_BUSY", message: "La solicitud todavía se está guardando; consulte de nuevo el mismo identificador." });
+            if (reservada.accion !== accion) return res.status(409).json({ success: false, code: "SOLICITUD_DISTINTA", message: "Ese identificador ya se usó para otra tarea." });
+            return res.json({ success: true, repetida: true, tarea: tareaPublica(reservada), message: "Esta solicitud ya se había recibido: se muestra su estado." });
+        }
+        const clave = claveEsperaTarea(accion, parametros);
+        const espera = def.espera_s * 1000 - (Date.now() - (estadoVps.ultimaPorClave[clave] || 0));
+        if (espera > 0) {
+            res.set('Retry-After', String(Math.ceil(espera / 1000)));
+            return res.status(429).json({ success: false, code: "TAREA_MUY_SEGUIDA", espera_s: Math.ceil(espera / 1000), message: `Esta tarea se pidió hace poco. Espere ${Math.ceil(espera / 1000)} s.` });
+        }
+        // Comprobación y reserva sin pausas intermedias: dos solicitudes simultáneas no crean dos tareas.
+        actualizarEstadosVps();
+        const activa = tareaActivaVps();
+        if (activa) {
+            return res.status(409).json({ success: false, code: "TAREA_EN_CURSO", tarea: tareaPublica(activa), message: `Hay otra tarea en curso (${TAREAS_VPS[activa.accion].titulo}). Espere a que termine.` });
+        }
+        const ahora = Date.now();
+        const tarea = {
+            id, accion, parametros, admin: (req.golazoAdmin && (req.golazoAdmin.email || req.golazoAdmin.uid)) || "", admin_uid: (req.golazoAdmin && req.golazoAdmin.uid) || "",
+            creada_en_ms: ahora, expira_en_ms: ahora + TAREA_ENTREGA_MS, iniciada_en_ms: null, terminada_en_ms: null,
+            estado: "pendiente", mensaje: "", resultado: null, reconciliada: false, recibido_final: false,
+            persistida: false, entregada_en_ms: null
+        };
+        estadoVps.tareas.set(id, tarea);
+        estadoVps.ultimaPorClave[clave] = ahora;
+        try {
+            await guardarTareaVps(tarea);
+            tarea.persistida = true;
+        } catch (_) {
+            estadoVps.tareas.delete(id);
+            delete estadoVps.ultimaPorClave[clave];
+            return res.status(503).json({ success: false, code: "STORE_UNAVAILABLE", message: "No se pudo guardar la tarea. No se envió nada al VPS; reintente en unos segundos." });
+        }
+        registrarAccionAdmin(req, "vps_tarea", `${def.titulo}${parametros.servicio ? ` (${parametros.servicio})` : ""}${parametros.dias ? ` · más de ${parametros.dias} días` : ""} · solicitada`, { id, accion, parametros });
+        return res.json({ success: true, tarea: tareaPublica(tarea), message: "Tarea enviada: el agente la recibirá en su próxima conexión (hasta 15 s)." });
+    });
+
+    app.post('/admin/vps/tareas/estado', tareasVpsLimiter, verifyAdmin, async (req, res) => {
+        const id = String(req.body?.id || "").trim();
+        if (!SOLICITUD_ADMIN_VALIDA.test(id)) return res.status(400).json({ success: false, code: "BAD_REQUEST_ID", message: "Falta el identificador de la tarea." });
+        try {
+            await cargarTareasVps();
+            actualizarEstadosVps();
+            const t = await leerTareaVps(id);
+            if (!t) return res.status(404).json({ success: false, code: "TAREA_DESCONOCIDA", message: "El servidor no recibió esa solicitud: no se creó ninguna tarea." });
+            return res.json({ success: true, tarea: tareaPublica(t), ...resumenVps() });
+        } catch (_) {
+            return res.status(503).json({ success: false, code: "STORE_UNAVAILABLE", message: "No se pudo consultar la tarea. Reintente en unos segundos." });
+        }
+    });
+
+    app.post('/admin/vps/tareas/listar', tareasVpsLimiter, verifyAdmin, async (req, res) => {
+        const limite = Math.min(50, Math.max(1, parseInt(req.body?.limite || "20", 10) || 20));
+        try {
+            await cargarTareasVps();
+            actualizarEstadosVps();
+            const snap = await db.collection('tareas_vps').orderBy('creada_en_ms', 'desc').limit(limite).get();
+            const tareas = snap.docs.map(d => { const t = d.data() || {}; return estadoVps.tareas.get(t.id) || t; }).filter(t => t && TAREAS_VPS[t.accion]).map(tareaPublica);
+            return res.json({ success: true, tareas, ...resumenVps() });
+        } catch (_) {
+            return res.status(503).json({ success: false, code: "STORE_UNAVAILABLE", message: "No se pudo leer el historial de tareas. Reintente en unos segundos." });
         }
     });
 }
@@ -5189,6 +5627,875 @@ if (CDN_API_ACTIVA) {
         } catch (e) {
             console.error("❌ Error leyendo el consumo de la CDN:", e);
             return res.status(500).json({ success: false, message: "Error leyendo el consumo de la CDN." });
+        }
+    });
+}
+
+// --- 17.8 CDN: CONSUMO POR PERIODO, RESÚMENES DIARIOS Y PURGA DE ZONA (B15, OPCIONAL) ---
+// Requiere lo mismo que B13 (BUNNY_API_KEY y BUNNY_PULLZONE_ID). La clave nunca sale del servidor.
+//
+// Periodos: hoy, ayer, últimos 7 días, mes en curso, mes anterior y rango (desde/hasta), siempre en días de
+// Lima (UTC−5 todo el año). Límites de GET /statistics (documentación de Bunny, 05-10-2026): datos por hora
+// de los últimos 30 días, por día del último año y 40 días como máximo por consulta; las consultas diarias
+// se redondean a días completos y exactRange solo actúa con hourly=true.
+//   · Días recientes (hasta 28 días atrás): consulta por hora con exactRange y se agrupan las 24 horas de
+//     cada día de Lima (de 05:00 a 04:59 UTC). Los tramos no se solapan y cada hora se cuenta una sola vez.
+//   · Días anteriores (hasta un año): solo existe el corte diario de Bunny, que es el día UTC (de 19:00 del
+//     día anterior a 19:00 de Lima). Se muestra con esa etiqueta; no se presenta como un día de Lima exacto.
+//   · Más antiguos: solo si hay un resumen guardado; si no, «fuera del histórico disponible».
+// Resúmenes diarios persistentes (consumo_cdn_diario/{zona}_{día}): una tarea del servidor, cada hora y sin
+// depender del panel, guarda los últimos 3 días y una vez cada 6 h completa los 28 días anteriores. El día
+// en curso es «provisional»; un día se «concilia» cuando pasaron 48 h desde su fin. La escritura es
+// idempotente: un dato conciliado no se reemplaza por uno provisional ni un corte de Lima por uno UTC.
+// Tipo de cambio histórico: tipo_cambio_historico/{serie}_{mes}, separado de config/tipo_cambio_pen.
+const CDN_HORARIO_SEGURO_DIAS = 28;      // días de Lima cuyo inicio cae con margen dentro de los 30 días por hora
+const CDN_DIARIO_DIAS = 365;             // historial diario de Bunny
+const CDN_MAX_DIAS_CONSULTA = 40;        // máximo por consulta a GET /statistics
+const CDN_TRAMO_HORARIO_DIAS = 14;       // tramos horarios de 14 días (336 puntos por consulta)
+const CDN_CONCILIAR_TRAS_MS = 48 * 3600 * 1000;
+const CDN_REFRESCO_HOY_MS = 5 * 60 * 1000;
+const CDN_REFRESCO_PROVISIONAL_MS = 30 * 60 * 1000;
+const CDN_CICLO_MS = 60 * 60 * 1000;
+const CDN_REPASO_MS = 6 * 3600 * 1000;
+const CDN_CONSULTAS_SIMULTANEAS = 2;
+const CDN_RANGO_MAX_DIAS = 366;
+const CDN_RESUMENES = String(process.env.CDN_RESUMENES || "on").trim().toLowerCase() !== "off";
+const PURGA_ZONA_ESPERA_MS = Math.min(24 * 3600, Math.max(60, parseInt(process.env.CDN_PURGA_ZONA_ESPERA_S || "600", 10) || 600)) * 1000;
+const CONTEO_PASES_DESDE_ENV = /^\d{4}-\d{2}-\d{2}$/.test(String(process.env.CDN_CONTEO_PASES_DESDE || "").trim())
+    ? String(process.env.CDN_CONTEO_PASES_DESDE).trim() : null;
+const LIMA_DESFASE_MS = 5 * 3600 * 1000;  // Perú no usa horario de verano desde 1994
+
+function diaLimaDeMs(ms) { return new Date(ms - LIMA_DESFASE_MS).toISOString().slice(0, 10); }
+function horaLimaDeMs(ms) { return new Date(ms - LIMA_DESFASE_MS).getUTCHours(); }
+function inicioDiaLimaMs(dia) { return Date.parse(`${dia}T05:00:00Z`); }
+function sumarDias(dia, n) { return new Date(Date.parse(`${dia}T12:00:00Z`) + n * 86400000).toISOString().slice(0, 10); }
+function diasEntre(desde, hasta) { return Math.round((Date.parse(`${hasta}T12:00:00Z`) - Date.parse(`${desde}T12:00:00Z`)) / 86400000) + 1; }
+function fechaIsoValida(t) {
+    if (typeof t !== "string" || !/^\d{4}-\d{2}-\d{2}$/.test(t)) return false;
+    const d = new Date(`${t}T12:00:00Z`);
+    return !Number.isNaN(d.getTime()) && d.toISOString().slice(0, 10) === t && t >= "2020-01-01";
+}
+function listaDias(desde, hasta) {
+    const dias = [];
+    for (let d = desde; d <= hasta; d = sumarDias(d, 1)) dias.push(d);
+    return dias;
+}
+function tramosContiguos(dias, maximo) {
+    const tramos = [];
+    let actual = [];
+    for (const d of dias) {
+        if (actual.length && (sumarDias(actual[actual.length - 1], 1) !== d || actual.length >= maximo)) { tramos.push(actual); actual = []; }
+        actual.push(d);
+    }
+    if (actual.length) tramos.push(actual);
+    return tramos;
+}
+function errorPeriodo(code, message) { const e = new Error(message); e.code = code; return e; }
+
+function resolverPeriodoCdn(cuerpo, ahoraMs) {
+    const hoy = diaLimaDeMs(ahoraMs);
+    const periodo = String(cuerpo.periodo || "hoy");
+    let desde, hasta;
+    if (periodo === "hoy") { desde = hasta = hoy; }
+    else if (periodo === "ayer") { desde = hasta = sumarDias(hoy, -1); }
+    else if (periodo === "7d") { desde = sumarDias(hoy, -6); hasta = hoy; }
+    else if (periodo === "mes") { desde = `${hoy.slice(0, 8)}01`; hasta = hoy; }
+    else if (periodo === "mes_anterior") { hasta = sumarDias(`${hoy.slice(0, 8)}01`, -1); desde = `${hasta.slice(0, 8)}01`; }
+    else if (periodo === "rango") {
+        desde = String(cuerpo.desde || "").trim();
+        hasta = String(cuerpo.hasta || "").trim();
+        if (!fechaIsoValida(desde) || !fechaIsoValida(hasta)) throw errorPeriodo("FECHA_INVALIDA", "Indique las fechas Desde y Hasta con el formato AAAA-MM-DD.");
+        if (desde > hasta) throw errorPeriodo("RANGO_INVERTIDO", "La fecha Desde debe ser anterior o igual a la fecha Hasta.");
+        if (hasta > hoy) throw errorPeriodo("FECHA_FUTURA", "La fecha Hasta no puede ser posterior a hoy (hora de Lima).");
+        if (diasEntre(desde, hasta) > CDN_RANGO_MAX_DIAS) throw errorPeriodo("RANGO_LARGO", `El rango puede tener como máximo ${CDN_RANGO_MAX_DIAS} días.`);
+    } else {
+        throw errorPeriodo("PERIODO_INVALIDO", "Periodo no reconocido.");
+    }
+    return { periodo, desde, hasta, hoy, dias: diasEntre(desde, hasta) };
+}
+
+// --- Consultas a Bunny: como máximo dos a la vez y en pausa si Bunny responde 429 ---
+let bunnyPausaHasta = 0;
+let bunnyActivas = 0;
+const colaBunny = [];
+function enColaBunny(fn) {
+    return new Promise((resolve, reject) => {
+        colaBunny.push({ fn, resolve, reject });
+        siguienteBunny();
+    });
+}
+function siguienteBunny() {
+    while (bunnyActivas < CDN_CONSULTAS_SIMULTANEAS && colaBunny.length) {
+        const tarea = colaBunny.shift();
+        bunnyActivas++;
+        Promise.resolve().then(tarea.fn).then(tarea.resolve, tarea.reject).finally(() => {
+            bunnyActivas--;
+            siguienteBunny();
+        });
+    }
+}
+function segundosReintento(cabeceras, porDefecto = 60) {
+    const valor = cabeceras && (cabeceras['retry-after'] || cabeceras['Retry-After']);
+    if (valor === undefined || valor === null || valor === "") return porDefecto;
+    const s = Number(valor);
+    if (Number.isFinite(s)) return Math.min(3600, Math.max(1, Math.ceil(s)));
+    const fecha = Date.parse(String(valor));
+    return Number.isFinite(fecha) ? Math.min(3600, Math.max(1, Math.ceil((fecha - Date.now()) / 1000))) : porDefecto;
+}
+function mensajeBunnySeguro(texto) {
+    try {
+        const d = JSON.parse(texto || "{}");
+        const m = String(d.Message || d.message || "").replace(/[\u0000-\u001f]/g, " ").slice(0, 200);
+        return m ? `Bunny: ${m}` : "";
+    } catch (_) { return ""; }
+}
+
+const diagnosticoBunny = { consultas: 0, fallidas: 0, limitadas: 0, ultima_ms: 0, ultimo_error: "" };
+
+async function consultarEstadisticasBunny({ desdeIso, hastaIso, porHora }) {
+    if (Date.now() < bunnyPausaHasta) {
+        return { ok: false, codigo: "limite", retry_after_s: Math.ceil((bunnyPausaHasta - Date.now()) / 1000), mensaje: "Bunny pidió esperar antes de nuevas consultas (429)." };
+    }
+    const p = new URLSearchParams({ pullZone: BUNNY_PULLZONE_ID, dateFrom: desdeIso, dateTo: hastaIso, loadBandwidthUsed: "true", loadRequestsServed: "true" });
+    if (porHora) { p.set("hourly", "true"); p.set("exactRange", "true"); }
+    return enColaBunny(async () => {
+        if (Date.now() < bunnyPausaHasta) {
+            return { ok: false, codigo: "limite", retry_after_s: Math.ceil((bunnyPausaHasta - Date.now()) / 1000), mensaje: "Bunny pidió esperar antes de nuevas consultas (429)." };
+        }
+        diagnosticoBunny.consultas++;
+        diagnosticoBunny.ultima_ms = Date.now();
+        const r = await solicitudSaliente(`https://api.bunny.net/statistics?${p.toString()}`, {
+            cabeceras: { AccessKey: BUNNY_API_KEY, accept: 'application/json' },
+            timeoutMs: 15000, maxBytes: 4 * 1024 * 1024, soloPublicas: false, redirecciones: 0
+        });
+        if (r.status === 429) {
+            const s = segundosReintento(r.headers);
+            bunnyPausaHasta = Date.now() + s * 1000;
+            diagnosticoBunny.limitadas++;
+            diagnosticoBunny.ultimo_error = "429";
+            return { ok: false, codigo: "limite", retry_after_s: s, mensaje: `Bunny pidió esperar ${s} s antes de nuevas consultas (429).` };
+        }
+        if (!r.ok || r.cortada) {
+            diagnosticoBunny.fallidas++;
+            diagnosticoBunny.ultimo_error = r.error || String(r.status || "");
+            return {
+                ok: false, codigo: r.status === 400 ? "rango" : "fallo", status: r.status || null,
+                mensaje: r.cortada ? "La respuesta de Bunny superó el tamaño permitido." : (r.status === 400 && mensajeBunnySeguro(r.texto)) || mensajeErrorBunny(r)
+            };
+        }
+        try {
+            const datos = JSON.parse(r.texto || "{}");
+            return datos && typeof datos === "object" ? { ok: true, datos } : { ok: false, codigo: "fallo", mensaje: "Bunny devolvió estadísticas ilegibles." };
+        } catch (_) {
+            diagnosticoBunny.fallidas++;
+            return { ok: false, codigo: "fallo", mensaje: "Bunny devolvió estadísticas ilegibles." };
+        }
+    });
+}
+
+// Claves de los gráficos de Bunny: fechas ISO. Sin zona explícita se asume UTC y se avisa.
+function msDeClaveBunny(clave) {
+    const s = String(clave || "");
+    if (!/^\d{4}-\d{2}-\d{2}(T\d{2}:\d{2}(:\d{2}(\.\d+)?)?)?(Z|[+-]\d{2}:?\d{2})?$/.test(s)) return null;
+    const conHora = s.length === 10 ? `${s}T00:00:00` : s;
+    const ms = Date.parse(/(Z|[+-]\d{2}:?\d{2})$/.test(conHora) ? conHora : `${conHora}Z`);
+    return Number.isFinite(ms) ? ms : null;
+}
+function objetoGrafico(v) { return v && typeof v === "object" && !Array.isArray(v) ? v : {}; }
+
+// Acierto de caché: Bunny lo da en porcentaje; si todos los valores son ≤ 1 se interpretan como fracción.
+function puntosDeRespuesta(d, desdeMs, hastaMs) {
+    const bw = objetoGrafico(d.BandwidthUsedChart), rq = objetoGrafico(d.RequestsServedChart), ch = objetoGrafico(d.CacheHitRateChart);
+    const tasas = [Number(d.CacheHitRate)].concat(Object.values(ch).map(Number)).filter(Number.isFinite);
+    const escala = tasas.some(v => v > 1) ? 1 : 100;
+    const general = Number.isFinite(Number(d.CacheHitRate)) ? Math.min(100, Math.max(0, Number(d.CacheHitRate) * escala)) : null;
+    const puntos = new Map();
+    let sinZona = false;
+    for (const clave of new Set([...Object.keys(bw), ...Object.keys(rq)])) {
+        const t = msDeClaveBunny(clave);
+        if (t === null || t < desdeMs || t > hastaMs) continue;
+        if (!/(Z|[+-]\d{2}:?\d{2})$/.test(clave)) sinZona = true;
+        const tasa = ch[clave] !== undefined && Number.isFinite(Number(ch[clave])) ? Math.min(100, Math.max(0, Number(ch[clave]) * escala)) : general;
+        const valido = v => v !== null && v !== undefined && v !== "" && typeof v !== "boolean" && Number.isFinite(Number(v)) && Number(v) >= 0;
+        if (!valido(bw[clave]) || !valido(rq[clave])) continue;
+        puntos.set(t, { bytes: Number(bw[clave]), solicitudes: Number(rq[clave]), acierto: tasa });
+    }
+    return { puntos, sinZona };
+}
+
+function precioVigenteGbUsd() { return CDN_PRECIO_GB_USD; }
+
+function resumenesDesdeHoras(puntos, dias, ahoraMs) {
+    const salida = [];
+    for (const dia of dias) {
+        const bytes = new Array(24).fill(null), solicitudes = new Array(24).fill(null), acierto = new Array(24).fill(null);
+        for (const [t, p] of puntos) {
+            if (diaLimaDeMs(t) !== dia) continue;
+            const h = horaLimaDeMs(t);
+            bytes[h] = p.bytes; solicitudes[h] = p.solicitudes; acierto[h] = p.acierto === null ? null : Math.round(p.acierto * 10) / 10;
+        }
+        const horas = bytes.filter(v => v !== null).length;
+        // Sin ninguna hora en la respuesta no hay dato (no es consumo cero): no se guarda.
+        if (!horas) continue;
+        let totalBytes = 0, totalSol = 0, solCache = 0, solConTasa = 0;
+        for (let h = 0; h < 24; h++) {
+            if (bytes[h] === null) continue;
+            totalBytes += bytes[h]; totalSol += solicitudes[h] || 0;
+            if (acierto[h] !== null) { solCache += (solicitudes[h] || 0) * acierto[h] / 100; solConTasa += solicitudes[h] || 0; }
+        }
+        const finMs = inicioDiaLimaMs(sumarDias(dia, 1));
+        const conciliado = horas >= 24 && ahoraMs - finMs >= CDN_CONCILIAR_TRAS_MS;
+        salida.push({
+            version: 1, zona: BUNNY_PULLZONE_ID, dia, horario: "America/Lima", fuente: "bunny_horario",
+            bytes: totalBytes, solicitudes: totalSol, solicitudes_cache: Math.round(solCache), solicitudes_con_acierto: totalSol ? solConTasa : 0,
+            horas_con_datos: horas, horas: { bytes, solicitudes, acierto },
+            estado: conciliado ? "conciliado" : "provisional",
+            consultado_en_ms: ahoraMs, conciliado_en_ms: conciliado ? ahoraMs : null,
+            precio_gb_usd: precioVigenteGbUsd(), tarifa_origen: dia === diaLimaDeMs(ahoraMs) ? "observada_en_dia" : "referencia_actual"
+        });
+    }
+    return salida;
+}
+
+function resumenesDesdeDiasUtc(puntos, dias, ahoraMs) {
+    const porDia = new Map();
+    for (const [t, p] of puntos) porDia.set(new Date(t).toISOString().slice(0, 10), p);
+    return dias.filter(dia => porDia.has(dia)).map(dia => {
+        const p = porDia.get(dia);
+        return {
+            version: 1, zona: BUNNY_PULLZONE_ID, dia, horario: "UTC", fuente: "bunny_diario",
+            bytes: p.bytes, solicitudes: p.solicitudes,
+            solicitudes_cache: p.acierto === null ? 0 : Math.round(p.solicitudes * p.acierto / 100),
+            solicitudes_con_acierto: p.acierto === null ? 0 : p.solicitudes,
+            horas_con_datos: null, horas: null, estado: "conciliado",
+            consultado_en_ms: ahoraMs, conciliado_en_ms: ahoraMs, precio_gb_usd: precioVigenteGbUsd(), tarifa_origen: "referencia_actual"
+        };
+    });
+}
+
+function refResumenCdn(dia) { return db.collection('consumo_cdn_diario').doc(`${BUNNY_PULLZONE_ID}_${dia}`); }
+function tieneConsumo(g) { return Boolean(g && Number.isFinite(Number(g.bytes)) && g.estado); }
+
+// Escritura idempotente: conciliado > provisional; corte de Lima > corte UTC; a igual estado gana la consulta más nueva.
+async function guardarResumenCdn(nuevo) {
+    const ref = refResumenCdn(nuevo.dia);
+    return db.runTransaction(async (t) => {
+        const snap = await t.get(ref);
+        const previo = snap.exists ? snap.data() || {} : null;
+        if (tieneConsumo(previo)) {
+            if (previo.estado === "conciliado" && nuevo.estado !== "conciliado") return previo;
+            if (previo.horario === "America/Lima" && nuevo.horario === "UTC") return previo;
+            if (previo.estado === nuevo.estado && previo.horario === nuevo.horario &&
+                Number(previo.consultado_en_ms || 0) > Number(nuevo.consultado_en_ms || 0)) return previo;
+        }
+        const final = { ...nuevo };
+        if (previo && previo.tarifa_origen === "observada_en_dia" && previo.precio_gb_usd !== null && previo.precio_gb_usd !== undefined) {
+            final.precio_gb_usd = previo.precio_gb_usd;
+            final.tarifa_origen = "observada_en_dia";
+        }
+        if (previo && Number.isFinite(Number(previo.pases_creados))) {
+            final.pases_creados = previo.pases_creados;
+            final.pases_creados_en_ms = previo.pases_creados_en_ms || null;
+        }
+        if (previo && previo.precio_gb_usd !== undefined && previo.precio_gb_usd !== null && previo.estado === "conciliado") final.precio_gb_usd = previo.precio_gb_usd;
+        t.set(ref, final);
+        return final;
+    });
+}
+
+// Obtiene de Bunny los días pedidos (por hora o por día UTC), los guarda y devuelve { resumenes, errores }.
+async function traerDiasDeBunny(dias, porHora, ahoraMs) {
+    const resumenes = new Map();
+    const errores = new Map();
+    const tramos = tramosContiguos(dias, porHora ? CDN_TRAMO_HORARIO_DIAS : CDN_MAX_DIAS_CONSULTA);
+    let sinZona = false;
+    for (const tramo of tramos) {
+        const primero = tramo[0], ultimo = tramo[tramo.length - 1];
+        let desdeMs, hastaMs, desdeIso, hastaIso;
+        if (porHora) {
+            desdeMs = inicioDiaLimaMs(primero);
+            hastaMs = Math.min(inicioDiaLimaMs(sumarDias(ultimo, 1)) - 1000, ahoraMs);
+            desdeIso = new Date(desdeMs).toISOString().slice(0, 19) + "Z";
+            hastaIso = new Date(hastaMs).toISOString().slice(0, 19) + "Z";
+        } else {
+            // Corte diario de Bunny: días UTC completos; dateTo se redondea al final de su día.
+            desdeMs = Date.parse(`${primero}T00:00:00Z`);
+            hastaMs = Date.parse(`${ultimo}T23:59:59Z`);
+            desdeIso = `${primero}T00:00:00Z`;
+            hastaIso = `${ultimo}T00:00:00Z`;
+        }
+        const r = await consultarEstadisticasBunny({ desdeIso, hastaIso, porHora });
+        if (!r.ok) {
+            tramo.forEach(d => errores.set(d, r));
+            if (r.codigo === "limite") {
+                // Pausa pedida por Bunny: los tramos siguientes tampoco se consultan.
+                tramos.slice(tramos.indexOf(tramo) + 1).forEach(t => t.forEach(d => errores.set(d, r)));
+                break;
+            }
+            continue;
+        }
+        const { puntos, sinZona: sz } = puntosDeRespuesta(r.datos, desdeMs, hastaMs);
+        sinZona = sinZona || sz;
+        const nuevos = porHora ? resumenesDesdeHoras(puntos, tramo, ahoraMs) : resumenesDesdeDiasUtc(puntos, tramo, ahoraMs);
+        for (const n of nuevos) {
+            let guardado = n;
+            try { guardado = await guardarResumenCdn(n); } catch (_) { /* se usa en memoria */ }
+            resumenes.set(n.dia, guardado);
+        }
+        tramo.filter(d => !nuevos.some(n => n.dia === d)).forEach(d => errores.set(d, { ok: false, codigo: "sin_datos", mensaje: "Bunny no devolvió datos para este día." }));
+    }
+    return { resumenes, errores, sinZona };
+}
+
+// --- Pases creados por día (denominador del coste estimado por pase creado) ---
+let conteoPasesDesde = CONTEO_PASES_DESDE_ENV;
+let conteoPasesDesdeCargado = false;
+async function cargarConteoPasesDesde() {
+    if (conteoPasesDesdeCargado) return conteoPasesDesde;
+    try {
+        const ref = db.collection('config').doc('consumo_cdn');
+        const hoy = diaLimaDeMs(Date.now());
+        const guardado = await db.runTransaction(async (t) => {
+            const snap = await t.get(ref);
+            const d = snap.exists ? snap.data() || {} : {};
+            if (fechaIsoValida(d.conteo_pases_desde)) return d.conteo_pases_desde;
+            t.set(ref, { conteo_pases_desde: hoy, creado_en_ms: Date.now() }, { merge: true });
+            return hoy;
+        });
+        conteoPasesDesde = CONTEO_PASES_DESDE_ENV && CONTEO_PASES_DESDE_ENV < guardado ? CONTEO_PASES_DESDE_ENV : guardado;
+        conteoPasesDesdeCargado = true;
+    } catch (_) { /* se reintenta en la próxima consulta */ }
+    return conteoPasesDesde;
+}
+
+async function contarPasesCreados(dia) {
+    const t0 = admin.firestore.Timestamp.fromMillis(inicioDiaLimaMs(dia));
+    const t1 = admin.firestore.Timestamp.fromMillis(inicioDiaLimaMs(sumarDias(dia, 1)));
+    const ids = new Set();
+    for (const nombre of ['usuarios', 'historial_accesos']) {
+        let q = db.collection(nombre).where('creado_el', '>=', t0).where('creado_el', '<', t1);
+        if (typeof q.select === 'function') q = q.select();
+        const snap = await q.get();
+        snap.docs.forEach(d => ids.add(d.id));
+    }
+    return ids.size;
+}
+
+async function actualizarPasesCreados(dias, guardados, maximo = 31) {
+    const desde = await cargarConteoPasesDesde();
+    if (!desde) return;
+    const hoy = diaLimaDeMs(Date.now());
+    const pendientes = dias.filter(d => {
+        if (d < desde || d > hoy) return false;
+        const g = guardados.get(d);
+        if (!g || !Number.isFinite(Number(g.pases_creados))) return true;
+        // Hoy y ayer cambian mientras se crean pases o se completa el día.
+        return d >= sumarDias(hoy, -1) && Date.now() - Number(g.pases_creados_en_ms || 0) > 10 * 60000;
+    }).slice(0, maximo);
+    for (const d of pendientes) {
+        try {
+            const n = await contarPasesCreados(d);
+            const en = Date.now();
+            await refResumenCdn(d).set({ zona: BUNNY_PULLZONE_ID, dia: d, pases_creados: n, pases_creados_en_ms: en }, { merge: true });
+            guardados.set(d, { ...(guardados.get(d) || {}), pases_creados: n, pases_creados_en_ms: en });
+        } catch (_) { /* queda sin denominador para ese día */ }
+    }
+}
+
+// --- Tipo de cambio histórico (BCRP · SBS venta), separado de config/tipo_cambio_pen ---
+const tcHistoricoConsultado = new Map();   // mes -> ms de la última consulta a BCRP
+const tcHistoricoEnCurso = new Map();
+const tcHistoricoMemoria = new Map();
+function refTcMes(mes) { return db.collection('tipo_cambio_historico').doc(`${TIPO_CAMBIO_SERIE}_${mes}`); }
+function mesesEntre(desde, hasta) {
+    const meses = [];
+    let m = desde.slice(0, 7);
+    while (m <= hasta.slice(0, 7)) {
+        meses.push(m);
+        const [a, mm] = m.split("-").map(Number);
+        m = mm === 12 ? `${a + 1}-01` : `${a}-${String(mm + 1).padStart(2, "0")}`;
+    }
+    return meses;
+}
+function ultimoDiaMes(mes) { const [a, m] = mes.split("-").map(Number); return new Date(Date.UTC(a, m, 0)).toISOString().slice(0, 10); }
+
+function analizarRangoBcrp(texto) {
+    let datos;
+    try { datos = JSON.parse(texto); } catch (_) { return null; }
+    const series = datos && datos.config && datos.config.series;
+    if (!Array.isArray(series) || series.length !== 1 || !/SBS.*Venta/i.test(String(series[0] && series[0].name || "")) || !Array.isArray(datos.periods)) return null;
+    const valores = {};
+    for (const periodo of datos.periods) {
+        if (!periodo || !Array.isArray(periodo.values) || periodo.values.length !== 1) continue;
+        const valor = valorTipoCambioPen(periodo.values[0]);
+        const fecha = fechaTipoCambioPen(periodo.name);
+        if (valor !== null && fecha) valores[fecha] = valor;
+    }
+    return valores;
+}
+
+async function asegurarTcHistorico(desde, hasta) {
+    const hoy = diaLimaDeMs(Date.now());
+    const inicio = sumarDias(desde, -10);   // fines de semana y feriados al inicio del periodo
+    const meses = mesesEntre(inicio, hasta);
+    const guardados = new Map();
+    try {
+        const snaps = await db.getAll(...meses.map(refTcMes));
+        snaps.forEach((s, i) => { if (s.exists) guardados.set(meses[i], s.data() || {}); });
+    } catch (_) { /* sin lectura: se intenta la fuente */ }
+    const pedir = meses.filter(m => {
+        const g = guardados.get(m);
+        const consultado = Math.max(Number(g && g.consultado_en_ms || 0), tcHistoricoConsultado.get(m) || 0);
+        const cerrado = ultimoDiaMes(m) < hoy;
+        // Un mes cerrado y consultado 3 días después de su fin no se vuelve a pedir; los recientes, cada 6 h.
+        if (g && cerrado && consultado >= Date.parse(`${ultimoDiaMes(m)}T05:00:00Z`) + 3 * 86400000) return false;
+        return Date.now() - consultado > 6 * 3600 * 1000;
+    });
+    let aviso = "";
+    if (pedir.length && TIPO_CAMBIO_AUTOMATICO) {
+        const claveConsulta = pedir.join(",");
+        if (!tcHistoricoEnCurso.has(claveConsulta)) {
+            tcHistoricoEnCurso.set(claveConsulta, (async () => {
+                // Meses completos: un mes guardado debe tener todas sus cotizaciones, no solo las del periodo.
+                const d1 = pedir[0] + "-01";
+                const d2 = ultimoDiaMes(pedir[pedir.length - 1]) > hoy ? hoy : ultimoDiaMes(pedir[pedir.length - 1]);
+                const r = await solicitudSaliente(`https://estadisticas.bcrp.gob.pe/estadisticas/series/api/${TIPO_CAMBIO_SERIE}/json/${d1}/${d2}`, {
+                    cabeceras: { accept: 'application/json' }, timeoutMs: 8000, maxBytes: 512 * 1024, soloPublicas: true, redirecciones: 0
+                });
+                const valores = r.ok && !r.cortada ? analizarRangoBcrp(r.texto) : null;
+                if (!valores) throw new Error("fuente_no_disponible");
+                const en = Date.now();
+                for (const m of pedir) {
+                    const delMes = Object.fromEntries(Object.entries(valores).filter(([f]) => f.startsWith(m)));
+                    tcHistoricoConsultado.set(m, en);
+                    tcHistoricoMemoria.set(m, { valores: delMes, consultado_en_ms: en });
+                    try {
+                        await refTcMes(m).set({ version: 1, serie: TIPO_CAMBIO_SERIE, mes: m, valores: delMes, consultado_en_ms: en }, { merge: true });
+                    } catch (_) { /* queda en memoria */ }
+                    guardados.set(m, { ...(guardados.get(m) || {}), valores: { ...((guardados.get(m) || {}).valores || {}), ...delMes }, consultado_en_ms: en });
+                }
+                return true;
+            })().finally(() => { tcHistoricoEnCurso.delete(claveConsulta); }));
+        }
+        try { await tcHistoricoEnCurso.get(claveConsulta); } catch (_) {
+            pedir.forEach(m => tcHistoricoConsultado.set(m, Date.now() - 5 * 3600 * 1000)); // reintento en 1 h
+            aviso = "La fuente oficial del tipo de cambio histórico no respondió; se usan las cotizaciones guardadas.";
+        }
+        if (!aviso) {
+            try {
+                const snaps = await db.getAll(...pedir.map(refTcMes));
+                snaps.forEach((s, i) => { if (s.exists) guardados.set(pedir[i], s.data() || {}); });
+            } catch (_) {}
+        }
+    }
+    const valores = {};
+    for (const m of meses) { const g = guardados.get(m); Object.assign(valores, (g && g.valores) || {}, (tcHistoricoMemoria.get(m) || {}).valores || {}); }
+    return { valores, aviso };
+}
+
+// Cotización para cada día: la del día; si no hubo publicación (fin de semana, feriado), la del día hábil
+// anterior más cercano (hasta 7 días atrás); si tampoco existe, la cotización actual como referencia.
+function cotizacionDelDia(dia, valores, actual) {
+    for (let i = 0; i <= 7; i++) {
+        const f = sumarDias(dia, -i);
+        if (Number.isFinite(Number(valores[f]))) {
+            return { valor: Number(valores[f]), fecha: f, origen: i === 0 ? "bcrp_dia" : "bcrp_dia_habil_anterior", fuente: "BCRP · SBS venta" };
+        }
+    }
+    if (actual && Number(actual.tipo_cambio_pen) > 0) {
+        const tc = actual.tipo_cambio || {};
+        return { valor: Number(actual.tipo_cambio_pen), fecha: tc.fecha || null, origen: "referencia_actual", fuente: tc.fuente || "Render · TIPO_CAMBIO_PEN" };
+    }
+    return null;
+}
+
+// --- Consumo de un periodo ---
+const cacheConsumoPeriodo = new Map();
+const consultasConsumoEnCurso = new Map();
+function ttlConsumoPeriodo(p) {
+    if (p.hasta === p.hoy) return CDN_REFRESCO_HOY_MS;
+    if (p.hasta >= sumarDias(p.hoy, -2)) return CDN_REFRESCO_PROVISIONAL_MS;
+    return 6 * 3600 * 1000;
+}
+function redondear(v, d) { return v === null || v === undefined || !Number.isFinite(Number(v)) ? null : Math.round(Number(v) * 10 ** d) / 10 ** d; }
+
+async function calcularConsumoPeriodo(p, { forzar = false } = {}) {
+    const ahora = Date.now();
+    const dias = listaDias(p.desde, p.hasta);
+    const avisos = [];
+    const guardados = new Map();
+    try {
+        const snaps = await db.getAll(...dias.map(refResumenCdn));
+        snaps.forEach((s, i) => { if (s.exists) guardados.set(dias[i], s.data() || {}); });
+    } catch (_) {
+        avisos.push("No se pudieron leer los resúmenes guardados; los datos se piden a Bunny.");
+    }
+    const limiteHorario = sumarDias(p.hoy, -CDN_HORARIO_SEGURO_DIAS);
+    const limiteDiario = sumarDias(p.hoy, -(CDN_DIARIO_DIAS - 1));
+    const porHora = [], porDia = [], sinHistorial = [];
+    for (const dia of dias) {
+        const g = guardados.get(dia);
+        const edad = g ? ahora - Number(g.consultado_en_ms || 0) : Infinity;
+        if (tieneConsumo(g)) {
+            if (g.estado === "conciliado") continue;
+            if (dia === p.hoy && edad < (forzar ? 60000 : CDN_REFRESCO_HOY_MS)) continue;
+            if (dia !== p.hoy && (edad < (forzar ? 60000 : CDN_REFRESCO_PROVISIONAL_MS) || dia < limiteHorario)) continue;
+        }
+        if (dia >= limiteHorario) porHora.push(dia);
+        else if (dia >= limiteDiario) { if (!tieneConsumo(g)) porDia.push(dia); }
+        else if (!tieneConsumo(g)) sinHistorial.push(dia);
+    }
+    const errores = new Map();
+    let sinZona = false;
+    for (const [lista, horaria] of [[porHora, true], [porDia, false]]) {
+        if (!lista.length) continue;
+        const r = await traerDiasDeBunny(lista, horaria, ahora);
+        r.resumenes.forEach((v, k) => guardados.set(k, v));
+        r.errores.forEach((v, k) => errores.set(k, v));
+        sinZona = sinZona || r.sinZona;
+    }
+    await actualizarPasesCreados(dias, guardados);
+
+    const actual = tipoCambioPenParaPanel();
+    let tc = { valores: {}, aviso: "" };
+    try { tc = await asegurarTcHistorico(p.desde, p.hasta); } catch (_) { tc.aviso = "No se pudo obtener el tipo de cambio histórico."; }
+    if (tc.aviso) avisos.push(tc.aviso);
+
+    const precioActual = precioVigenteGbUsd();
+    const detalle = [];
+    let bytes = 0, solicitudes = 0, solCache = 0, solConTasa = 0, usd = 0, pen = 0;
+    let conDatos = 0, provisionales = 0, utc = 0, conError = 0, sinUsd = 0, sinPen = 0, referenciaTc = 0, tarifaReferencia = 0, incompletos = 0;
+    let pases = 0, diasConPases = 0;
+    for (const dia of dias) {
+        const g = guardados.get(dia);
+        const err = errores.get(dia);
+        const fila = { dia, horario: null, estado: null, fuente: null, gb: null, bytes: null, solicitudes: null, acierto_cache_pct: null,
+            precio_gb_usd: null, tarifa: null, costo_usd: null, tipo_cambio: null, costo_pen: null, consultado_en_ms: null,
+            pases_creados: g && Number.isFinite(Number(g.pases_creados)) ? Number(g.pases_creados) : null, aviso: "" };
+        if (fila.pases_creados !== null) { pases += fila.pases_creados; diasConPases++; }
+        if (tieneConsumo(g)) {
+            fila.horario = g.horario; fila.estado = g.estado; fila.fuente = g.fuente;
+            fila.bytes = Number(g.bytes) || 0; fila.gb = redondear(fila.bytes / 1e9, 3);
+            fila.solicitudes = Number(g.solicitudes) || 0;
+            fila.acierto_cache_pct = Number(g.solicitudes_con_acierto) > 0 ? redondear(Number(g.solicitudes_cache) / Number(g.solicitudes_con_acierto) * 100, 1) : null;
+            fila.consultado_en_ms = Number(g.consultado_en_ms) || null;
+            if (g.horario === "America/Lima" && g.horas && Array.isArray(g.horas.bytes)) {
+                const esperadas = dia === p.hoy ? horaLimaDeMs(ahora) + 1 : 24;
+                if (g.horas.bytes.slice(0, esperadas).filter(v => v !== null && v !== undefined).length < esperadas) {
+                    incompletos++;
+                    fila.aviso = "Faltan intervalos horarios: el total de este día es parcial.";
+                }
+            }
+            if (err) fila.aviso += `${fila.aviso ? " " : ""}No se pudo actualizar (${err.mensaje || "Bunny no respondió"}); se muestra el dato guardado.`;
+            const precioGuardado = g.tarifa_origen === "observada_en_dia" && g.precio_gb_usd !== null && g.precio_gb_usd !== undefined;
+            const precio = precioGuardado ? Number(g.precio_gb_usd) : precioActual;
+            fila.precio_gb_usd = precio || null;
+            fila.tarifa = !precio ? null : (precioGuardado ? "guardada" : "referencia_actual");
+            if (fila.tarifa === "referencia_actual") tarifaReferencia++;
+            fila.costo_usd = precio ? fila.bytes / 1e9 * precio : null;
+            const cot = cotizacionDelDia(dia, tc.valores, actual);
+            fila.tipo_cambio = cot;
+            if (cot && cot.origen === "referencia_actual") referenciaTc++;
+            fila.costo_pen = fila.costo_usd !== null && cot ? fila.costo_usd * cot.valor : null;
+            bytes += fila.bytes; solicitudes += fila.solicitudes;
+            solCache += Number(g.solicitudes_cache) || 0; solConTasa += Number(g.solicitudes_con_acierto) || 0;
+            if (fila.costo_usd === null) sinUsd++; else usd += fila.costo_usd;
+            if (fila.costo_pen === null) sinPen++; else pen += fila.costo_pen;
+            conDatos++;
+            if (g.estado === "provisional") provisionales++;
+            if (g.horario === "UTC") utc++;
+            fila.costo_usd = redondear(fila.costo_usd, 4);
+            fila.costo_pen = redondear(fila.costo_pen, 4);
+        } else if (sinHistorial.includes(dia)) {
+            fila.estado = "sin_historial";
+            fila.aviso = "Fuera del histórico disponible: Bunny conserva un año de datos diarios y no hay un resumen guardado de este día.";
+        } else {
+            fila.estado = "error";
+            fila.aviso = err ? err.mensaje || "Bunny no respondió." : "Sin datos.";
+            conError++;
+        }
+        detalle.push(fila);
+    }
+
+    const errLimite = [...errores.values()].find(e => e.codigo === "limite");
+    if (!conDatos && (conError || sinHistorial.length)) {
+        return {
+            fallo: true, status: errLimite ? 429 : (sinHistorial.length === dias.length ? 404 : 502),
+            code: errLimite ? "CDN_RATE_LIMITED" : (sinHistorial.length === dias.length ? "CDN_OUT_OF_HISTORY" : "CDN_STATS_FAILED"),
+            retry_after_s: errLimite ? errLimite.retry_after_s : null,
+            message: errLimite ? errLimite.mensaje
+                : sinHistorial.length === dias.length ? "El periodo queda fuera del histórico disponible en Bunny (un año de datos diarios) y no hay resúmenes guardados."
+                : `No se pudieron obtener las estadísticas: ${(detalle.find(f => f.estado === "error") || {}).aviso || "Bunny no respondió."} Esto no significa consumo cero.`,
+            periodo: p
+        };
+    }
+    if (incompletos) avisos.push(`${incompletos} día(s) con intervalos faltantes: los totales son parciales.`);
+    if (conError) avisos.push(`${conError} día(s) sin datos por un fallo de la consulta: no equivalen a consumo cero.`);
+    if (sinHistorial.length) avisos.push(`${sinHistorial.length} día(s) fuera del histórico disponible en Bunny.`);
+    if (utc) avisos.push(`${utc} día(s) con el corte diario de Bunny en UTC (de 19:00 del día anterior a 19:00, hora de Lima): sus límites no coinciden con el día peruano.`);
+    if (provisionales) avisos.push(`${provisionales} día(s) provisionales: Bunny puede completar sus datos durante las 48 h siguientes.`);
+    if (sinZona) avisos.push("Bunny no indicó la zona horaria de sus intervalos; se asumió UTC.");
+    if (referenciaTc) avisos.push(`${referenciaTc} día(s) convertidos con la cotización actual como referencia (sin cotización histórica disponible).`);
+    if (tarifaReferencia) avisos.push(`${tarifaReferencia} día(s) con la tarifa actual como tarifa de referencia.`);
+
+    // Serie: por hora para un solo día de Lima; por día en los demás casos.
+    let granularidad = "dia";
+    let serie = detalle.map(f => ({ clave: f.dia, gb: f.gb, solicitudes: f.solicitudes, acierto_cache_pct: f.acierto_cache_pct, estado: f.estado, horario: f.horario }));
+    if (dias.length === 1) {
+        const g = guardados.get(dias[0]);
+        if (tieneConsumo(g) && g.horas && Array.isArray(g.horas.bytes)) {
+            granularidad = "hora";
+            serie = g.horas.bytes.map((b, h) => ({
+                clave: `${dias[0]}T${String(h).padStart(2, "0")}:00`, hora: h,
+                gb: b === null ? null : redondear(b / 1e9, 3),
+                solicitudes: b === null ? null : g.horas.solicitudes[h],
+                acierto_cache_pct: b === null ? null : g.horas.acierto[h]
+            }));
+        }
+    }
+
+    const desdeConteo = conteoPasesDesde;
+    const usdTotal = conDatos && sinUsd === 0 ? usd : null;
+    const penTotal = conDatos && sinPen === 0 ? pen : null;
+    let costePorPase = { disponible: false, valor_pen: null, pases_creados: null, conteo_desde: desdeConteo, motivo: "" };
+    if (!precioActual && usdTotal === null) costePorPase.motivo = "Configure CDN_PRECIO_GB_USD para estimar costes.";
+    else if (!desdeConteo || p.desde < desdeConteo) costePorPase.motivo = desdeConteo
+        ? `No disponible: los pases creados se registran de forma verificable desde el ${desdeConteo.split("-").reverse().join("/")}.`
+        : "No disponible: todavía no hay un registro verificable de pases creados.";
+    else if (diasConPases < dias.length) costePorPase.motivo = "No disponible: faltan días por contar en el periodo.";
+    else if (!pases) costePorPase.motivo = "No disponible: no se crearon pases en el periodo.";
+    else if (penTotal === null || conError || sinHistorial.length || incompletos) costePorPase.motivo = "No disponible: el coste del periodo está incompleto.";
+    else costePorPase = { disponible: true, valor_pen: redondear(penTotal / pases, 4), pases_creados: pases, conteo_desde: desdeConteo, motivo: "" };
+    if (!costePorPase.disponible && diasConPases === dias.length) costePorPase.pases_creados = pases;
+
+    return {
+        fallo: false,
+        zona: BUNNY_PULLZONE_ID,
+        periodo: p.periodo, desde: p.desde, hasta: p.hasta, hoy: p.hoy, dias: dias.length,
+        granularidad,
+        horario: {
+            zona: "America/Lima",
+            desde_utc: new Date(inicioDiaLimaMs(p.desde)).toISOString(),
+            hasta_utc: new Date(Math.min(inicioDiaLimaMs(sumarDias(p.hasta, 1)), ahora)).toISOString(),
+            dias_utc: utc
+        },
+        totales: {
+            bytes, gb: redondear(bytes / 1e9, 3), solicitudes,
+            acierto_cache_pct: solConTasa > 0 ? redondear(solCache / solConTasa * 100, 1) : null,
+            costo_usd: redondear(usdTotal, 2), costo_pen: redondear(penTotal, 2),
+            dias_con_datos: conDatos, dias_con_error: conError, dias_sin_historial: sinHistorial.length,
+            dias_provisionales: provisionales, dias_utc: utc
+        },
+        serie,
+        detalle,
+        tarifa: { precio_gb_usd: precioActual, origen: precioActual ? "Render · CDN_PRECIO_GB_USD" : null },
+        ...tipoCambioPenParaPanel(),
+        coste_por_pase: costePorPase,
+        completo: conError === 0 && sinHistorial.length === 0 && incompletos === 0,
+        avisos,
+        diagnostico: { consultas_bunny: diagnosticoBunny.consultas, bunny_en_pausa_s: Math.max(0, Math.ceil((bunnyPausaHasta - Date.now()) / 1000)), resumenes_guardados: guardados.size },
+        actualizado_en_ms: ahora
+    };
+}
+
+// --- Purga de toda la zona ---
+let purgaZonaEnCurso = false;
+let purgaZonaUltima = null;
+let purgaZonaCargada = false;
+let bunnyPurgaPausaHasta = 0;
+async function cargarUltimaPurgaZona(estricto = false) {
+    if (purgaZonaCargada) return purgaZonaUltima;
+    try {
+        const snap = await db.collection('config').doc('cdn_purga_zona').get();
+        if (snap.exists) {
+            const d = snap.data() || {};
+            const recuperada = d.estado === "en_proceso" && !purgaZonaEnCurso
+                ? { ...d, estado: "desconocida", mensaje: "El servidor se reinició sin recibir la confirmación de Bunny. Se mantiene la espera antes de repetir." } : d;
+            if (!purgaZonaUltima || Number(d.en_ms || 0) > Number(purgaZonaUltima.en_ms || 0)) purgaZonaUltima = recuperada;
+        }
+        purgaZonaCargada = true;
+    } catch (e) { if (estricto) throw e; }
+    return purgaZonaUltima;
+}
+function esperaPurgaZonaMs() {
+    const u = purgaZonaUltima;
+    if (!u || !["aceptada", "desconocida", "en_proceso"].includes(u.estado)) return 0;
+    return Math.max(0, PURGA_ZONA_ESPERA_MS - (Date.now() - Number(u.en_ms || 0)));
+}
+function resumenPurgaZona() {
+    const u = purgaZonaUltima;
+    return {
+        en_curso: purgaZonaEnCurso,
+        espera_s: Math.ceil(esperaPurgaZonaMs() / 1000),
+        espera_total_s: PURGA_ZONA_ESPERA_MS / 1000,
+        ultima: u ? { en_ms: u.en_ms || null, estado: u.estado || null, por: u.por || "", mensaje: u.mensaje || "" } : null
+    };
+}
+
+HERRAMIENTAS.cdn_periodos = CDN_API_ACTIVA;
+HERRAMIENTAS.cdn_purga_zona = CDN_API_ACTIVA;
+HERRAMIENTAS.cdn_resumenes = CDN_API_ACTIVA && CDN_RESUMENES ? "activos" : "desactivados";
+
+// --- Tarea periódica de resúmenes (independiente del panel) ---
+let cicloCdnEnCurso = false;
+let ultimoRepasoCdn = 0;
+let ultimoCicloCdn = { en_ms: 0, ok: null, mensaje: "" };
+async function cicloResumenesCdn() {
+    if (cicloCdnEnCurso) return;
+    cicloCdnEnCurso = true;
+    try {
+        const ahora = Date.now();
+        const hoy = diaLimaDeMs(ahora);
+        const recientes = listaDias(sumarDias(hoy, -2), hoy);
+        const r = await traerDiasDeBunny(recientes, true, ahora);
+        let mensaje = `${r.resumenes.size} día(s) guardados`;
+        if (ahora - ultimoRepasoCdn >= CDN_REPASO_MS) {
+            const ventana = listaDias(sumarDias(hoy, -CDN_HORARIO_SEGURO_DIAS), sumarDias(hoy, -3));
+            const snaps = await db.getAll(...ventana.map(refResumenCdn));
+            const faltan = ventana.filter((d, i) => {
+                const g = snaps[i].exists ? snaps[i].data() : null;
+                return !tieneConsumo(g) || g.estado !== "conciliado";
+            });
+            if (faltan.length) {
+                const rr = await traerDiasDeBunny(faltan, true, ahora);
+                mensaje += ` · repaso: ${rr.resumenes.size} de ${faltan.length}`;
+            }
+            ultimoRepasoCdn = ahora;
+        }
+        const guardados = new Map();
+        const snapsP = await db.getAll(...recientes.map(refResumenCdn));
+        snapsP.forEach((s, i) => { if (s.exists) guardados.set(recientes[i], s.data() || {}); });
+        await actualizarPasesCreados(recientes, guardados, 3);
+        try { await asegurarTcHistorico(sumarDias(hoy, -35), hoy); } catch (_) {}
+        ultimoCicloCdn = { en_ms: ahora, ok: r.errores.size === 0, mensaje: r.errores.size ? `${mensaje} · ${r.errores.size} día(s) con error` : mensaje };
+    } catch (e) {
+        ultimoCicloCdn = { en_ms: Date.now(), ok: false, mensaje: "La tarea de resúmenes falló; se reintentará en una hora." };
+    } finally {
+        cicloCdnEnCurso = false;
+    }
+}
+
+if (CDN_API_ACTIVA) {
+    EXTENSIONES_TABLERO.push(() => ({
+        cdn_purga_zona: resumenPurgaZona(),
+        cdn_resumenes: { activos: CDN_RESUMENES, ultimo_ciclo: ultimoCicloCdn, frecuencia_min: CDN_CICLO_MS / 60000 }
+    }));
+
+    if (CDN_RESUMENES) {
+        const primera = setTimeout(() => { cicloResumenesCdn().catch(() => {}); }, 2 * 60 * 1000);
+        if (primera.unref) primera.unref();
+        const periodica = setInterval(() => { cicloResumenesCdn().catch(() => {}); }, CDN_CICLO_MS);
+        if (periodica.unref) periodica.unref();
+    }
+
+    app.post('/admin/cdn/consumo-periodo', adminLimiter, verifyAdmin, async (req, res) => {
+        let p;
+        try { p = resolverPeriodoCdn(req.body || {}, Date.now()); }
+        catch (e) { return res.status(400).json({ success: false, code: e.code || "PERIODO_INVALIDO", message: e.message }); }
+        actualizarTipoCambioPen().catch(() => {});
+        const forzar = req.body?.actualizar === true;
+        const granularidad = p.dias === 1 ? "hora" : "dia";
+        const clave = `${BUNNY_PULLZONE_ID}|${granularidad}|${p.desde}|${p.hasta}`;
+        const enCache = cacheConsumoPeriodo.get(clave);
+        if (!forzar && enCache && Date.now() - enCache.en < ttlConsumoPeriodo(p)) {
+            return res.json({ success: true, ...enCache.datos, ...tipoCambioPenParaPanel(), en_cache: true, periodo: p.periodo });
+        }
+        try {
+            let promesa = consultasConsumoEnCurso.get(clave);
+            if (!promesa) {
+                promesa = calcularConsumoPeriodo(p, { forzar }).finally(() => consultasConsumoEnCurso.delete(clave));
+                consultasConsumoEnCurso.set(clave, promesa);
+            }
+            const datos = await promesa;
+            if (datos.fallo) {
+                if (datos.retry_after_s) res.set('Retry-After', String(datos.retry_after_s));
+                return res.status(datos.status).json({ success: false, code: datos.code, message: datos.message, retry_after_s: datos.retry_after_s, desde: p.desde, hasta: p.hasta, periodo: p.periodo });
+            }
+            if (cacheConsumoPeriodo.size >= 60) cacheConsumoPeriodo.delete(cacheConsumoPeriodo.keys().next().value);
+            cacheConsumoPeriodo.set(clave, { en: Date.now(), datos });
+            return res.json({ success: true, ...datos, periodo: p.periodo, en_cache: false });
+        } catch (e) {
+            console.error("❌ Error calculando el consumo del periodo:", e && e.message);
+            return res.status(500).json({ success: false, code: "SERVER_ERROR", message: "Error calculando el consumo del periodo." });
+        }
+    });
+
+    app.post('/admin/cdn/purga-zona/estado', adminLimiter, verifyAdmin, async (req, res) => {
+        try {
+            await cargarUltimaPurgaZona(true);
+            return res.json({ success: true, zona: BUNNY_PULLZONE_ID, ...resumenPurgaZona() });
+        } catch (_) { return res.status(503).json({ success: false, code: "STORE_UNAVAILABLE", message: "No se pudo confirmar el estado de la purga." }); }
+    });
+
+    // Purga de TODA la caché de la zona configurada (POST /pullzone/{id}/purgeCache sin CacheTag).
+    // El navegador no elige la zona ni recibe la clave. Una espera entre purgas evita repeticiones.
+    app.post('/admin/cdn/purgar-zona', adminLimiter, verifyAdmin, async (req, res) => {
+        if (req.body?.confirmar !== "PURGAR_ZONA") {
+            return res.status(400).json({ success: false, code: "CONFIRMATION_REQUIRED", message: "Confirme la purga de toda la zona." });
+        }
+        if (purgaZonaEnCurso) {
+            return res.status(409).json({ success: false, code: "PURGE_IN_PROGRESS", estado: "en_proceso", message: "Ya hay una purga de la zona en proceso." });
+        }
+        purgaZonaEnCurso = true;
+        let solicitudEnviada = false;
+        try {
+            await cargarUltimaPurgaZona(true);
+            const espera = esperaPurgaZonaMs();
+            if (espera > 0) {
+                res.set('Retry-After', String(Math.ceil(espera / 1000)));
+                return res.status(429).json({ success: false, code: "PURGE_TOO_SOON", estado: "en_espera", espera_s: Math.ceil(espera / 1000),
+                    message: `La última purga de la zona fue hace poco. Espere ${Math.ceil(espera / 60000)} min antes de repetirla.` });
+            }
+            if (Date.now() < bunnyPurgaPausaHasta) {
+                const s = Math.ceil((bunnyPurgaPausaHasta - Date.now()) / 1000);
+                res.set('Retry-After', String(s));
+                return res.status(429).json({ success: false, code: "CDN_RATE_LIMITED", estado: "en_espera", espera_s: s, message: `Bunny pidió esperar ${s} s antes de otra purga.` });
+            }
+            const autor = (req.golazoAdmin && (req.golazoAdmin.email || req.golazoAdmin.uid)) || "";
+            const inicio = Date.now();
+            const anterior = purgaZonaUltima;
+            const reserva = { en_ms: inicio, estado: "en_proceso", por: autor, mensaje: "Solicitud registrada antes de contactar a Bunny." };
+            try { await db.collection('config').doc('cdn_purga_zona').set(reserva); }
+            catch (_) { purgaZonaUltima = anterior; return res.status(503).json({ success: false, code: "STORE_UNAVAILABLE", message: "No se pudo registrar la purga: no se contactó a Bunny." }); }
+            purgaZonaUltima = reserva;
+            solicitudEnviada = true;
+            const r = await solicitudSaliente(`https://api.bunny.net/pullzone/${encodeURIComponent(BUNNY_PULLZONE_ID)}/purgeCache`, {
+                metodo: 'POST', cabeceras: { AccessKey: BUNNY_API_KEY, accept: 'application/json', 'content-type': 'application/json' },
+                cuerpo: '{}', timeoutMs: 20000, maxBytes: 16384, soloPublicas: false, redirecciones: 0
+            });
+            let estado, status, code, mensaje;
+            if (r.ok) {
+                estado = "aceptada"; status = 200; code = null;
+                mensaje = "Bunny aceptó la purga de toda la zona. Las copias se eliminan de forma progresiva en su red; mientras se vuelven a llenar, el servidor de emisión recibe más solicitudes.";
+            } else if (r.error || r.cortada || !r.status || r.status >= 500) {
+                estado = "desconocida"; status = 504; code = "CDN_PURGE_UNKNOWN";
+                mensaje = `No se pudo confirmar la respuesta de Bunny: la purga pudo haberse aplicado. No la repita antes de ${Math.ceil(PURGA_ZONA_ESPERA_MS / 60000)} min; revise el consumo y la señal.`;
+            } else if (r.status === 429) {
+                const s = segundosReintento(r.headers);
+                bunnyPurgaPausaHasta = Date.now() + s * 1000;
+                estado = "limitada"; status = 429; code = "CDN_RATE_LIMITED";
+                mensaje = `Bunny limitó las purgas: espere ${s} s antes de intentarlo de nuevo. No se purgó nada.`;
+                res.set('Retry-After', String(s));
+            } else {
+                estado = "fallida"; status = 502; code = "CDN_PURGE_FAILED";
+                mensaje = r.status === 404 ? "Bunny no encontró la zona configurada (BUNNY_PULLZONE_ID). No se purgó nada." : `${mensajeErrorBunny(r)} No se purgó nada.`;
+            }
+            purgaZonaUltima = { en_ms: inicio, estado, por: autor, mensaje, http: r.status || null };
+            try { await db.collection('config').doc('cdn_purga_zona').set(purgaZonaUltima); } catch (_) {}
+            registrarAccionAdmin(req, "purgar_zona_cdn", `zona ${BUNNY_PULLZONE_ID} · ${estado}`, { zona: BUNNY_PULLZONE_ID, estado, http: r.status || null });
+            const cuerpo = { success: estado === "aceptada", estado, message: mensaje, zona: BUNNY_PULLZONE_ID, en_ms: inicio, ...resumenPurgaZona() };
+            if (code) cuerpo.code = code;
+            return res.status(status).json(cuerpo);
+        } catch (e) {
+            console.error("❌ Error purgando la zona de la CDN:", e && e.message);
+            if (solicitudEnviada) {
+                purgaZonaUltima = { ...purgaZonaUltima, estado: "desconocida", mensaje: "La solicitud pudo llegar a Bunny; espere antes de repetir y revise su estado." };
+                try { await db.collection('config').doc('cdn_purga_zona').set(purgaZonaUltima); } catch (_) {}
+                return res.status(503).json({ success: false, code: "CDN_PURGE_UNKNOWN", estado: "desconocida", message: purgaZonaUltima.mensaje, en_ms: purgaZonaUltima.en_ms, ...resumenPurgaZona() });
+            }
+            return res.status(503).json({ success: false, code: "STORE_UNAVAILABLE", message: "No se pudo comprobar el registro de purgas: no se contactó a Bunny." });
+        } finally {
+            purgaZonaEnCurso = false;
         }
     });
 }
